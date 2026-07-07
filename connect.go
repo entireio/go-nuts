@@ -1,0 +1,208 @@
+package entwine
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"time"
+
+	"github.com/nats-io/nats.go"
+)
+
+// Default connection tunables. DefaultDrainTimeout matches entire-core's tuned
+// value (COR-923); nats.go's own default is 30s. It caps only the
+// subscription-drain phase — see [Drain] for why it is not the whole budget.
+const (
+	DefaultDrainTimeout  = 5 * time.Second
+	DefaultReconnectWait = 2 * time.Second
+)
+
+// Environment variables that carry the org-wide mTLS client identity. The same
+// triple is consumed by every Entire service that dials NATS.
+const (
+	envTLSCert = "ENTIRE_INTERNAL_TLS_CERT_FILE"
+	envTLSKey  = "ENTIRE_INTERNAL_TLS_KEY_FILE"
+	envTLSCA   = "ENTIRE_INTERNAL_TLS_CA_FILE"
+)
+
+// config holds the resolved connection settings. Callers mutate it through
+// [Option] values.
+type config struct {
+	name          string
+	logger        *slog.Logger
+	tlsConfig     *tls.Config
+	tlsFromEnv    bool
+	drainTimeout  time.Duration
+	reconnectWait time.Duration
+	maxReconnects int
+	extra         []nats.Option
+}
+
+// Option configures a [Connect] call.
+type Option func(*config)
+
+// WithName sets the NATS connection name (nats.Name), which labels the client
+// in server monitoring and in the logs.
+func WithName(name string) Option { return func(c *config) { c.name = name } }
+
+// WithLogger sets the logger used for connection lifecycle events. Defaults to
+// [slog.Default]. Context-aware log methods are used, so a handler that reads
+// trace context from the context still works.
+func WithLogger(l *slog.Logger) Option { return func(c *config) { c.logger = l } }
+
+// WithTLSConfig supplies an explicit *tls.Config and disables the default
+// env-var mTLS lookup. Pass this (or [WithoutTLS]) when the standard
+// ENTIRE_INTERNAL_TLS_* identity does not apply.
+func WithTLSConfig(t *tls.Config) Option {
+	return func(c *config) {
+		c.tlsConfig = t
+		c.tlsFromEnv = false
+	}
+}
+
+// WithoutTLS disables TLS entirely (plaintext). Intended for local development
+// and tests against an embedded server; production dials always use mTLS.
+func WithoutTLS() Option {
+	return func(c *config) {
+		c.tlsConfig = nil
+		c.tlsFromEnv = false
+	}
+}
+
+// WithDrainTimeout overrides [DefaultDrainTimeout].
+func WithDrainTimeout(d time.Duration) Option { return func(c *config) { c.drainTimeout = d } }
+
+// WithReconnectWait overrides [DefaultReconnectWait].
+func WithReconnectWait(d time.Duration) Option { return func(c *config) { c.reconnectWait = d } }
+
+// WithNATSOptions appends raw nats.Option values, applied after entwine's
+// defaults so a caller can override any of them. An escape hatch for options
+// entwine does not model.
+func WithNATSOptions(opts ...nats.Option) Option {
+	return func(c *config) { c.extra = append(c.extra, opts...) }
+}
+
+// Connect opens a NATS connection with the org-standard resiliency posture:
+// rotation-aware mTLS (from the ENTIRE_INTERNAL_TLS_* env vars unless
+// overridden), reconnect-forever (long-lived services must outlive arbitrary
+// NATS outages rather than permanently CLOSE after the client default of 60
+// attempts), a bounded drain timeout, and lifecycle handlers that log at the
+// right level — notably routing the nil-error DisconnectErr that nats.go fires
+// on an explicit Close to INFO, so a clean shutdown does not look like a fault.
+//
+// The returned connection should be torn down with [Drain] (or via a
+// [ShutdownGroup]) on graceful shutdown, not nc.Close, so in-flight work
+// finishes and pull-consumer fetch loops exit cleanly.
+func Connect(ctx context.Context, url string, opts ...Option) (*nats.Conn, error) {
+	if url == "" {
+		return nil, errors.New("entwine: nats url is empty")
+	}
+	cfg := config{
+		logger:        slog.Default(),
+		tlsFromEnv:    true,
+		drainTimeout:  DefaultDrainTimeout,
+		reconnectWait: DefaultReconnectWait,
+		maxReconnects: -1,
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	if cfg.logger == nil {
+		cfg.logger = slog.Default()
+	}
+
+	var tlsConf *tls.Config
+	switch {
+	case cfg.tlsConfig != nil:
+		tlsConf = cfg.tlsConfig
+	case cfg.tlsFromEnv:
+		var err error
+		if tlsConf, err = tlsConfigFromEnv(); err != nil {
+			return nil, err
+		}
+	}
+
+	natsOpts := []nats.Option{
+		nats.DrainTimeout(cfg.drainTimeout),
+		nats.RetryOnFailedConnect(true),
+		nats.MaxReconnects(cfg.maxReconnects),
+		nats.ReconnectWait(cfg.reconnectWait),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			// nats.go fires this with err==nil when the caller calls Close()
+			// explicitly (see nats.Options.DisconnectedErrCB). Logging that at
+			// ERROR makes clean shutdowns look like failures, so route the
+			// explicit-close case to INFO.
+			if err == nil {
+				cfg.logger.InfoContext(ctx, "entwine: NATS disconnected")
+				return
+			}
+			cfg.logger.ErrorContext(ctx, "entwine: NATS disconnected", slog.Any("error", err))
+		}),
+		nats.ClosedHandler(func(_ *nats.Conn) {
+			cfg.logger.InfoContext(ctx, "entwine: NATS connection closed")
+		}),
+		nats.ReconnectHandler(func(_ *nats.Conn) {
+			cfg.logger.InfoContext(ctx, "entwine: NATS reconnected")
+		}),
+		nats.ReconnectErrHandler(func(_ *nats.Conn, err error) {
+			cfg.logger.ErrorContext(ctx, "entwine: NATS reconnect failed", slog.Any("error", err))
+		}),
+	}
+	if tlsConf != nil {
+		natsOpts = append(natsOpts, nats.Secure(tlsConf))
+	}
+	if cfg.name != "" {
+		natsOpts = append(natsOpts, nats.Name(cfg.name))
+	}
+	natsOpts = append(natsOpts, cfg.extra...)
+
+	nc, err := nats.Connect(url, natsOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("entwine: connect to NATS: %w", err)
+	}
+	cfg.logger.InfoContext(ctx, "entwine: NATS connected", slog.String("url", url))
+	return nc, nil
+}
+
+// tlsConfigFromEnv builds the mTLS config from the ENTIRE_INTERNAL_TLS_* env
+// vars, requiring all three to be set.
+func tlsConfigFromEnv() (*tls.Config, error) {
+	cert, key, ca := os.Getenv(envTLSCert), os.Getenv(envTLSKey), os.Getenv(envTLSCA)
+	if cert == "" || key == "" || ca == "" {
+		return nil, fmt.Errorf("entwine: %s, %s, %s all required for NATS mTLS", envTLSCert, envTLSKey, envTLSCA)
+	}
+	return TLSConfigFromFiles(cert, key, ca)
+}
+
+// TLSConfigFromFiles builds a rotation-aware mTLS *tls.Config from cert, key,
+// and CA files on disk. The GetClientCertificate callback re-reads the cert and
+// key on every handshake, so a cert-manager rotation is picked up on the next
+// reconnect without a process restart.
+func TLSConfigFromFiles(certFile, keyFile, caFile string) (*tls.Config, error) {
+	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+		return nil, fmt.Errorf("entwine: load tls keypair: %w", err)
+	}
+	caBytes, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("entwine: read ca: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caBytes) {
+		return nil, errors.New("entwine: ca PEM: no certs parsed")
+	}
+	return &tls.Config{
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+			if err != nil {
+				return nil, fmt.Errorf("entwine: reload tls keypair: %w", err)
+			}
+			return &cert, nil
+		},
+		RootCAs:    pool,
+		MinVersion: tls.VersionTLS13,
+	}, nil
+}

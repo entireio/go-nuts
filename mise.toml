@@ -1,0 +1,24 @@
+[tools]
+# Keep aligned with the go directive in go.mod.
+go = { version = '1.26.2' }
+golangci-lint = '2.11.4'
+
+[tasks.fmt]
+description = "Run gofmt"
+run = "gofmt -s -w ."
+
+[tasks.lint]
+description = "Run golangci-lint"
+run = "golangci-lint run"
+
+[tasks.test]
+description = "Run tests"
+run = "go test ./..."
+
+[tasks."test:ci"]
+description = "Run tests with the race detector"
+run = "go test -race ./..."
+
+[tasks.build]
+description = "Build all packages"
+run = "go build ./..."

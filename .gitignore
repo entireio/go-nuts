@@ -1,0 +1,33 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Coverage / profiling
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+*.prof
+
+# Go workspace file — entwine is developed against its consumers via a local
+# go.work that is never committed (a real version is cut once the API settles).
+go.work
+go.work.sum
+
+# env
+.env
+.envrc
+
+.DS_Store
+
+# worktrees / scratch
+.worktrees/
+.claude/worktrees/
+tmp/
+.tmp/
