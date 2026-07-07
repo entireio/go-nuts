@@ -143,10 +143,23 @@ func (g *ShutdownGroup) Go(fn func(ctx context.Context)) {
 // AddConn registers a connection to be drained after the loops have joined.
 // Draining last — never before the fetch loops stop — is the ordering that
 // keeps a Drain/Close from racing an in-flight Fetch (COR-923).
+//
+// Like [ShutdownGroup.Go], registering after Shutdown has begun is a no-op:
+// the drain set is snapshotted when shutdown starts, so a connection added
+// afterward (including during the join window) would never be drained. It is
+// refused and logged rather than silently dropped — the caller then owns
+// tearing it down. Uses the same lock as shutdown's snapshot, so a connection
+// is either in the snapshot or explicitly refused, never lost to a race.
 func (g *ShutdownGroup) AddConn(name string, nc *nats.Conn) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	if g.closed {
+		g.mu.Unlock()
+		g.logger.WarnContext(g.ctx, "entwine: ShutdownGroup.AddConn called after shutdown; connection not registered for drain",
+			slog.String("conn", name))
+		return
+	}
 	g.conns = append(g.conns, groupConn{name: name, nc: nc})
+	g.mu.Unlock()
 }
 
 // Shutdown cancels the group context, waits (bounded by the join timeout) for

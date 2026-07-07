@@ -143,6 +143,34 @@ func TestGoAfterShutdownIsRefused(t *testing.T) {
 	}
 }
 
+// TestAddConnAfterShutdownIsRefused guards that a connection registered once
+// shutdown has begun is refused (and logged) rather than silently omitted from
+// the drain snapshot.
+func TestAddConnAfterShutdownIsRefused(t *testing.T) {
+	nc, err := Connect(t.Context(), runEmbeddedServer(t), WithoutTLS())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() {
+		if !nc.IsClosed() {
+			nc.Close()
+		}
+	})
+
+	logger, h := newCapturingLogger()
+	g := NewShutdownGroup(t.Context(), WithGroupLogger(logger))
+	g.Shutdown()
+
+	g.AddConn("late", nc) // after shutdown: must be refused, not drained
+
+	if nc.IsClosed() {
+		t.Fatal("late-registered connection was drained despite shutdown having completed")
+	}
+	if !h.has("entwine: ShutdownGroup.AddConn called after shutdown; connection not registered for drain") {
+		t.Fatalf("expected a refusal warning for late AddConn; saw %v", h.snapshot())
+	}
+}
+
 // TestGoConcurrentWithShutdown stresses the Go/Shutdown coordination. Under the
 // race detector this catches both the "Add called concurrently with Wait"
 // WaitGroup panic and any data race on the group's shared state.
