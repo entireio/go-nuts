@@ -8,7 +8,7 @@ shutting down cleanly.
 ## Install
 
 ```
-go get github.com/entirehq/entwine
+go get github.com/entireio/entwine
 ```
 
 ## What it provides

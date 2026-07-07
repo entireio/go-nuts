@@ -1,4 +1,4 @@
-module github.com/entirehq/entwine
+module github.com/entireio/entwine
 
 go 1.26
 
