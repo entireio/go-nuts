@@ -21,6 +21,13 @@ const (
 	DefaultReconnectWait = 2 * time.Second
 )
 
+// natsPublishDrainTimeout is the fixed publish-flush budget nats.go spends
+// after the subscription-drain phase before a drained connection reaches CLOSED
+// (the hardcoded FlushTimeout in (*nats.Conn).drainConnection). A total
+// time-to-CLOSED backstop must exceed a connection's nats.DrainTimeout by at
+// least this much, plus a little slack, to avoid firing mid-flush.
+const natsPublishDrainTimeout = 5 * time.Second
+
 // Environment variables that carry the org-wide mTLS client identity. The same
 // triple is consumed by every Entire service that dials NATS.
 const (
@@ -32,14 +39,15 @@ const (
 // config holds the resolved connection settings. Callers mutate it through
 // [Option] values.
 type config struct {
-	name          string
-	logger        *slog.Logger
-	tlsConfig     *tls.Config
-	tlsFromEnv    bool
-	drainTimeout  time.Duration
-	reconnectWait time.Duration
-	maxReconnects int
-	extra         []nats.Option
+	name                 string
+	logger               *slog.Logger
+	tlsConfig            *tls.Config
+	tlsFromEnv           bool
+	drainTimeout         time.Duration
+	reconnectWait        time.Duration
+	maxReconnects        int
+	retryOnFailedConnect bool
+	extra                []nats.Option
 }
 
 // Option configures a [Connect] call.
@@ -79,6 +87,17 @@ func WithDrainTimeout(d time.Duration) Option { return func(c *config) { c.drain
 // WithReconnectWait overrides [DefaultReconnectWait].
 func WithReconnectWait(d time.Duration) Option { return func(c *config) { c.reconnectWait = d } }
 
+// WithRetryOnFailedConnect keeps [Connect] from returning an error when the
+// initial dial fails: nats.go instead returns a connection in RECONNECTING
+// state and retries in the background (buffering publishes). It is off by
+// default so a misconfigured connection (bad URL, wrong TLS material) fails
+// fast at startup — crash-looping the pod so a bad rollout is visible — rather
+// than silently accepting work it cannot deliver. Enable it only for
+// optional/secondary connections a service is designed to run without.
+func WithRetryOnFailedConnect() Option {
+	return func(c *config) { c.retryOnFailedConnect = true }
+}
+
 // WithNATSOptions appends raw nats.Option values, applied after entwine's
 // defaults so a caller can override any of them. An escape hatch for options
 // entwine does not model.
@@ -93,6 +112,12 @@ func WithNATSOptions(opts ...nats.Option) Option {
 // attempts), a bounded drain timeout, and lifecycle handlers that log at the
 // right level — notably routing the nil-error DisconnectErr that nats.go fires
 // on an explicit Close to INFO, so a clean shutdown does not look like a fault.
+//
+// The initial dial is fail-fast: if the first connect does not succeed Connect
+// returns an error, so a misconfigured service crash-loops visibly rather than
+// booting into a broken state. Reconnect-forever applies only once a connection
+// has been established. Pass [WithRetryOnFailedConnect] to opt into background
+// retry of the initial dial instead.
 //
 // The returned connection should be torn down with [Drain] (or via a
 // [ShutdownGroup]) on graceful shutdown, not nc.Close, so in-flight work
@@ -126,9 +151,17 @@ func Connect(ctx context.Context, url string, opts ...Option) (*nats.Conn, error
 		}
 	}
 
+	// The lifecycle handlers below outlive the Connect call — they fire on
+	// disconnects and reconnects for the whole life of the connection, long
+	// after a startup- or request-scoped ctx is cancelled. Log through a
+	// cancellation-detached copy so a context-aware slog handler still sees the
+	// trace values but never drops a mid-life event because ctx is already done.
+	logCtx := context.WithoutCancel(ctx)
+	connAttr := slog.String("conn", cfg.name)
+
 	natsOpts := []nats.Option{
 		nats.DrainTimeout(cfg.drainTimeout),
-		nats.RetryOnFailedConnect(true),
+		nats.RetryOnFailedConnect(cfg.retryOnFailedConnect),
 		nats.MaxReconnects(cfg.maxReconnects),
 		nats.ReconnectWait(cfg.reconnectWait),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
@@ -137,19 +170,19 @@ func Connect(ctx context.Context, url string, opts ...Option) (*nats.Conn, error
 			// ERROR makes clean shutdowns look like failures, so route the
 			// explicit-close case to INFO.
 			if err == nil {
-				cfg.logger.InfoContext(ctx, "entwine: NATS disconnected")
+				cfg.logger.InfoContext(logCtx, "entwine: NATS disconnected", connAttr)
 				return
 			}
-			cfg.logger.ErrorContext(ctx, "entwine: NATS disconnected", slog.Any("error", err))
+			cfg.logger.ErrorContext(logCtx, "entwine: NATS disconnected", connAttr, slog.Any("error", err))
 		}),
 		nats.ClosedHandler(func(_ *nats.Conn) {
-			cfg.logger.InfoContext(ctx, "entwine: NATS connection closed")
+			cfg.logger.InfoContext(logCtx, "entwine: NATS connection closed", connAttr)
 		}),
 		nats.ReconnectHandler(func(_ *nats.Conn) {
-			cfg.logger.InfoContext(ctx, "entwine: NATS reconnected")
+			cfg.logger.InfoContext(logCtx, "entwine: NATS reconnected", connAttr)
 		}),
 		nats.ReconnectErrHandler(func(_ *nats.Conn, err error) {
-			cfg.logger.ErrorContext(ctx, "entwine: NATS reconnect failed", slog.Any("error", err))
+			cfg.logger.ErrorContext(logCtx, "entwine: NATS reconnect failed", connAttr, slog.Any("error", err))
 		}),
 	}
 	if tlsConf != nil {
@@ -164,7 +197,16 @@ func Connect(ctx context.Context, url string, opts ...Option) (*nats.Conn, error
 	if err != nil {
 		return nil, fmt.Errorf("entwine: connect to NATS: %w", err)
 	}
-	cfg.logger.InfoContext(ctx, "entwine: NATS connected", slog.String("url", url))
+	// With RetryOnFailedConnect enabled, nats.Connect returns a nil error even
+	// when the initial dial failed — the connection is in RECONNECTING and the
+	// client is retrying in the background. Report that honestly instead of
+	// claiming "connected".
+	if status := nc.Status(); status != nats.CONNECTED {
+		cfg.logger.WarnContext(ctx, "entwine: NATS not yet connected; retrying in background",
+			connAttr, slog.String("url", url), slog.String("status", status.String()))
+		return nc, nil
+	}
+	cfg.logger.InfoContext(ctx, "entwine: NATS connected", connAttr, slog.String("url", url))
 	return nc, nil
 }
 
@@ -178,21 +220,24 @@ func tlsConfigFromEnv() (*tls.Config, error) {
 	return TLSConfigFromFiles(cert, key, ca)
 }
 
-// TLSConfigFromFiles builds a rotation-aware mTLS *tls.Config from cert, key,
-// and CA files on disk. The GetClientCertificate callback re-reads the cert and
-// key on every handshake, so a cert-manager rotation is picked up on the next
-// reconnect without a process restart.
+// TLSConfigFromFiles builds a fully rotation-aware mTLS *tls.Config from cert,
+// key, and CA files on disk. Both sides of the trust are re-read from disk on
+// every handshake: GetClientCertificate reloads the client keypair, and
+// VerifyConnection rebuilds the root pool from the CA file and verifies the
+// server against it. A cert-manager rotation of either the client identity or
+// the trusted CA is therefore picked up on the next reconnect without a process
+// restart. The files are read and parsed once here so a misconfiguration fails
+// fast at construction time rather than on the first handshake.
+//
+// Because the roots must be resolved per handshake, verification is done in
+// VerifyConnection (which also re-checks the server hostname) rather than via
+// the static RootCAs field.
 func TLSConfigFromFiles(certFile, keyFile, caFile string) (*tls.Config, error) {
 	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
 		return nil, fmt.Errorf("entwine: load tls keypair: %w", err)
 	}
-	caBytes, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, fmt.Errorf("entwine: read ca: %w", err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caBytes) {
-		return nil, errors.New("entwine: ca PEM: no certs parsed")
+	if _, err := caPoolFromFile(caFile); err != nil {
+		return nil, err
 	}
 	return &tls.Config{
 		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
@@ -202,7 +247,45 @@ func TLSConfigFromFiles(certFile, keyFile, caFile string) (*tls.Config, error) {
 			}
 			return &cert, nil
 		},
-		RootCAs:    pool,
+		// Roots are resolved per handshake in VerifyConnection, so default
+		// verification (which would pin a static RootCAs) is turned off and
+		// replaced with an equivalent check against a freshly-read pool.
+		InsecureSkipVerify: true, //nolint:gosec // server cert + hostname are verified against a freshly-read CA pool in VerifyConnection to stay rotation-aware
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			roots, err := caPoolFromFile(caFile)
+			if err != nil {
+				return err
+			}
+			if len(cs.PeerCertificates) == 0 {
+				return errors.New("entwine: server presented no certificate")
+			}
+			opts := x509.VerifyOptions{
+				Roots:         roots,
+				DNSName:       cs.ServerName,
+				Intermediates: x509.NewCertPool(),
+			}
+			for _, cert := range cs.PeerCertificates[1:] {
+				opts.Intermediates.AddCert(cert)
+			}
+			if _, err := cs.PeerCertificates[0].Verify(opts); err != nil {
+				return fmt.Errorf("entwine: verify server certificate: %w", err)
+			}
+			return nil
+		},
 		MinVersion: tls.VersionTLS13,
 	}, nil
+}
+
+// caPoolFromFile reads a PEM CA bundle from disk and returns it as a cert pool,
+// erroring if the file cannot be read or contains no parseable certificates.
+func caPoolFromFile(caFile string) (*x509.CertPool, error) {
+	caBytes, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("entwine: read ca: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caBytes) {
+		return nil, errors.New("entwine: ca PEM: no certs parsed")
+	}
+	return pool, nil
 }

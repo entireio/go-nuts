@@ -41,6 +41,12 @@ g.AddConn("worker", nc)
 
 g.Go(func(ctx context.Context) {
 	for {
+		// Stop fetching once the group is shutting down, so the loop returns
+		// before its connection is drained (Shutdown cancels, joins, then
+		// drains — the loop must observe the cancel to keep that ordering).
+		if ctx.Err() != nil {
+			return
+		}
 		msgs, err := sub.Fetch(1, nats.MaxWait(5*time.Second))
 		switch {
 		case errors.Is(err, nats.ErrTimeout):
@@ -48,7 +54,14 @@ g.Go(func(ctx context.Context) {
 		case entwine.IsShutdownFetchErr(ctx, err):
 			return // clean shutdown: connection drained/closed
 		case err != nil:
-			continue // real error — log/metric
+			// Real error — log/metric, then back off so a fast-failing Fetch
+			// (e.g. connection closed mid-run) does not busy-spin the CPU.
+			slog.ErrorContext(ctx, "fetch failed", slog.Any("error", err))
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+			}
+			continue
 		}
 		handle(msgs)
 	}

@@ -9,9 +9,11 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -84,12 +86,8 @@ func writeSelfSignedCert(t *testing.T, certFile, keyFile string) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		t.Fatal(err)
-	}
 	tmpl := &x509.Certificate{
-		SerialNumber:          serial,
+		SerialNumber:          randSerial(t),
 		Subject:               pkix.Name{CommonName: "entwine-test"},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(time.Hour),
@@ -114,4 +112,158 @@ func writeSelfSignedCert(t *testing.T, certFile, keyFile string) []byte {
 		t.Fatal(err)
 	}
 	return certPEM
+}
+
+func TestConnectFailsFastOnUnreachableServer(t *testing.T) {
+	// The default posture is fail-fast: an unreachable server must yield an
+	// error, not a silently-reconnecting connection reported as healthy.
+	if _, err := Connect(t.Context(), "nats://127.0.0.1:1", WithoutTLS()); err == nil {
+		t.Fatal("expected an error connecting to an unreachable server without retry-on-failed-connect")
+	}
+}
+
+func TestConnectRetryOnFailedConnectReturnsPendingConn(t *testing.T) {
+	// Opting in keeps the initial failure non-fatal: a connection is returned in
+	// a not-yet-connected state and retries in the background.
+	nc, err := Connect(t.Context(), "nats://127.0.0.1:1", WithoutTLS(), WithRetryOnFailedConnect())
+	if err != nil {
+		t.Fatalf("retry-on-failed-connect should not error on initial failure: %v", err)
+	}
+	if nc == nil {
+		t.Fatal("expected a non-nil connection in retry-on-failed-connect mode")
+	}
+	t.Cleanup(nc.Close)
+	if nc.IsConnected() {
+		t.Fatal("did not expect an established connection to an unreachable server")
+	}
+}
+
+func TestConnectLogsConnName(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	nc, err := Connect(t.Context(), runEmbeddedServer(t), WithoutTLS(), WithName("worker"), WithLogger(logger))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+
+	if !strings.Contains(buf.String(), "conn=worker") {
+		t.Fatalf("connected log is missing the conn-name attribute: %q", buf.String())
+	}
+}
+
+// TestTLSConfigCARotation guards that the trusted CA is re-read from disk on
+// every handshake (via VerifyConnection) rather than pinned once at startup, so
+// a CA rotation is honored without a process restart.
+func TestTLSConfigCARotation(t *testing.T) {
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "tls.crt")
+	keyFile := filepath.Join(dir, "tls.key")
+	caFile := filepath.Join(dir, "ca.crt")
+
+	// A client identity keypair — GetClientCertificate just needs to load it.
+	writeSelfSignedCert(t, certFile, keyFile)
+
+	caA := newTestCA(t)
+	caB := newTestCA(t)
+	serverLeaf := caA.signLeaf(t, "nats.internal") // signed by CA A only
+
+	// Start out trusting CA A.
+	if err := os.WriteFile(caFile, caA.certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := TLSConfigFromFiles(certFile, keyFile, caFile)
+	if err != nil {
+		t.Fatalf("TLSConfigFromFiles: %v", err)
+	}
+
+	stateA := tls.ConnectionState{ServerName: "nats.internal", PeerCertificates: []*x509.Certificate{serverLeaf}}
+	if err := cfg.VerifyConnection(stateA); err != nil {
+		t.Fatalf("verify against the trusting CA should pass: %v", err)
+	}
+
+	// Rotate the CA file to a different CA that did NOT sign the server leaf.
+	if err := os.WriteFile(caFile, caB.certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.VerifyConnection(stateA); err == nil {
+		t.Fatal("verify must fail after the CA on disk is rotated to one that did not sign the server cert")
+	}
+
+	// And a leaf signed by the newly-trusted CA B must now verify.
+	stateB := tls.ConnectionState{ServerName: "nats.internal", PeerCertificates: []*x509.Certificate{caB.signLeaf(t, "nats.internal")}}
+	if err := cfg.VerifyConnection(stateB); err != nil {
+		t.Fatalf("verify against the rotated-in CA should pass: %v", err)
+	}
+}
+
+// testCA is a self-signed certificate authority for tests.
+type testCA struct {
+	cert    *x509.Certificate
+	key     *ecdsa.PrivateKey
+	certPEM []byte
+}
+
+func newTestCA(t *testing.T) testCA {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          randSerial(t),
+		Subject:               pkix.Name{CommonName: "entwine-test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return testCA{cert: cert, key: key, certPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}
+}
+
+// signLeaf returns a server leaf certificate with the given DNS SAN, signed by
+// the CA.
+func (ca testCA) signLeaf(t *testing.T, dnsName string) *x509.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: randSerial(t),
+		Subject:      pkix.Name{CommonName: dnsName},
+		DNSNames:     []string{dnsName},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, &key.PublicKey, ca.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert
+}
+
+func randSerial(t *testing.T) *big.Int {
+	t.Helper()
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return serial
 }
