@@ -1,0 +1,19 @@
+✓ Fetching regions
+entireio/entwine @ aws-us-east-2.entire.io       ✗ error
+entireio/entwine @ aws-ap-southeast-2.entire.io  ✓ ready
+entireio/entwine @ aws-eu-central-1.entire.io    ✓ ready
+
+REPO              REGION                   STATUS  CLONE URL
+entireio/entwine  aws-us-east-2 (us)       error   entire://aws-us-east-2.entire.io/gh/entireio/entwine
+entireio/entwine  aws-ap-southeast-2 (au)  ready   entire://aws-ap-southeast-2.entire.io/gh/entireio/entwine
+entireio/entwine  aws-eu-central-1 (eu)    ready   entire://aws-eu-central-1.entire.io/gh/entireio/entwine
+
+Clone them:
+  git clone entire://aws-ap-southeast-2.entire.io/gh/entireio/entwine
+  git clone entire://aws-eu-central-1.entire.io/gh/entireio/entwine
+entireio/entwine @ aws-us-east-2 (us): poll mirror status: decode response: error: code 404: {Schema:{Value:{Scheme:https Opaque: User: Host:us.auth.entire.io Path:/api/v1/schemas/ErrorModel.json Fragment: RawQuery: RawPath: RawFragment: ForceQuery:false OmitHost:false} Set:true} Detail:{Value:mirror not found Set:true} Errors:[] Instance:{Value:{Scheme: Opaque: User: Host: Path: Fragment: RawQuery: RawPath: RawFragment: ForceQuery:false OmitHost:false} Set:false} Status:{Value:404 Set:true} Title:{Value:Not Found Set:true} Type:{Value:{Scheme:about Opaque:blank User: Host: Path: Fragment: RawQuery: RawPath: RawFragment: ForceQuery:false OmitHost:false} Set:true} AdditionalProps:map[]}
+ what is that about?
+
+---
+
+check in the cli repo
