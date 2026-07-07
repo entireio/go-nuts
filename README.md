@@ -1,33 +1,30 @@
 # entwine
 
-Shared NATS connection-lifecycle helpers for Entire services.
+Connection-lifecycle helpers for [NATS](https://nats.io) pull consumers in Go —
+a small, dependency-light layer over
+[`nats.go`](https://github.com/nats-io/nats.go) for connecting, draining, and
+shutting down cleanly.
 
-`entwine` is the one place the org's NATS plumbing lives, so services stop
-re-deriving (and drifting on) connection setup, graceful shutdown, and
-pull-consumer teardown. It is deliberately small and grows only as real
-consumers converge onto it. Tracking issue: **COR-925**.
+## Install
 
-## Status — thin first slice
+```
+go get github.com/entirehq/entwine
+```
 
-This first slice ships the connection-lifecycle core, extracted from the
-copies that had grown in entire-core (`entiredb`), `entire-api`, and
-`mirror-pipeline`:
+## What it provides
 
-- **`Connect`** — rotation-aware mTLS dial with the org-standard resiliency
-  posture: reconnect-forever (long-lived services must outlive NATS outages
-  rather than permanently CLOSE after 60 attempts), a bounded drain timeout,
-  and lifecycle log handlers that route the nil-error disconnect on an explicit
-  `Close` to INFO so a clean shutdown doesn't look like a fault.
-- **`Drain` / `IsShutdownFetchErr`** — graceful shutdown: drain-and-wait
-  (nats.go's `Drain` is async), and a classifier so a fetch loop treats a
-  drain/close during shutdown as a clean exit instead of an ERROR (COR-923).
-- **`ShutdownGroup`** — cancels background loops, joins them, and only *then*
-  drains the connections — the ordering that keeps a `Drain` from racing an
-  in-flight `Fetch`.
-
-Planned as consumers migrate (not here yet): `jsconsumer` (durable JetStream
-pull-consumer scaffold), `natsmsg` (KeepInProgress heartbeat + trace-context
-propagation), `backoff` (Term-on-final-delivery + NakWithDelay policy).
+- **`Connect`** — dial with a resilient default posture: reconnect-forever (so a
+  long-lived service rides out a NATS outage instead of permanently closing
+  after the client's default 60 attempts), a bounded drain timeout, optional
+  rotation-aware mTLS, and lifecycle log handlers that don't mistake a clean
+  shutdown for a fault.
+- **`Drain` / `IsShutdownFetchErr`** — graceful shutdown. `Drain` starts
+  nats.go's asynchronous drain and blocks until the connection flushes and
+  closes (bounded by a timeout); `IsShutdownFetchErr` lets a fetch loop treat a
+  drain/close during shutdown as a clean exit rather than an error.
+- **`ShutdownGroup`** — cancels tracked background loops, waits for them to
+  return, then drains the registered connections — the ordering that keeps a
+  `Drain` from racing an in-flight `Fetch`.
 
 ## Usage
 
@@ -45,13 +42,12 @@ g.AddConn("worker", nc)
 g.Go(func(ctx context.Context) {
 	for {
 		msgs, err := sub.Fetch(1, nats.MaxWait(5*time.Second))
-		if err != nil {
-			if errors.Is(err, nats.ErrTimeout) {
-				continue // idle poll
-			}
-			if entwine.IsShutdownFetchErr(ctx, err) {
-				return // clean shutdown: connection drained/closed
-			}
+		switch {
+		case errors.Is(err, nats.ErrTimeout):
+			continue // idle poll
+		case entwine.IsShutdownFetchErr(ctx, err):
+			return // clean shutdown: connection drained/closed
+		case err != nil:
 			continue // real error — log/metric
 		}
 		handle(msgs)
@@ -59,26 +55,17 @@ g.Go(func(ctx context.Context) {
 })
 
 <-ctx.Done()
-g.Shutdown() // cancel the loop → join it → drain nc, in that order
+g.Shutdown() // cancel loops → join → drain, in that order
 ```
+
+By default `Connect` builds mTLS from the `ENTIRE_INTERNAL_TLS_{CERT,KEY,CA}_FILE`
+environment variables; use `WithTLSConfig`, `WithoutTLS`, or the other `Option`s
+to override.
 
 ## Development
 
-`entwine` is developed against its consumers with a **local `go.work`**
-(git-ignored) so the module and, e.g., `mirror-pipeline` co-evolve without a
-tag-and-bump cycle. A real version is cut only once the API settles.
-
-```
-go 1.26
-
-use (
-	./entwine
-	./mirror-pipeline
-)
-```
-
-Tasks (via [mise](https://mise.jdx.dev)): `mise run test`, `mise run lint`,
-`mise run fmt`.
+Requires Go 1.26. Tasks via [mise](https://mise.jdx.dev): `mise run test`,
+`mise run lint`, `mise run fmt`.
 
 ## License
 
