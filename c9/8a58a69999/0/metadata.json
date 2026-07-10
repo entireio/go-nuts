@@ -1,0 +1,56 @@
+{
+  "cli_version": "0.8.43-nightly.202607081321.e009b7501",
+  "checkpoint_id": "c98a58a69999",
+  "session_id": "b19adb79-1a3a-463d-b5df-57c95724b4b7",
+  "strategy": "manual-commit",
+  "created_at": "2026-07-10T11:51:43.74247Z",
+  "branch": "docs/readme-logo",
+  "checkpoints_count": 1,
+  "save_step_count": 1,
+  "files_touched": [
+    "README.md",
+    "assets/go-nuts.png"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "0e5e3c406b58",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 21892,
+    "cache_creation_tokens": 49451,
+    "cache_read_tokens": 220311,
+    "output_tokens": 1422,
+    "api_call_count": 6
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-07-10T11:51:43.718658Z",
+    "agent_lines": 4,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 4,
+    "total_lines_changed": 4,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 4,
+      "agent_lines_removed": 0
+    }
+  ]
+}
