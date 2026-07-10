@@ -2,16 +2,19 @@ package natsmsg
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go/jetstream"
 )
 
-// noopInProgress and failingInProgress stand in for the message's InProgress
+// noopInProgress and disposedInProgress stand in for the message's InProgress
 // call that consumers pass to KeepInProgress (func() error { return
 // msg.InProgress() }): one keeps the heartbeat ticking, one drives the
-// handled-error exit path.
-func noopInProgress() error    { return nil }
-func failingInProgress() error { return errors.New("in progress failed") }
+// permanent-error exit path (the delivery was already terminally disposed).
+func noopInProgress() error     { return nil }
+func disposedInProgress() error { return jetstream.ErrMsgAlreadyAckd }
 
 // TestKeepInProgress_StopIsIdempotentAndTerminates smoke-tests the long-handler
 // keepalive: with a succeeding callback the ticker goroutine keeps running, and
@@ -74,12 +77,13 @@ func TestKeepInProgress_CapTerminatesTheGoroutine(t *testing.T) {
 	}
 }
 
-// TestKeepInProgress_CallbackErrorStopsTheGoroutine pins the handled-error path:
-// a callback that can't extend the delivery (no reply subject, already disposed)
-// exits the goroutine rather than spinning. Observed via stop returning promptly
-// even though the goroutine has already exited on its own.
-func TestKeepInProgress_CallbackErrorStopsTheGoroutine(t *testing.T) {
-	stop := KeepInProgress(failingInProgress, 3*time.Millisecond)
+// TestKeepInProgress_PermanentErrorStopsTheGoroutine pins the handled-error
+// path: a callback that can never extend the delivery again (already
+// terminally disposed, no reply subject) exits the goroutine rather than
+// spinning. Observed via stop returning promptly even though the goroutine
+// has already exited on its own.
+func TestKeepInProgress_PermanentErrorStopsTheGoroutine(t *testing.T) {
+	stop := KeepInProgress(disposedInProgress, 3*time.Millisecond)
 	time.Sleep(20 * time.Millisecond) // several intervals; the first tick already errored out
 
 	done := make(chan struct{})
@@ -90,6 +94,29 @@ func TestKeepInProgress_CallbackErrorStopsTheGoroutine(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("goroutine did not exit after the callback errored")
+		t.Fatal("goroutine did not exit after the callback returned a permanent error")
+	}
+}
+
+// TestKeepInProgress_TransientErrorKeepsTicking pins the recovery path: a
+// failure that can heal (a reconnect-buffer overflow during a NATS blip) must
+// not permanently disable the heartbeat — the goroutine keeps ticking (bounded
+// by the cap) so the extension resumes once the connection recovers. The old
+// behavior exited on the first error, so the tick count would freeze at 1.
+func TestKeepInProgress_TransientErrorKeepsTicking(t *testing.T) {
+	var ticks atomic.Int64
+	transient := func() error {
+		ticks.Add(1)
+		return errors.New("nats: outbound buffer limit exceeded") // transient: recovers after reconnect
+	}
+	stop := KeepInProgress(transient, 9*time.Millisecond) // ticks every 3ms
+	defer stop()
+
+	deadline := time.Now().Add(time.Second)
+	for ticks.Load() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("heartbeat stopped after a transient error: %d ticks, want >= 3", ticks.Load())
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
