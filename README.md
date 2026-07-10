@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/go-nuts.png" alt="go-nuts" width="600">
+</p>
+
 # go-nuts
 
 Connection-lifecycle helpers for [NATS](https://nats.io) pull consumers in Go —
