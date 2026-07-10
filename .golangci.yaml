@@ -92,6 +92,12 @@ linters:
         - error
         - empty
         - stdlib
+        # The OTel and jetstream APIs are interface-based by design; helpers
+        # that open spans or hand back a JetStream context necessarily return
+        # these.
+        - go.opentelemetry.io/otel/trace.Tracer
+        - go.opentelemetry.io/otel/trace.Span
+        - github.com/nats-io/nats.go/jetstream.JetStream
     nolintlint:
       require-explanation: true
       require-specific: true

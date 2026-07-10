@@ -1,0 +1,389 @@
+package jsconsumer
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	natsserver "github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/entireio/go-nuts/natsmsg/natsmsgtest"
+)
+
+var testCfg = Config{Stream: "s_v1", Name: "testconsumer", SpanName: "test.consume"}
+
+// TestProcessDispatchesDecodedEvent: a payload that decodes reaches handle with the
+// decoded event and a live span; the message is left for handle to ack/nak (Process
+// does not touch it), and onUndecodable is not called.
+func TestProcessDispatchesDecodedEvent(t *testing.T) {
+	msg := &natsmsgtest.FakeMsg{DataVal: []byte("payload")}
+	var (
+		gotEv   string
+		gotSpan trace.Span
+		gotMsg  jetstream.Msg
+		dropped bool
+	)
+	decode := func(b []byte) (string, error) { return "decoded:" + string(b), nil }
+	handle := func(_ context.Context, span trace.Span, m jetstream.Msg, ev string) {
+		gotEv, gotSpan, gotMsg = ev, span, m
+	}
+	Process(context.Background(), msg, testCfg, decode, handle, func(context.Context) { dropped = true })
+
+	if gotEv != "decoded:payload" {
+		t.Errorf("handle got ev %q, want decoded:payload", gotEv)
+	}
+	if gotSpan == nil {
+		t.Error("handle got a nil span, want the live consumer span")
+	}
+	if gotMsg != msg {
+		t.Error("handle got a different msg than the one passed to Process")
+	}
+	if msg.Acked || msg.Termed || msg.Naks > 0 || len(msg.NakDelays) > 0 {
+		t.Error("Process disposed the message, want none (handle owns ack/nak)")
+	}
+	if dropped {
+		t.Error("onUndecodable called on a successful decode")
+	}
+}
+
+// TestProcessTermsUndecodable: a decode error terms the message, bumps the caller's
+// drop metric via onUndecodable, and never calls handle — a poison payload won't
+// decode on redelivery.
+func TestProcessTermsUndecodable(t *testing.T) {
+	msg := &natsmsgtest.FakeMsg{DataVal: []byte("garbage")}
+	handled := false
+	dropped := false
+	decode := func([]byte) (string, error) { return "", errors.New("bad payload") }
+	handle := func(context.Context, trace.Span, jetstream.Msg, string) { handled = true }
+	Process(context.Background(), msg, testCfg, decode, handle, func(context.Context) { dropped = true })
+
+	if !msg.Termed {
+		t.Error("message not termed on a decode error")
+	}
+	if !dropped {
+		t.Error("onUndecodable not called on a decode error")
+	}
+	if handled {
+		t.Error("handle called despite a decode error")
+	}
+}
+
+// TestProcessNilOnUndecodable: a nil onUndecodable is tolerated (still terms).
+func TestProcessNilOnUndecodable(t *testing.T) {
+	msg := &natsmsgtest.FakeMsg{DataVal: []byte("garbage")}
+	decode := func([]byte) (string, error) { return "", errors.New("bad") }
+	Process(context.Background(), msg, testCfg, decode,
+		func(context.Context, trace.Span, jetstream.Msg, string) {}, nil)
+	if !msg.Termed {
+		t.Error("message not termed")
+	}
+}
+
+// TestProcessKeepInProgress: with Config.KeepInProgress set, a handler that
+// outruns AckWait/3 gets InProgress heartbeats, and the heartbeat goroutine has
+// stopped by the time Process returns (no further ticks accrue).
+func TestProcessKeepInProgress(t *testing.T) {
+	cfg := testCfg
+	cfg.KeepInProgress = true
+	cfg.AckWait = 30 * time.Millisecond // ticks at 10ms
+
+	msg := &natsmsgtest.FakeMsg{DataVal: []byte("payload")}
+	decode := func(b []byte) (string, error) { return string(b), nil }
+	handle := func(context.Context, trace.Span, jetstream.Msg, string) {
+		time.Sleep(35 * time.Millisecond) // spans at least three ticks
+	}
+	Process(context.Background(), msg, cfg, decode, handle, nil)
+
+	after := msg.InProgressN
+	if after == 0 {
+		t.Fatal("no InProgress heartbeat during a long handler")
+	}
+	time.Sleep(25 * time.Millisecond)
+	if msg.InProgressN != after {
+		t.Errorf("heartbeat still ticking after Process returned: %d → %d", after, msg.InProgressN)
+	}
+}
+
+// TestProcessNoKeepInProgressByDefault: without the opt-in, a long handler gets
+// no heartbeat — the broker's AckWait failsafe stays untouched.
+func TestProcessNoKeepInProgressByDefault(t *testing.T) {
+	cfg := testCfg
+	cfg.AckWait = 30 * time.Millisecond
+
+	msg := &natsmsgtest.FakeMsg{DataVal: []byte("payload")}
+	decode := func(b []byte) (string, error) { return string(b), nil }
+	handle := func(context.Context, trace.Span, jetstream.Msg, string) {
+		time.Sleep(35 * time.Millisecond)
+	}
+	Process(context.Background(), msg, cfg, decode, handle, nil)
+
+	if msg.InProgressN != 0 {
+		t.Errorf("InProgress called %d times without KeepInProgress opt-in", msg.InProgressN)
+	}
+}
+
+// TestConfigEffectiveValues pins the zero-value resolution callers must use
+// when the real tunables matter outside the scaffold — most importantly
+// feeding EffectiveMaxDeliver (never the raw field) into a backoff.Policy,
+// where a zero means unlimited redeliveries instead of "default to 8".
+func TestConfigEffectiveValues(t *testing.T) {
+	var zero Config
+	if got := zero.EffectiveAckWait(); got != DefaultAckWait {
+		t.Errorf("zero EffectiveAckWait = %v, want DefaultAckWait (%v)", got, DefaultAckWait)
+	}
+	if got := zero.EffectiveMaxDeliver(); got != DefaultMaxDeliver {
+		t.Errorf("zero EffectiveMaxDeliver = %d, want DefaultMaxDeliver (%d)", got, DefaultMaxDeliver)
+	}
+	set := Config{AckWait: time.Second, MaxDeliver: 3}
+	if got := set.EffectiveAckWait(); got != time.Second {
+		t.Errorf("set EffectiveAckWait = %v, want 1s", got)
+	}
+	if got := set.EffectiveMaxDeliver(); got != 3 {
+		t.Errorf("set EffectiveMaxDeliver = %d, want 3", got)
+	}
+}
+
+// TestRunnerStopIdempotent: Stop is safe on a nil Runner, a zero Runner, and
+// twice. A panic on any of these fails the test.
+func TestRunnerStopIdempotent(_ *testing.T) {
+	var nilRunner *Runner
+	nilRunner.Stop() // must not panic
+
+	r := &Runner{} // cc nil (never Started)
+	r.Stop()
+	r.Stop() // second call is a no-op
+}
+
+// TestStartNilConn: a nil connection is rejected up front, not on first use.
+func TestStartNilConn(t *testing.T) {
+	cfg := testCfg
+	cfg.Durable = "test_durable"
+	if _, err := Start(context.Background(), nil, cfg, func(jetstream.Msg) {}); err == nil {
+		t.Fatal("Start(nil conn) succeeded, want error")
+	}
+}
+
+// TestStartRejectsEmptyDurable: an empty durable would make
+// CreateOrUpdateConsumer silently create an ephemeral, server-named consumer,
+// losing resume-across-restarts — reject it before touching the broker.
+func TestStartRejectsEmptyDurable(t *testing.T) {
+	if _, err := Start(context.Background(), nil, testCfg, func(jetstream.Msg) {}); err == nil || !strings.Contains(err.Error(), "Durable") {
+		t.Fatalf("Start(empty Durable) err = %v, want Durable-required error", err)
+	}
+}
+
+// TestIsShutdownConsumeErr pins the classifier over BOTH error families: the
+// jetstream consume loop emits its own jetstream.ErrConnectionClosed (a
+// distinct value wrapping neither core sentinel), and either family is benign
+// only once ctx is done — a mid-run connection loss stays a real fault.
+func TestIsShutdownConsumeErr(t *testing.T) {
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+	live := context.Background()
+
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{"jetstream closed, shutting down", done, jetstream.ErrConnectionClosed, true},
+		{"core closed, shutting down", done, nats.ErrConnectionClosed, true},
+		{"core draining, shutting down", done, nats.ErrConnectionDraining, true},
+		{"jetstream closed, mid-run", live, jetstream.ErrConnectionClosed, false},
+		{"unrelated error, shutting down", done, errors.New("boom"), false},
+	} {
+		if got := isShutdownConsumeErr(tc.ctx, tc.err); got != tc.want {
+			t.Errorf("%s: isShutdownConsumeErr = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestStartRejectsKeepInProgressWithPrefetch pins the config conflict: the
+// heartbeat extends only the in-flight delivery, so a multi-message prefetch
+// would let buffered deliveries exhaust AckWait behind a long handler and
+// redeliver concurrently — exactly what KeepInProgress exists to prevent.
+func TestStartRejectsKeepInProgressWithPrefetch(t *testing.T) {
+	cfg := testCfg
+	cfg.Durable = "test_durable"
+	cfg.KeepInProgress = true
+	cfg.MaxMessages = 10
+	if _, err := Start(context.Background(), nil, cfg, func(jetstream.Msg) {}); err == nil || !strings.Contains(err.Error(), "MaxMessages") {
+		t.Fatalf("Start(KeepInProgress, MaxMessages=10) err = %v, want MaxMessages conflict error", err)
+	}
+}
+
+// startTestConsumer boots an embedded JetStream server, a stream, and a
+// running consumer delivering to onMsg, returning the runner, the JetStream
+// context for publishing, and the consume context's cancel.
+func startTestConsumer(t *testing.T, onMsg func(jetstream.Msg)) (*Runner, jetstream.JetStream, context.CancelFunc) {
+	t.Helper()
+	url := runJetStreamServer(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
+		Name: "events_v1", Subjects: []string{"events.>"},
+	}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	run, err := Start(ctx, nc, Config{
+		Stream:        "events_v1",
+		Durable:       "test_durable",
+		FilterSubject: "events.repo",
+		Name:          "testconsumer",
+		SpanName:      "test.consume",
+	}, onMsg)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	return run, js, cancel
+}
+
+// TestStopWaitsForInFlightHandler pins Stop's join semantics: it must not
+// return while a handler is mid-flight, so callers can tear down the
+// resources handlers use (stores, publishers, the connection) as soon as it
+// returns — the cancel → join → drain ordering.
+func TestStopWaitsForInFlightHandler(t *testing.T) {
+	started := make(chan struct{})
+	var handlerDone atomic.Bool
+	run, js, _ := startTestConsumer(t, func(m jetstream.Msg) {
+		close(started)
+		time.Sleep(300 * time.Millisecond)
+		handlerDone.Store(true)
+		if err := m.Ack(); err != nil {
+			t.Errorf("ack: %v", err)
+		}
+	})
+
+	if _, err := js.Publish(context.Background(), "events.repo", []byte("slow")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never started")
+	}
+	run.Stop()
+	if !handlerDone.Load() {
+		t.Fatal("Stop returned while the handler was still in flight")
+	}
+}
+
+// TestStopConcurrentWithCancel drives the explicit-Stop-races-context-cancel
+// path the race detector previously caught: several goroutines call Stop
+// while ctx cancellation triggers the Start-armed stop. All calls must
+// return, without panic or race.
+func TestStopConcurrentWithCancel(t *testing.T) {
+	run, _, cancel := startTestConsumer(t, func(jetstream.Msg) {})
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			run.Stop()
+		}()
+	}
+	cancel()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("concurrent Stop calls did not all return")
+	}
+}
+
+// runJetStreamServer starts an in-process JetStream-enabled NATS server on a
+// random loopback port and returns its client URL.
+func runJetStreamServer(t *testing.T) string {
+	t.Helper()
+	s, err := natsserver.NewServer(&natsserver.Options{
+		Host:      "127.0.0.1",
+		Port:      -1, // pick a free port
+		NoLog:     true,
+		NoSigs:    true,
+		JetStream: true,
+		StoreDir:  t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("new embedded nats server: %v", err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(10 * time.Second) {
+		t.Fatal("embedded nats server not ready in time")
+	}
+	t.Cleanup(s.Shutdown)
+	return s.ClientURL()
+}
+
+// TestStartDeliversToOnMsg drives the whole scaffold against an embedded
+// JetStream server: Start creates the durable, a published message reaches
+// onMsg, and cancelling ctx stops the runner.
+func TestStartDeliversToOnMsg(t *testing.T) {
+	url := runJetStreamServer(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
+		Name: "events_v1", Subjects: []string{"events.>"},
+	}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+
+	got := make(chan jetstream.Msg, 1)
+	run, err := Start(ctx, nc, Config{
+		Stream:        "events_v1",
+		Durable:       "test_durable",
+		FilterSubject: "events.repo",
+		Name:          "testconsumer",
+		SpanName:      "test.consume",
+	}, func(m jetstream.Msg) {
+		if err := m.Ack(); err != nil {
+			t.Errorf("ack: %v", err)
+		}
+		got <- m
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer run.Stop()
+
+	if _, err := js.Publish(ctx, "events.repo", []byte("hello")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case m := <-got:
+		if string(m.Data()) != "hello" {
+			t.Errorf("payload = %q, want hello", m.Data())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("message did not reach onMsg")
+	}
+}
