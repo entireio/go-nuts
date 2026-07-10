@@ -170,6 +170,42 @@ func TestStartNilConn(t *testing.T) {
 	}
 }
 
+// TestStartRejectsEmptyDurable: an empty durable would make
+// CreateOrUpdateConsumer silently create an ephemeral, server-named consumer,
+// losing resume-across-restarts — reject it before touching the broker.
+func TestStartRejectsEmptyDurable(t *testing.T) {
+	if _, err := Start(context.Background(), nil, testCfg, func(jetstream.Msg) {}); err == nil || !strings.Contains(err.Error(), "Durable") {
+		t.Fatalf("Start(empty Durable) err = %v, want Durable-required error", err)
+	}
+}
+
+// TestIsShutdownConsumeErr pins the classifier over BOTH error families: the
+// jetstream consume loop emits its own jetstream.ErrConnectionClosed (a
+// distinct value wrapping neither core sentinel), and either family is benign
+// only once ctx is done — a mid-run connection loss stays a real fault.
+func TestIsShutdownConsumeErr(t *testing.T) {
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+	live := context.Background()
+
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{"jetstream closed, shutting down", done, jetstream.ErrConnectionClosed, true},
+		{"core closed, shutting down", done, nats.ErrConnectionClosed, true},
+		{"core draining, shutting down", done, nats.ErrConnectionDraining, true},
+		{"jetstream closed, mid-run", live, jetstream.ErrConnectionClosed, false},
+		{"unrelated error, shutting down", done, errors.New("boom"), false},
+	} {
+		if got := isShutdownConsumeErr(tc.ctx, tc.err); got != tc.want {
+			t.Errorf("%s: isShutdownConsumeErr = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // TestStartRejectsKeepInProgressWithPrefetch pins the config conflict: the
 // heartbeat extends only the in-flight delivery, so a multi-message prefetch
 // would let buffered deliveries exhaust AckWait behind a long handler and

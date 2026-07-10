@@ -22,6 +22,7 @@ package jsconsumer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -131,6 +132,19 @@ func (c Config) logger() *slog.Logger {
 	return c.Logger
 }
 
+// isShutdownConsumeErr reports whether a consume error is the benign result
+// of the connection going away during shutdown. [nuts.IsShutdownFetchErr]
+// covers the core nats.go sentinels, but the jetstream consume loop surfaces
+// its OWN [jetstream.ErrConnectionClosed] — a distinct value that wraps
+// neither — so it must be matched separately or a clean rollout drain still
+// logs a warning (the COR-923 noise this suppression exists to remove). As
+// with the root classifier, it is only "clean" when ctx is already done; a
+// mid-run connection loss is a genuine fault worth logging.
+func isShutdownConsumeErr(ctx context.Context, err error) bool {
+	return nuts.IsShutdownFetchErr(ctx, err) ||
+		(ctx.Err() != nil && errors.Is(err, jetstream.ErrConnectionClosed))
+}
+
 // Runner is a live consume loop. Stop halts it and is idempotent.
 type Runner struct {
 	cc jetstream.ConsumeContext
@@ -163,11 +177,18 @@ func (r *Runner) Stop() {
 // opt in per-stream gate Start behind that opt-in so a cell without the stream
 // doesn't error at CreateOrUpdateConsumer.
 //
-// Consume errors are logged at Warn, except a drain/close during shutdown
-// ([nuts.IsShutdownFetchErr]), which is a clean exit rather than a fault.
+// Consume errors are logged at Warn, except a drain/close during shutdown —
+// both the core nats.go sentinels ([nuts.IsShutdownFetchErr]) and jetstream's
+// own connection-closed error — which is a clean exit rather than a fault.
 func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.Msg)) (*Runner, error) {
 	if cfg.KeepInProgress && cfg.MaxMessages > 1 {
 		return nil, fmt.Errorf("jsconsumer(%s): KeepInProgress requires MaxMessages <= 1: the heartbeat extends only the in-flight delivery, so %d buffered messages would exhaust AckWait behind a long handler", cfg.Name, cfg.MaxMessages)
+	}
+	if cfg.Durable == "" {
+		// CreateOrUpdateConsumer accepts an empty durable and silently makes
+		// an ephemeral, server-named consumer — losing the stable
+		// resume-across-restarts behavior this scaffold promises.
+		return nil, fmt.Errorf("jsconsumer(%s): Durable is required", cfg.Name)
 	}
 	if nc == nil {
 		return nil, fmt.Errorf("jsconsumer(%s): nil nats conn", cfg.Name)
@@ -188,7 +209,7 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 		return nil, fmt.Errorf("jsconsumer(%s): create consumer %s/%s: %w", cfg.Name, cfg.Stream, cfg.Durable, err)
 	}
 	consumeOpts := []jetstream.PullConsumeOpt{jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, cerr error) {
-		if nuts.IsShutdownFetchErr(ctx, cerr) {
+		if isShutdownConsumeErr(ctx, cerr) {
 			return
 		}
 		cfg.logger().WarnContext(ctx, cfg.Name+": consume error", slog.Any("error", cerr))
