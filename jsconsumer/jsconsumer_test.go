@@ -126,6 +126,27 @@ func TestProcessNoKeepInProgressByDefault(t *testing.T) {
 	}
 }
 
+// TestConfigEffectiveValues pins the zero-value resolution callers must use
+// when the real tunables matter outside the scaffold — most importantly
+// feeding EffectiveMaxDeliver (never the raw field) into a backoff.Policy,
+// where a zero means unlimited redeliveries instead of "default to 8".
+func TestConfigEffectiveValues(t *testing.T) {
+	var zero Config
+	if got := zero.EffectiveAckWait(); got != DefaultAckWait {
+		t.Errorf("zero EffectiveAckWait = %v, want DefaultAckWait (%v)", got, DefaultAckWait)
+	}
+	if got := zero.EffectiveMaxDeliver(); got != DefaultMaxDeliver {
+		t.Errorf("zero EffectiveMaxDeliver = %d, want DefaultMaxDeliver (%d)", got, DefaultMaxDeliver)
+	}
+	set := Config{AckWait: time.Second, MaxDeliver: 3}
+	if got := set.EffectiveAckWait(); got != time.Second {
+		t.Errorf("set EffectiveAckWait = %v, want 1s", got)
+	}
+	if got := set.EffectiveMaxDeliver(); got != 3 {
+		t.Errorf("set EffectiveMaxDeliver = %d, want 3", got)
+	}
+}
+
 // TestRunnerStopIdempotent: Stop is safe on a nil Runner, a zero Runner, and
 // twice. A panic on any of these fails the test.
 func TestRunnerStopIdempotent(_ *testing.T) {

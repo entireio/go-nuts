@@ -37,13 +37,13 @@ import (
 )
 
 const (
-	// defaultAckWait is how long JetStream waits for an ack before redelivery
+	// DefaultAckWait is how long JetStream waits for an ack before redelivery
 	// when Config.AckWait is zero — comfortably longer than an RPC round-trip
 	// plus a DB upsert, short enough that a stuck message redelivers promptly.
-	defaultAckWait = 30 * time.Second
-	// defaultMaxDeliver caps redelivery before JetStream stops redelivering a
+	DefaultAckWait = 30 * time.Second
+	// DefaultMaxDeliver caps redelivery before JetStream stops redelivering a
 	// message when Config.MaxDeliver is zero.
-	defaultMaxDeliver = 8
+	DefaultMaxDeliver = 8
 )
 
 // Config describes the durable consumer to create and how to trace/log it. The
@@ -55,8 +55,8 @@ type Config struct {
 	Durable        string        // durable consumer name, stable across restarts
 	FilterSubject  string        // set this OR FilterSubjects
 	FilterSubjects []string      // set this OR FilterSubject
-	AckWait        time.Duration // 0 → defaultAckWait
-	MaxDeliver     int           // 0 → defaultMaxDeliver
+	AckWait        time.Duration // 0 → DefaultAckWait (see EffectiveAckWait)
+	MaxDeliver     int           // 0 → DefaultMaxDeliver (see EffectiveMaxDeliver)
 	SpanName       string        // per-message consumer span name (e.g. "repolifecycle.consume")
 	Name           string        // short consumer name, used as the log prefix
 
@@ -76,16 +76,28 @@ type Config struct {
 	KeepInProgress bool
 }
 
-func (c Config) ackWait() time.Duration {
+// EffectiveAckWait is the AckWait actually applied to the JetStream consumer:
+// Config.AckWait, or DefaultAckWait when zero. Use it — not the raw field —
+// anywhere the real value matters, e.g. wiring a natsmsg.KeepInProgress
+// heartbeat by hand (a zero ackWait there is a no-op).
+func (c Config) EffectiveAckWait() time.Duration {
 	if c.AckWait == 0 {
-		return defaultAckWait
+		return DefaultAckWait
 	}
 	return c.AckWait
 }
 
-func (c Config) maxDeliver() int {
+// EffectiveMaxDeliver is the MaxDeliver actually applied to the JetStream
+// consumer: Config.MaxDeliver, or DefaultMaxDeliver when zero. Use it — not
+// the raw field — when building a backoff.Policy for this consumer's
+// messages: the two packages read zero differently (here it means "default
+// to DefaultMaxDeliver"; on the policy it means unlimited redeliveries, the
+// jetstream.ConsumerConfig semantics), so passing a zero Config.MaxDeliver
+// through verbatim would make TermOnExhaustion never fire on the broker's
+// real final delivery and orphan work-queue messages (COR-762).
+func (c Config) EffectiveMaxDeliver() int {
 	if c.MaxDeliver == 0 {
-		return defaultMaxDeliver
+		return DefaultMaxDeliver
 	}
 	return c.MaxDeliver
 }
@@ -134,8 +146,8 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 	cons, err := js.CreateOrUpdateConsumer(ctx, cfg.Stream, jetstream.ConsumerConfig{
 		Durable:        cfg.Durable,
 		AckPolicy:      jetstream.AckExplicitPolicy,
-		AckWait:        cfg.ackWait(),
-		MaxDeliver:     cfg.maxDeliver(),
+		AckWait:        cfg.EffectiveAckWait(),
+		MaxDeliver:     cfg.EffectiveMaxDeliver(),
 		FilterSubject:  cfg.FilterSubject,
 		FilterSubjects: cfg.FilterSubjects,
 	})
@@ -198,7 +210,7 @@ func Process[E any](
 		return
 	}
 	if cfg.KeepInProgress {
-		stop := natsmsg.KeepInProgress(msg.InProgress, cfg.ackWait())
+		stop := natsmsg.KeepInProgress(msg.InProgress, cfg.EffectiveAckWait())
 		defer stop()
 	}
 	handle(ctx, span, msg, ev)
