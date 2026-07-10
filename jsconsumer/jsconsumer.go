@@ -73,7 +73,21 @@ type Config struct {
 	// natsmsg.KeepInProgress. The heartbeat stops when handle returns; a tick
 	// racing the handler's own terminal Ack/Nak/Term is a client-side no-op
 	// (nats.go marks the message disposed locally) that halts the heartbeat.
+	//
+	// Setting this forces the prefetch to one message (see MaxMessages): the
+	// heartbeat extends only the delivery the handler holds, so anything
+	// buffered behind a long handler would exhaust its AckWait unextended.
 	KeepInProgress bool
+
+	// MaxMessages caps how many deliveries the consume loop buffers
+	// client-side (jetstream.PullMaxMessages); 0 uses the nats.go default
+	// (500). AckWait runs from server delivery into that buffer, not from
+	// callback dispatch, and callbacks run serially — so a consumer whose
+	// handler can approach AckWait should keep this small or queued
+	// deliveries expire and redeliver concurrently to other replicas.
+	// KeepInProgress forces it to 1; setting both to conflicting values is a
+	// Start error.
+	MaxMessages int
 }
 
 // EffectiveAckWait is the AckWait actually applied to the JetStream consumer:
@@ -136,6 +150,9 @@ func (r *Runner) Stop() {
 // Consume errors are logged at Warn, except a drain/close during shutdown
 // ([nuts.IsShutdownFetchErr]), which is a clean exit rather than a fault.
 func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.Msg)) (*Runner, error) {
+	if cfg.KeepInProgress && cfg.MaxMessages > 1 {
+		return nil, fmt.Errorf("jsconsumer(%s): KeepInProgress requires MaxMessages <= 1: the heartbeat extends only the in-flight delivery, so %d buffered messages would exhaust AckWait behind a long handler", cfg.Name, cfg.MaxMessages)
+	}
 	if nc == nil {
 		return nil, fmt.Errorf("jsconsumer(%s): nil nats conn", cfg.Name)
 	}
@@ -154,12 +171,19 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 	if err != nil {
 		return nil, fmt.Errorf("jsconsumer(%s): create consumer %s/%s: %w", cfg.Name, cfg.Stream, cfg.Durable, err)
 	}
-	cc, err := cons.Consume(onMsg, jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, cerr error) {
+	consumeOpts := []jetstream.PullConsumeOpt{jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, cerr error) {
 		if nuts.IsShutdownFetchErr(ctx, cerr) {
 			return
 		}
 		cfg.logger().WarnContext(ctx, cfg.Name+": consume error", slog.Any("error", cerr))
-	}))
+	})}
+	switch {
+	case cfg.KeepInProgress:
+		consumeOpts = append(consumeOpts, jetstream.PullMaxMessages(1))
+	case cfg.MaxMessages > 0:
+		consumeOpts = append(consumeOpts, jetstream.PullMaxMessages(cfg.MaxMessages))
+	}
+	cc, err := cons.Consume(onMsg, consumeOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("jsconsumer(%s): consume %s: %w", cfg.Name, cfg.Stream, err)
 	}

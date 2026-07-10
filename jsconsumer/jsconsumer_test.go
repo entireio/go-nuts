@@ -3,6 +3,7 @@ package jsconsumer
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -160,8 +161,24 @@ func TestRunnerStopIdempotent(_ *testing.T) {
 
 // TestStartNilConn: a nil connection is rejected up front, not on first use.
 func TestStartNilConn(t *testing.T) {
-	if _, err := Start(context.Background(), nil, testCfg, func(jetstream.Msg) {}); err == nil {
+	cfg := testCfg
+	cfg.Durable = "test_durable"
+	if _, err := Start(context.Background(), nil, cfg, func(jetstream.Msg) {}); err == nil {
 		t.Fatal("Start(nil conn) succeeded, want error")
+	}
+}
+
+// TestStartRejectsKeepInProgressWithPrefetch pins the config conflict: the
+// heartbeat extends only the in-flight delivery, so a multi-message prefetch
+// would let buffered deliveries exhaust AckWait behind a long handler and
+// redeliver concurrently — exactly what KeepInProgress exists to prevent.
+func TestStartRejectsKeepInProgressWithPrefetch(t *testing.T) {
+	cfg := testCfg
+	cfg.Durable = "test_durable"
+	cfg.KeepInProgress = true
+	cfg.MaxMessages = 10
+	if _, err := Start(context.Background(), nil, cfg, func(jetstream.Msg) {}); err == nil || !strings.Contains(err.Error(), "MaxMessages") {
+		t.Fatalf("Start(KeepInProgress, MaxMessages=10) err = %v, want MaxMessages conflict error", err)
 	}
 }
 
