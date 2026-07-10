@@ -1,0 +1,45 @@
+{
+  "cli_version": "0.8.43-nightly.202607081321.e009b7501",
+  "checkpoint_id": "788ee0fc2a18",
+  "session_id": "019f4c34-15c7-7073-8dfd-18c350a9f1bd",
+  "strategy": "manual-commit",
+  "created_at": "2026-07-10T13:40:44.894751Z",
+  "branch": "nodo/cor-929-grow-go-nuts",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "jsconsumer/jsconsumer.go",
+    "jsconsumer/jsconsumer_test.go"
+  ],
+  "agent": "Codex",
+  "model": "gpt-5.6-sol",
+  "turn_id": "49531a9aebd8",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 109358,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 2281216,
+    "output_tokens": 11900,
+    "api_call_count": 37
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-07-10T13:40:44.878047Z",
+    "agent_lines": 46,
+    "agent_removed": 13,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 46,
+    "total_lines_changed": 59,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    }
+  ]
+}
