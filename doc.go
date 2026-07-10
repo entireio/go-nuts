@@ -1,4 +1,4 @@
-// Package entwine provides shared NATS connection-lifecycle helpers for Entire
+// Package nuts provides shared NATS connection-lifecycle helpers for Entire
 // services: a rotation-aware mTLS [Connect] with the org-standard resiliency
 // options, a [Drain] that waits for a connection to flush and close on graceful
 // shutdown, an [IsShutdownFetchErr] classifier so pull-consumer loops can treat
@@ -12,4 +12,4 @@
 // plumbing. Consumer scaffolding (jsconsumer), message helpers (natsmsg), and
 // the redelivery/DLQ policy (backoff) will land here as those services converge
 // onto the module. Tracking: COR-925.
-package entwine
+package nuts

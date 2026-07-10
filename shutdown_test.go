@@ -1,4 +1,4 @@
-package entwine
+package nuts
 
 import (
 	"context"
@@ -92,7 +92,7 @@ func TestGoRecoversPanic(t *testing.T) {
 	})
 	g.Go(func(context.Context) { panic("boom") })
 
-	h.waitFor(t, "entwine: background loop panicked")
+	h.waitFor(t, "nuts: background loop panicked")
 
 	g.Shutdown() // must complete despite the earlier panic
 	if !sibling.Load() {
@@ -110,7 +110,7 @@ func TestGoLogsPrematureReturn(t *testing.T) {
 		// Returns immediately without waiting for cancellation.
 	})
 
-	h.waitFor(t, "entwine: background loop returned before shutdown")
+	h.waitFor(t, "nuts: background loop returned before shutdown")
 }
 
 // TestGoCleanReturnOnShutdownIsSilent guards that a normal return in response to
@@ -122,7 +122,7 @@ func TestGoCleanReturnOnShutdownIsSilent(t *testing.T) {
 	g.Go(func(ctx context.Context) { <-ctx.Done() })
 	g.Shutdown()
 
-	if h.has("entwine: background loop returned before shutdown") {
+	if h.has("nuts: background loop returned before shutdown") {
 		t.Fatalf("a cancellation-driven return was wrongly flagged; saw %v", h.snapshot())
 	}
 }
@@ -166,7 +166,7 @@ func TestAddConnAfterShutdownIsRefused(t *testing.T) {
 	if nc.IsClosed() {
 		t.Fatal("late-registered connection was drained despite shutdown having completed")
 	}
-	if !h.has("entwine: ShutdownGroup.AddConn called after shutdown; connection not registered for drain") {
+	if !h.has("nuts: ShutdownGroup.AddConn called after shutdown; connection not registered for drain") {
 		t.Fatalf("expected a refusal warning for late AddConn; saw %v", h.snapshot())
 	}
 }

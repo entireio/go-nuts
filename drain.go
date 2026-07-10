@@ -1,4 +1,4 @@
-package entwine
+package nuts
 
 import (
 	"context"
@@ -18,7 +18,7 @@ import (
 //
 //	msgs, err := sub.Fetch(1, nats.MaxWait(5*time.Second))
 //	if err != nil {
-//		if errors.Is(err, nats.ErrTimeout) || entwine.IsShutdownFetchErr(ctx, err) {
+//		if errors.Is(err, nats.ErrTimeout) || nuts.IsShutdownFetchErr(ctx, err) {
 //			// benign: idle poll, or a drain/close during shutdown
 //		}
 //		...
@@ -70,7 +70,7 @@ func Drain(ctx context.Context, nc *nats.Conn, name string, logger *slog.Logger,
 	defer nc.RemoveStatusListener(closed)
 
 	if err := nc.Drain(); err != nil {
-		logger.WarnContext(ctx, "entwine: NATS drain failed; closing",
+		logger.WarnContext(ctx, "nuts: NATS drain failed; closing",
 			slog.String("conn", name), slog.Any("error", err))
 		nc.Close()
 		return
@@ -78,8 +78,8 @@ func Drain(ctx context.Context, nc *nats.Conn, name string, logger *slog.Logger,
 
 	select {
 	case <-closed:
-		logger.InfoContext(ctx, "entwine: NATS drained", slog.String("conn", name))
+		logger.InfoContext(ctx, "nuts: NATS drained", slog.String("conn", name))
 	case <-time.After(timeout):
-		logger.WarnContext(ctx, "entwine: NATS drain timed out before close", slog.String("conn", name))
+		logger.WarnContext(ctx, "nuts: NATS drain timed out before close", slog.String("conn", name))
 	}
 }

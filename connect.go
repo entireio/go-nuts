@@ -1,4 +1,4 @@
-package entwine
+package nuts
 
 import (
 	"context"
@@ -98,9 +98,9 @@ func WithRetryOnFailedConnect() Option {
 	return func(c *config) { c.retryOnFailedConnect = true }
 }
 
-// WithNATSOptions appends raw nats.Option values, applied after entwine's
+// WithNATSOptions appends raw nats.Option values, applied after nuts's
 // defaults so a caller can override any of them. An escape hatch for options
-// entwine does not model.
+// nuts does not model.
 func WithNATSOptions(opts ...nats.Option) Option {
 	return func(c *config) { c.extra = append(c.extra, opts...) }
 }
@@ -124,7 +124,7 @@ func WithNATSOptions(opts ...nats.Option) Option {
 // finishes and pull-consumer fetch loops exit cleanly.
 func Connect(ctx context.Context, url string, opts ...Option) (*nats.Conn, error) {
 	if url == "" {
-		return nil, errors.New("entwine: nats url is empty")
+		return nil, errors.New("nuts: nats url is empty")
 	}
 	cfg := config{
 		logger:        slog.Default(),
@@ -170,19 +170,19 @@ func Connect(ctx context.Context, url string, opts ...Option) (*nats.Conn, error
 			// ERROR makes clean shutdowns look like failures, so route the
 			// explicit-close case to INFO.
 			if err == nil {
-				cfg.logger.InfoContext(logCtx, "entwine: NATS disconnected", connAttr)
+				cfg.logger.InfoContext(logCtx, "nuts: NATS disconnected", connAttr)
 				return
 			}
-			cfg.logger.ErrorContext(logCtx, "entwine: NATS disconnected", connAttr, slog.Any("error", err))
+			cfg.logger.ErrorContext(logCtx, "nuts: NATS disconnected", connAttr, slog.Any("error", err))
 		}),
 		nats.ClosedHandler(func(_ *nats.Conn) {
-			cfg.logger.InfoContext(logCtx, "entwine: NATS connection closed", connAttr)
+			cfg.logger.InfoContext(logCtx, "nuts: NATS connection closed", connAttr)
 		}),
 		nats.ReconnectHandler(func(_ *nats.Conn) {
-			cfg.logger.InfoContext(logCtx, "entwine: NATS reconnected", connAttr)
+			cfg.logger.InfoContext(logCtx, "nuts: NATS reconnected", connAttr)
 		}),
 		nats.ReconnectErrHandler(func(_ *nats.Conn, err error) {
-			cfg.logger.ErrorContext(logCtx, "entwine: NATS reconnect failed", connAttr, slog.Any("error", err))
+			cfg.logger.ErrorContext(logCtx, "nuts: NATS reconnect failed", connAttr, slog.Any("error", err))
 		}),
 	}
 	if tlsConf != nil {
@@ -195,18 +195,18 @@ func Connect(ctx context.Context, url string, opts ...Option) (*nats.Conn, error
 
 	nc, err := nats.Connect(url, natsOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("entwine: connect to NATS: %w", err)
+		return nil, fmt.Errorf("nuts: connect to NATS: %w", err)
 	}
 	// With RetryOnFailedConnect enabled, nats.Connect returns a nil error even
 	// when the initial dial failed — the connection is in RECONNECTING and the
 	// client is retrying in the background. Report that honestly instead of
 	// claiming "connected".
 	if status := nc.Status(); status != nats.CONNECTED {
-		cfg.logger.WarnContext(ctx, "entwine: NATS not yet connected; retrying in background",
+		cfg.logger.WarnContext(ctx, "nuts: NATS not yet connected; retrying in background",
 			connAttr, slog.String("url", url), slog.String("status", status.String()))
 		return nc, nil
 	}
-	cfg.logger.InfoContext(ctx, "entwine: NATS connected", connAttr, slog.String("url", url))
+	cfg.logger.InfoContext(ctx, "nuts: NATS connected", connAttr, slog.String("url", url))
 	return nc, nil
 }
 
@@ -215,7 +215,7 @@ func Connect(ctx context.Context, url string, opts ...Option) (*nats.Conn, error
 func tlsConfigFromEnv() (*tls.Config, error) {
 	cert, key, ca := os.Getenv(envTLSCert), os.Getenv(envTLSKey), os.Getenv(envTLSCA)
 	if cert == "" || key == "" || ca == "" {
-		return nil, fmt.Errorf("entwine: %s, %s, %s all required for NATS mTLS", envTLSCert, envTLSKey, envTLSCA)
+		return nil, fmt.Errorf("nuts: %s, %s, %s all required for NATS mTLS", envTLSCert, envTLSKey, envTLSCA)
 	}
 	return TLSConfigFromFiles(cert, key, ca)
 }
@@ -234,7 +234,7 @@ func tlsConfigFromEnv() (*tls.Config, error) {
 // the static RootCAs field.
 func TLSConfigFromFiles(certFile, keyFile, caFile string) (*tls.Config, error) {
 	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
-		return nil, fmt.Errorf("entwine: load tls keypair: %w", err)
+		return nil, fmt.Errorf("nuts: load tls keypair: %w", err)
 	}
 	if _, err := caPoolFromFile(caFile); err != nil {
 		return nil, err
@@ -243,7 +243,7 @@ func TLSConfigFromFiles(certFile, keyFile, caFile string) (*tls.Config, error) {
 		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 			if err != nil {
-				return nil, fmt.Errorf("entwine: reload tls keypair: %w", err)
+				return nil, fmt.Errorf("nuts: reload tls keypair: %w", err)
 			}
 			return &cert, nil
 		},
@@ -257,7 +257,7 @@ func TLSConfigFromFiles(certFile, keyFile, caFile string) (*tls.Config, error) {
 				return err
 			}
 			if len(cs.PeerCertificates) == 0 {
-				return errors.New("entwine: server presented no certificate")
+				return errors.New("nuts: server presented no certificate")
 			}
 			opts := x509.VerifyOptions{
 				Roots:         roots,
@@ -268,7 +268,7 @@ func TLSConfigFromFiles(certFile, keyFile, caFile string) (*tls.Config, error) {
 				opts.Intermediates.AddCert(cert)
 			}
 			if _, err := cs.PeerCertificates[0].Verify(opts); err != nil {
-				return fmt.Errorf("entwine: verify server certificate: %w", err)
+				return fmt.Errorf("nuts: verify server certificate: %w", err)
 			}
 			return nil
 		},
@@ -281,11 +281,11 @@ func TLSConfigFromFiles(certFile, keyFile, caFile string) (*tls.Config, error) {
 func caPoolFromFile(caFile string) (*x509.CertPool, error) {
 	caBytes, err := os.ReadFile(caFile)
 	if err != nil {
-		return nil, fmt.Errorf("entwine: read ca: %w", err)
+		return nil, fmt.Errorf("nuts: read ca: %w", err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caBytes) {
-		return nil, errors.New("entwine: ca PEM: no certs parsed")
+		return nil, errors.New("nuts: ca PEM: no certs parsed")
 	}
 	return pool, nil
 }

@@ -1,4 +1,4 @@
-# entwine
+# go-nuts
 
 Connection-lifecycle helpers for [NATS](https://nats.io) pull consumers in Go —
 a small, dependency-light layer over
@@ -8,7 +8,7 @@ shutting down cleanly.
 ## Install
 
 ```
-go get github.com/entireio/entwine
+go get github.com/entireio/go-nuts
 ```
 
 ## What it provides
@@ -32,8 +32,8 @@ go get github.com/entireio/entwine
 ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 defer stop()
 
-g := entwine.NewShutdownGroup(ctx)
-nc, err := entwine.Connect(g.Context(), natsURL, entwine.WithName("worker"))
+g := nuts.NewShutdownGroup(ctx)
+nc, err := nuts.Connect(g.Context(), natsURL, nuts.WithName("worker"))
 if err != nil {
 	return err
 }
@@ -51,7 +51,7 @@ g.Go(func(ctx context.Context) {
 		switch {
 		case errors.Is(err, nats.ErrTimeout):
 			continue // idle poll
-		case entwine.IsShutdownFetchErr(ctx, err):
+		case nuts.IsShutdownFetchErr(ctx, err):
 			return // clean shutdown: connection drained/closed
 		case err != nil:
 			// Real error — log/metric, then back off so a fast-failing Fetch

@@ -1,4 +1,4 @@
-package entwine
+package nuts
 
 import (
 	"context"
@@ -22,8 +22,8 @@ const DefaultJoinTimeout = 10 * time.Second
 //
 // Typical use in a service main:
 //
-//	g := entwine.NewShutdownGroup(ctx)
-//	nc, _ := entwine.Connect(g.Context(), url, entwine.WithName("worker"))
+//	g := nuts.NewShutdownGroup(ctx)
+//	nc, _ := nuts.Connect(g.Context(), url, nuts.WithName("worker"))
 //	g.AddConn("worker", nc)
 //	g.Go(func(ctx context.Context) { consumer.Run(ctx) }) // returns on ctx.Done
 //	<-ctx.Done() // SIGTERM/SIGINT
@@ -115,7 +115,7 @@ func (g *ShutdownGroup) Go(fn func(ctx context.Context)) {
 	g.mu.Lock()
 	if g.closed {
 		g.mu.Unlock()
-		g.logger.WarnContext(g.ctx, "entwine: ShutdownGroup.Go called after shutdown; loop not started")
+		g.logger.WarnContext(g.ctx, "nuts: ShutdownGroup.Go called after shutdown; loop not started")
 		return
 	}
 	g.wg.Add(1)
@@ -125,7 +125,7 @@ func (g *ShutdownGroup) Go(fn func(ctx context.Context)) {
 		defer g.wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
-				g.logger.ErrorContext(g.ctx, "entwine: background loop panicked",
+				g.logger.ErrorContext(g.ctx, "nuts: background loop panicked",
 					slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 				return
 			}
@@ -133,7 +133,7 @@ func (g *ShutdownGroup) Go(fn func(ctx context.Context)) {
 			// stopped supervising its subsystem while it was still supposed to
 			// be running — surface it instead of letting the pod look healthy.
 			if g.ctx.Err() == nil {
-				g.logger.ErrorContext(g.ctx, "entwine: background loop returned before shutdown")
+				g.logger.ErrorContext(g.ctx, "nuts: background loop returned before shutdown")
 			}
 		}()
 		fn(g.ctx)
@@ -154,7 +154,7 @@ func (g *ShutdownGroup) AddConn(name string, nc *nats.Conn) {
 	g.mu.Lock()
 	if g.closed {
 		g.mu.Unlock()
-		g.logger.WarnContext(g.ctx, "entwine: ShutdownGroup.AddConn called after shutdown; connection not registered for drain",
+		g.logger.WarnContext(g.ctx, "nuts: ShutdownGroup.AddConn called after shutdown; connection not registered for drain",
 			slog.String("conn", name))
 		return
 	}
@@ -188,7 +188,7 @@ func (g *ShutdownGroup) shutdown() {
 	select {
 	case <-done:
 	case <-time.After(g.joinTimeout):
-		g.logger.WarnContext(g.ctx, "entwine: background loops did not stop within join timeout; draining anyway",
+		g.logger.WarnContext(g.ctx, "nuts: background loops did not stop within join timeout; draining anyway",
 			slog.Duration("join_timeout", g.joinTimeout))
 	}
 
