@@ -95,6 +95,19 @@ func TestStartConsumerSpanReparents(t *testing.T) {
 	}
 }
 
+// TestHeaderCarrierValues pins the ValuesGetter contract: every value of a
+// repeated header is returned, so multi-header W3C baggage isn't truncated to
+// its first entry on extract.
+func TestHeaderCarrierValues(t *testing.T) {
+	h := nats.Header{}
+	h.Add("Baggage", "a=1")
+	h.Add("Baggage", "b=2")
+	got := HeaderCarrier(h).Values("Baggage")
+	if len(got) != 2 || got[0] != "a=1" || got[1] != "b=2" {
+		t.Errorf("Values = %v, want [a=1 b=2]", got)
+	}
+}
+
 func TestClampToInt64(t *testing.T) {
 	if got := ClampToInt64(7); got != 7 {
 		t.Errorf("ClampToInt64(7) = %d", got)

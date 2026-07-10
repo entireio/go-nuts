@@ -16,7 +16,7 @@ import (
 // FakeMsg is a jetstream.Msg for unit-testing a consumer's message disposition
 // without a live broker. Script the fields the handler reads (SubjectVal,
 // DataVal, HeadersVal, Meta) and assert the terminal call it made (Acked,
-// Termed, NakDelays, ...). Because jetstream.Msg is an interface — unlike the
+// Termed, Naks, NakDelays). Because jetstream.Msg is an interface — unlike the
 // concrete *nats.Msg whose Ack/Nak/Term hit the wire — the disposition is
 // directly observable.
 type FakeMsg struct {
@@ -28,6 +28,7 @@ type FakeMsg struct {
 
 	Acked       bool
 	Termed      bool
+	Naks        int // plain Nak() calls; delayed naks land in NakDelays
 	NakDelays   []time.Duration
 	InProgressN int
 }
@@ -52,7 +53,7 @@ func (m *FakeMsg) Metadata() (*jetstream.MsgMetadata, error) {
 
 func (m *FakeMsg) Ack() error                      { m.Acked = true; return nil }
 func (m *FakeMsg) DoubleAck(context.Context) error { m.Acked = true; return nil }
-func (m *FakeMsg) Nak() error                      { return nil }
+func (m *FakeMsg) Nak() error                      { m.Naks++; return nil }
 func (m *FakeMsg) NakWithDelay(d time.Duration) error {
 	m.NakDelays = append(m.NakDelays, d)
 	return nil

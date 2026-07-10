@@ -45,7 +45,7 @@ func TestProcessDispatchesDecodedEvent(t *testing.T) {
 	if gotMsg != msg {
 		t.Error("handle got a different msg than the one passed to Process")
 	}
-	if msg.Acked || msg.Termed || len(msg.NakDelays) > 0 {
+	if msg.Acked || msg.Termed || msg.Naks > 0 || len(msg.NakDelays) > 0 {
 		t.Error("Process disposed the message, want none (handle owns ack/nak)")
 	}
 	if dropped {
@@ -267,7 +267,9 @@ func TestStopWaitsForInFlightHandler(t *testing.T) {
 		close(started)
 		time.Sleep(300 * time.Millisecond)
 		handlerDone.Store(true)
-		_ = m.Ack()
+		if err := m.Ack(); err != nil {
+			t.Errorf("ack: %v", err)
+		}
 	})
 
 	if _, err := js.Publish(context.Background(), "events.repo", []byte("slow")); err != nil {
@@ -289,7 +291,7 @@ func TestStopWaitsForInFlightHandler(t *testing.T) {
 // while ctx cancellation triggers the Start-armed stop. All calls must
 // return, without panic or race.
 func TestStopConcurrentWithCancel(t *testing.T) {
-	run, _, cancel := startTestConsumer(t, func(m jetstream.Msg) { _ = m.Ack() })
+	run, _, cancel := startTestConsumer(t, func(jetstream.Msg) {})
 
 	var wg sync.WaitGroup
 	for range 8 {

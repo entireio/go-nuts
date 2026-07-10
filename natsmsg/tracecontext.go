@@ -35,6 +35,11 @@ func (c HeaderCarrier) Get(key string) string {
 
 func (c HeaderCarrier) Set(key, value string) { nats.Header(c).Set(key, value) }
 
+// Values returns every value for key, satisfying [propagation.ValuesGetter]:
+// without it the baggage propagator falls back to Get and reads only the
+// first of multiple same-named headers, truncating multi-header W3C baggage.
+func (c HeaderCarrier) Values(key string) []string { return nats.Header(c).Values(key) }
+
 func (c HeaderCarrier) Keys() []string {
 	keys := make([]string, 0, len(c))
 	for k := range c {
@@ -43,7 +48,10 @@ func (c HeaderCarrier) Keys() []string {
 	return keys
 }
 
-var _ propagation.TextMapCarrier = HeaderCarrier(nil)
+var (
+	_ propagation.TextMapCarrier = HeaderCarrier(nil)
+	_ propagation.ValuesGetter   = HeaderCarrier(nil)
+)
 
 // Inject writes the propagator state from ctx into msg.Header, creating the
 // header map if absent. Call before publishing so the consumer can re-parent.
