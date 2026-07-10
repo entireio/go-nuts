@@ -1,4 +1,4 @@
-package entwine
+package nuts
 
 import (
 	"bytes"
@@ -88,7 +88,7 @@ func writeSelfSignedCert(t *testing.T, certFile, keyFile string) []byte {
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          randSerial(t),
-		Subject:               pkix.Name{CommonName: "entwine-test"},
+		Subject:               pkix.Name{CommonName: "nuts-test"},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
@@ -213,7 +213,7 @@ func newTestCA(t *testing.T) testCA {
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          randSerial(t),
-		Subject:               pkix.Name{CommonName: "entwine-test-ca"},
+		Subject:               pkix.Name{CommonName: "nuts-test-ca"},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(time.Hour),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,

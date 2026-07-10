@@ -1,4 +1,4 @@
-package entwine
+package nuts
 
 import (
 	"context"
@@ -144,7 +144,7 @@ func TestDrainLogsToProvidedLogger(t *testing.T) {
 	logger, h := newCapturingLogger()
 	Drain(t.Context(), nc, "worker", logger, 5*time.Second)
 
-	if !h.has("entwine: NATS drained") {
+	if !h.has("nuts: NATS drained") {
 		t.Fatalf("drain success not logged to the provided logger; saw %v", h.snapshot())
 	}
 }

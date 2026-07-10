@@ -15,7 +15,7 @@ coverage.*
 profile.cov
 *.prof
 
-# Go workspace file — entwine is developed against its consumers via a local
+# Go workspace file — go-nuts is developed against its consumers via a local
 # go.work that is never committed (a real version is cut once the API settles).
 go.work
 go.work.sum

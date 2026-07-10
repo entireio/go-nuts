@@ -1,4 +1,4 @@
-module github.com/entireio/entwine
+module github.com/entireio/go-nuts
 
 go 1.26
 
