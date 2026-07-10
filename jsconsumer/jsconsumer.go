@@ -24,6 +24,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -131,14 +132,29 @@ func (c Config) logger() *slog.Logger {
 }
 
 // Runner is a live consume loop. Stop halts it and is idempotent.
-type Runner struct{ cc jetstream.ConsumeContext }
+type Runner struct {
+	cc jetstream.ConsumeContext
+	// closed is cc.Closed(), captured while the subscription is live (the
+	// same channel is returned on every call, so capturing once avoids any
+	// post-Stop race) — it closes when the consume loop has fully wound
+	// down, including an in-flight handler.
+	closed <-chan struct{}
+	stop   sync.Once
+}
 
-// Stop halts the consume loop. Safe on a nil Runner and safe to call twice.
+// Stop halts the consume loop and blocks until it has fully wound down —
+// including an in-flight handler — so a caller may tear down what handlers
+// use (stores, publishers, the NATS connection) the moment it returns: the
+// cancel → join → drain shutdown ordering (COR-923). Safe on a nil or
+// never-Started Runner, idempotent, and safe for concurrent use — an
+// explicit Stop can race the context-cancel stop armed by Start. Must not be
+// called from inside the handler; it would deadlock waiting on itself.
 func (r *Runner) Stop() {
-	if r != nil && r.cc != nil {
-		r.cc.Stop()
-		r.cc = nil
+	if r == nil || r.cc == nil {
+		return
 	}
+	r.stop.Do(r.cc.Stop)
+	<-r.closed
 }
 
 // Start creates/updates the durable consumer on nc and begins delivering
@@ -187,7 +203,7 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 	if err != nil {
 		return nil, fmt.Errorf("jsconsumer(%s): consume %s: %w", cfg.Name, cfg.Stream, err)
 	}
-	r := &Runner{cc: cc}
+	r := &Runner{cc: cc, closed: cc.Closed()}
 	go func() {
 		<-ctx.Done()
 		r.Stop()

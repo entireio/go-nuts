@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -179,6 +181,95 @@ func TestStartRejectsKeepInProgressWithPrefetch(t *testing.T) {
 	cfg.MaxMessages = 10
 	if _, err := Start(context.Background(), nil, cfg, func(jetstream.Msg) {}); err == nil || !strings.Contains(err.Error(), "MaxMessages") {
 		t.Fatalf("Start(KeepInProgress, MaxMessages=10) err = %v, want MaxMessages conflict error", err)
+	}
+}
+
+// startTestConsumer boots an embedded JetStream server, a stream, and a
+// running consumer delivering to onMsg, returning the runner, the JetStream
+// context for publishing, and the consume context's cancel.
+func startTestConsumer(t *testing.T, onMsg func(jetstream.Msg)) (*Runner, jetstream.JetStream, context.CancelFunc) {
+	t.Helper()
+	url := runJetStreamServer(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
+		Name: "events_v1", Subjects: []string{"events.>"},
+	}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	run, err := Start(ctx, nc, Config{
+		Stream:        "events_v1",
+		Durable:       "test_durable",
+		FilterSubject: "events.repo",
+		Name:          "testconsumer",
+		SpanName:      "test.consume",
+	}, onMsg)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	return run, js, cancel
+}
+
+// TestStopWaitsForInFlightHandler pins Stop's join semantics: it must not
+// return while a handler is mid-flight, so callers can tear down the
+// resources handlers use (stores, publishers, the connection) as soon as it
+// returns — the cancel → join → drain ordering.
+func TestStopWaitsForInFlightHandler(t *testing.T) {
+	started := make(chan struct{})
+	var handlerDone atomic.Bool
+	run, js, _ := startTestConsumer(t, func(m jetstream.Msg) {
+		close(started)
+		time.Sleep(300 * time.Millisecond)
+		handlerDone.Store(true)
+		_ = m.Ack()
+	})
+
+	if _, err := js.Publish(context.Background(), "events.repo", []byte("slow")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never started")
+	}
+	run.Stop()
+	if !handlerDone.Load() {
+		t.Fatal("Stop returned while the handler was still in flight")
+	}
+}
+
+// TestStopConcurrentWithCancel drives the explicit-Stop-races-context-cancel
+// path the race detector previously caught: several goroutines call Stop
+// while ctx cancellation triggers the Start-armed stop. All calls must
+// return, without panic or race.
+func TestStopConcurrentWithCancel(t *testing.T) {
+	run, _, cancel := startTestConsumer(t, func(m jetstream.Msg) { _ = m.Ack() })
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			run.Stop()
+		}()
+	}
+	cancel()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("concurrent Stop calls did not all return")
 	}
 }
 
