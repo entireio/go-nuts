@@ -1,0 +1,1 @@
+let's tackle https://linear.app/entirehq/issue/COR-929/grow-go-nuts-natsmsg-jsconsumer-backoff-and-converge-entiredb-entire shall we?
