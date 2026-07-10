@@ -42,7 +42,10 @@ type Policy struct {
 	// NakDelay is the flat delay before redelivery. Flat, not growing: the
 	// envelope only rides out transient failures; MaxDeliver bounds the total.
 	NakDelay time.Duration
-	// MaxDeliver is the consumer's redelivery cap (jetstream.ConsumerConfig.MaxDeliver).
+	// MaxDeliver is the consumer's redelivery cap
+	// (jetstream.ConsumerConfig.MaxDeliver). Non-positive means unlimited
+	// redeliveries — matching the jetstream field's semantics — so no
+	// delivery is ever final and NakOrTerm always Naks.
 	MaxDeliver int
 	// TermOnExhaustion makes the final delivery Term instead of Nak, so a
 	// work-queue message is removed cleanly rather than orphaning un-acked
@@ -84,9 +87,16 @@ func NumDelivered(msg jetstream.Msg) int {
 
 // IsFinalDelivery reports whether this is the last delivery before JetStream
 // stops redelivering (NumDelivered has reached MaxDeliver), so a transient
-// failure here is terminal rather than another Nak-and-retry. Unavailable
-// metadata reads as non-final: the safe default is another retry, not a Term.
+// failure here is terminal rather than another Nak-and-retry. A non-positive
+// maxDeliver means unlimited redeliveries (the jetstream.ConsumerConfig
+// semantics), so no delivery is final — without the guard the zero value
+// would read every delivery as final and Term on the first failure.
+// Unavailable metadata also reads as non-final: the safe default is another
+// retry, not a Term.
 func IsFinalDelivery(msg jetstream.Msg, maxDeliver int) bool {
+	if maxDeliver <= 0 {
+		return false
+	}
 	if meta, err := msg.Metadata(); err == nil {
 		return meta.NumDelivered >= uint64(maxDeliver)
 	}

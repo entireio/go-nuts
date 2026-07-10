@@ -98,6 +98,26 @@ func TestNakOrTermMissingMetadataNaks(t *testing.T) {
 	}
 }
 
+// TestNakOrTermZeroMaxDeliverNaks pins the zero-value guard: MaxDeliver left
+// at 0 means unlimited redeliveries (the jetstream.ConsumerConfig semantics),
+// so no delivery is final and a transient failure Naks — it must NOT read
+// every delivery as final and Term on the first failure.
+func TestNakOrTermZeroMaxDeliverNaks(t *testing.T) {
+	p := Policy{NakDelay: testDelay, TermOnExhaustion: true} // MaxDeliver unset
+	msg := delivered(1)
+
+	got, err := p.NakOrTerm(msg)
+	if err != nil {
+		t.Fatalf("NakOrTerm: %v", err)
+	}
+	if got != OutcomeNak {
+		t.Errorf("outcome = %q, want nak", got)
+	}
+	if msg.Termed {
+		t.Error("termed on the first delivery with an unset MaxDeliver")
+	}
+}
+
 func TestNumDelivered(t *testing.T) {
 	if got := NumDelivered(delivered(3)); got != 3 {
 		t.Errorf("NumDelivered = %d, want 3", got)
@@ -116,5 +136,11 @@ func TestIsFinalDelivery(t *testing.T) {
 	}
 	if !IsFinalDelivery(delivered(6), 5) {
 		t.Error("delivery past MaxDeliver not read as final")
+	}
+	if IsFinalDelivery(delivered(1), 0) {
+		t.Error("delivery read as final with MaxDeliver 0 (unlimited)")
+	}
+	if IsFinalDelivery(delivered(1), -1) {
+		t.Error("delivery read as final with MaxDeliver -1 (unlimited)")
 	}
 }
