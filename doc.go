@@ -7,9 +7,20 @@
 // drains the connections — the ordering that keeps a Drain from racing an
 // in-flight Fetch (COR-923).
 //
-// This is the thin first slice extracted from entire-core (entiredb),
-// entire-api, and mirror-pipeline, which had each grown their own copy of this
-// plumbing. Consumer scaffolding (jsconsumer), message helpers (natsmsg), and
-// the redelivery/DLQ policy (backoff) will land here as those services converge
-// onto the module. Tracking: COR-925.
+// This root package is the connection-lifecycle core extracted from
+// entire-core (entiredb), entire-api, and mirror-pipeline, which had each
+// grown their own copy of this plumbing (COR-925). It depends only on nats.go.
+//
+// The subpackages carry the consumer-side layers those services shared
+// (COR-929) — [natsmsg] (trace-context propagation over message headers, the
+// KeepInProgress AckWait heartbeat, and the natsmsgtest.FakeMsg test double),
+// [jsconsumer] (the durable JetStream pull-consumer scaffold), and [backoff]
+// (the flat NakWithDelay redelivery policy with Term-on-final-delivery,
+// COR-762). natsmsg and jsconsumer additionally depend on the OpenTelemetry
+// API, and all three on nats.go's jetstream package; importing only the root
+// package links none of that.
+//
+// [natsmsg]: https://pkg.go.dev/github.com/entireio/go-nuts/natsmsg
+// [jsconsumer]: https://pkg.go.dev/github.com/entireio/go-nuts/jsconsumer
+// [backoff]: https://pkg.go.dev/github.com/entireio/go-nuts/backoff
 package nuts

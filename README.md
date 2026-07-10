@@ -79,6 +79,30 @@ By default `Connect` builds mTLS from the `ENTIRE_INTERNAL_TLS_{CERT,KEY,CA}_FIL
 environment variables; use `WithTLSConfig`, `WithoutTLS`, or the other `Option`s
 to override.
 
+## Subpackages
+
+The root package is deliberately nats.go-only. The consumer-side layers live in
+subpackages so importing the root links none of their dependencies (`natsmsg`
+and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
+
+- **`natsmsg`** — small JetStream message helpers: W3C trace-context
+  propagation over message headers (`Inject` / `ExtractHeader` /
+  `StartConsumerSpan`, so publish → consume stitches into one trace) and
+  `KeepInProgress`, an AckWait heartbeat for long handlers, capped so a wedged
+  handler still redelivers. `natsmsg/natsmsgtest` ships `FakeMsg`, a scriptable
+  `jetstream.Msg` for asserting a consumer's ack/nak/term disposition without a
+  broker.
+- **`jsconsumer`** — the durable JetStream pull-consumer scaffold:
+  `Start` (create-or-update durable → consume → stop on context cancel) and
+  `Process` (consumer span re-parented across the NATS hop → decode →
+  Term-on-undecodable → dispatch to the handler, which owns the message's
+  disposition). AckExplicit, bounded AckWait and MaxDeliver, shutdown-aware
+  consume-error logging, optional `KeepInProgress` heartbeat.
+- **`backoff`** — the redelivery policy for transiently-failed deliveries: a
+  flat `NakWithDelay` envelope bounded by MaxDeliver, with opt-in
+  Term-on-final-delivery so a work-queue message is removed cleanly instead of
+  orphaning un-acked (COR-762).
+
 ## Development
 
 Requires Go 1.26. Tasks via [mise](https://mise.jdx.dev): `mise run test`,
