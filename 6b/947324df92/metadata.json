@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.8.43-nightly.202607110651.7cd666280",
+  "checkpoint_id": "6b947324df92",
+  "strategy": "manual-commit",
+  "branch": "nodo/go-nuts-extension",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "README.md",
+    "doc.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/6b/947324df92/0/metadata.json",
+      "transcript": "/6b/947324df92/0/full.jsonl",
+      "compact_transcript": "/6b/947324df92/0/transcript.jsonl",
+      "content_hash": "/6b/947324df92/0/content_hash.txt",
+      "prompt": ""
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 45,
+    "cache_creation_tokens": 4290,
+    "cache_read_tokens": 659355,
+    "output_tokens": 3288,
+    "api_call_count": 3
+  }
+}
