@@ -112,6 +112,9 @@ func WithNATSOptions(opts ...nats.Option) Option {
 // attempts), a bounded drain timeout, and lifecycle handlers that log at the
 // right level — notably routing the nil-error DisconnectErr that nats.go fires
 // on an explicit Close to INFO, so a clean shutdown does not look like a fault.
+// Async errors (slow-consumer drops, permissions violations) and lame-duck
+// notices are logged through the configured logger instead of nats.go's
+// stderr default; override either handler via [WithNATSOptions].
 //
 // The initial dial is fail-fast: if the first connect does not succeed Connect
 // returns an error, so a misconfigured service crash-loops visibly rather than
@@ -183,6 +186,25 @@ func Connect(ctx context.Context, url string, opts ...Option) (*nats.Conn, error
 		}),
 		nats.ReconnectErrHandler(func(_ *nats.Conn, err error) {
 			cfg.logger.ErrorContext(logCtx, "nuts: NATS reconnect failed", connAttr, slog.Any("error", err))
+		}),
+		// Without a handler, nats.go routes async errors — slow-consumer
+		// drops, permissions violations on missing server grants — to a
+		// default that prints to stderr, bypassing the service's structured
+		// logs entirely. A permissions violation is how a misconfigured
+		// subscription surfaces (the server silently rejects it and the
+		// client keeps running), so it must land in the real log stream.
+		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
+			attrs := []any{connAttr, slog.Any("error", err)}
+			if sub != nil {
+				attrs = append(attrs, slog.String("subject", sub.Subject))
+			}
+			cfg.logger.ErrorContext(logCtx, "nuts: NATS async error", attrs...)
+		}),
+		// The server announces lame duck mode before it starts evicting
+		// clients; reconnection is automatic, but the log line attributes the
+		// coming disconnect to server maintenance rather than a fault.
+		nats.LameDuckModeHandler(func(_ *nats.Conn) {
+			cfg.logger.WarnContext(logCtx, "nuts: NATS server entering lame duck mode", connAttr)
 		}),
 	}
 	if tlsConf != nil {

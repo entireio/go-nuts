@@ -15,12 +15,20 @@ import (
 // and returns its client URL. The server is shut down when the test ends.
 func runEmbeddedServer(t *testing.T) string {
 	t.Helper()
-	s, err := natsserver.NewServer(&natsserver.Options{
-		Host:   "127.0.0.1",
-		Port:   -1, // pick a free port
-		NoLog:  true,
-		NoSigs: true,
-	})
+	return runEmbeddedServerWith(t, &natsserver.Options{}).ClientURL()
+}
+
+// runEmbeddedServerWith starts an in-process NATS server from opts (host, port,
+// and log/signal handling are forced to test-safe values) and returns the
+// server handle for tests that drive server-side behavior such as lame duck
+// mode. The server is shut down when the test ends.
+func runEmbeddedServerWith(t *testing.T, opts *natsserver.Options) *natsserver.Server {
+	t.Helper()
+	opts.Host = "127.0.0.1"
+	opts.Port = -1 // pick a free port
+	opts.NoLog = true
+	opts.NoSigs = true
+	s, err := natsserver.NewServer(opts)
 	if err != nil {
 		t.Fatalf("new embedded nats server: %v", err)
 	}
@@ -29,7 +37,7 @@ func runEmbeddedServer(t *testing.T) string {
 		t.Fatal("embedded nats server not ready in time")
 	}
 	t.Cleanup(s.Shutdown)
-	return s.ClientURL()
+	return s
 }
 
 // capturingHandler is a thread-safe slog.Handler that records log messages so

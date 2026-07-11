@@ -16,6 +16,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	natsserver "github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
 )
 
 func TestConnectEmptyURL(t *testing.T) {
@@ -151,6 +154,57 @@ func TestConnectLogsConnName(t *testing.T) {
 	if !strings.Contains(buf.String(), "conn=worker") {
 		t.Fatalf("connected log is missing the conn-name attribute: %q", buf.String())
 	}
+}
+
+// TestConnectLogsAsyncErrors: a permissions violation is an async error — the
+// Subscribe call itself succeeds and the server rejects it out of band — so
+// without a handler it reaches only nats.go's stderr default, invisible to the
+// service's structured logs. Connect must route it through the configured
+// logger.
+func TestConnectLogsAsyncErrors(t *testing.T) {
+	s := runEmbeddedServerWith(t, &natsserver.Options{
+		Users: []*natsserver.User{{
+			Username: "worker",
+			Password: "pw",
+			Permissions: &natsserver.Permissions{
+				Subscribe: &natsserver.SubjectPermission{Deny: []string{"denied.>"}},
+			},
+		}},
+	})
+	logger, captured := newCapturingLogger()
+	nc, err := Connect(t.Context(), s.ClientURL(), WithoutTLS(), WithLogger(logger),
+		WithNATSOptions(nats.UserInfo("worker", "pw")))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+
+	// The violation surfaces asynchronously; the subscribe itself must not fail.
+	if _, err := nc.Subscribe("denied.topic", func(*nats.Msg) {}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	captured.waitFor(t, "nuts: NATS async error")
+}
+
+// TestConnectLogsLameDuckMode: the server's lame-duck announcement must be
+// logged so the coming eviction reads as maintenance, not a fault.
+func TestConnectLogsLameDuckMode(t *testing.T) {
+	s := runEmbeddedServerWith(t, &natsserver.Options{
+		LameDuckDuration: 250 * time.Millisecond,
+		// Negative means "flip positive but skip the grace<duration
+		// validation" — the documented nats-server test bypass.
+		LameDuckGracePeriod: -10 * time.Millisecond,
+	})
+	logger, captured := newCapturingLogger()
+	nc, err := Connect(t.Context(), s.ClientURL(), WithoutTLS(), WithLogger(logger))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+
+	// LameDuckShutdown blocks for the full lame-duck duration.
+	go s.LameDuckShutdown()
+	captured.waitFor(t, "nuts: NATS server entering lame duck mode")
 }
 
 // TestTLSConfigCARotation guards that the trusted CA is re-read from disk on
