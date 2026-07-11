@@ -62,6 +62,21 @@ type Config struct {
 	SpanName       string        // per-message consumer span name (e.g. "repolifecycle.consume")
 	Name           string        // short consumer name, used as the log prefix
 
+	// InactiveThreshold mirrors jetstream.ConsumerConfig.InactiveThreshold:
+	// how long the durable may go without an active subscription before the
+	// server deletes it; zero means never (the JetStream default for
+	// durables). Consumers on interest-retention streams set this so a
+	// decommissioned durable stops pinning every message it would have
+	// received, instead of holding them until the stream's MaxAge.
+	InactiveThreshold time.Duration
+
+	// MaxAckPending mirrors jetstream.ConsumerConfig.MaxAckPending: the
+	// server-side cap on deliveries outstanding un-acked across ALL replicas
+	// sharing the durable; zero uses the server default (1000). Distinct
+	// from MaxMessages below, which caps only this process's client-side
+	// buffer.
+	MaxAckPending int
+
 	// Tracer opens the per-message consumer span; nil uses the global OTel
 	// tracer provider.
 	Tracer trace.Tracer
@@ -116,6 +131,25 @@ func (c Config) EffectiveMaxDeliver() int {
 		return DefaultMaxDeliver
 	}
 	return c.MaxDeliver
+}
+
+// validate rejects the configuration errors no retry can fix; shared by
+// [Start] (one-shot) and [Run] (supervised, which must fail fast on these
+// rather than retry them forever).
+func (c Config) validate(nc *nats.Conn) error {
+	if c.KeepInProgress && c.MaxMessages > 1 {
+		return fmt.Errorf("jsconsumer(%s): KeepInProgress requires MaxMessages <= 1: the heartbeat extends only the in-flight delivery, so %d buffered messages would exhaust AckWait behind a long handler", c.Name, c.MaxMessages)
+	}
+	if c.Durable == "" {
+		// CreateOrUpdateConsumer accepts an empty durable and silently makes
+		// an ephemeral, server-named consumer — losing the stable
+		// resume-across-restarts behavior this scaffold promises.
+		return fmt.Errorf("jsconsumer(%s): Durable is required", c.Name)
+	}
+	if nc == nil {
+		return fmt.Errorf("jsconsumer(%s): nil nats conn", c.Name)
+	}
+	return nil
 }
 
 func (c Config) tracer() trace.Tracer {
@@ -181,29 +215,22 @@ func (r *Runner) Stop() {
 // both the core nats.go sentinels ([nuts.IsShutdownFetchErr]) and jetstream's
 // own connection-closed error — which is a clean exit rather than a fault.
 func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.Msg)) (*Runner, error) {
-	if cfg.KeepInProgress && cfg.MaxMessages > 1 {
-		return nil, fmt.Errorf("jsconsumer(%s): KeepInProgress requires MaxMessages <= 1: the heartbeat extends only the in-flight delivery, so %d buffered messages would exhaust AckWait behind a long handler", cfg.Name, cfg.MaxMessages)
-	}
-	if cfg.Durable == "" {
-		// CreateOrUpdateConsumer accepts an empty durable and silently makes
-		// an ephemeral, server-named consumer — losing the stable
-		// resume-across-restarts behavior this scaffold promises.
-		return nil, fmt.Errorf("jsconsumer(%s): Durable is required", cfg.Name)
-	}
-	if nc == nil {
-		return nil, fmt.Errorf("jsconsumer(%s): nil nats conn", cfg.Name)
+	if err := cfg.validate(nc); err != nil {
+		return nil, err
 	}
 	js, err := jetstream.New(nc)
 	if err != nil {
 		return nil, fmt.Errorf("jsconsumer(%s): jetstream.New: %w", cfg.Name, err)
 	}
 	cons, err := js.CreateOrUpdateConsumer(ctx, cfg.Stream, jetstream.ConsumerConfig{
-		Durable:        cfg.Durable,
-		AckPolicy:      jetstream.AckExplicitPolicy,
-		AckWait:        cfg.EffectiveAckWait(),
-		MaxDeliver:     cfg.EffectiveMaxDeliver(),
-		FilterSubject:  cfg.FilterSubject,
-		FilterSubjects: cfg.FilterSubjects,
+		Durable:           cfg.Durable,
+		AckPolicy:         jetstream.AckExplicitPolicy,
+		AckWait:           cfg.EffectiveAckWait(),
+		MaxDeliver:        cfg.EffectiveMaxDeliver(),
+		FilterSubject:     cfg.FilterSubject,
+		FilterSubjects:    cfg.FilterSubjects,
+		InactiveThreshold: cfg.InactiveThreshold,
+		MaxAckPending:     cfg.MaxAckPending,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("jsconsumer(%s): create consumer %s/%s: %w", cfg.Name, cfg.Stream, cfg.Durable, err)
@@ -230,6 +257,84 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 		r.Stop()
 	}()
 	return r, nil
+}
+
+// Retry envelope for [Run]'s supervision: exponential from runRetryInitial
+// doubling to runRetryMax, reset once a consume loop survives longer than the
+// max. Package vars (not consts) so tests can compress the schedule.
+var (
+	runRetryInitial = time.Second
+	runRetryMax     = 30 * time.Second
+)
+
+// Run supervises the consume loop [Start] builds. Where Start is one-shot —
+// an error at consumer creation is returned, and a consume loop that closes
+// underneath the caller (consumer deleted on the server, subscription
+// invalidated) stays closed — Run retries both with exponential backoff
+// (runRetryInitial doubling to runRetryMax, reset after a loop that outlives
+// the max). In particular a stream that is not provisioned yet at boot — the
+// declarative-provisioning race — is a retry, not a crash.
+//
+// Run blocks until ctx is cancelled, then joins the live loop (including an
+// in-flight handler, see [Runner.Stop]) before returning, so it composes with
+// the cancel → join → drain shutdown ordering as the body of a supervised
+// goroutine:
+//
+//	g.Go(func(ctx context.Context) {
+//		if err := jsconsumer.Run(ctx, nc, cfg, onMsg); err != nil {
+//			log.Error("consumer config rejected", "error", err)
+//		}
+//	})
+//
+// Configuration errors — nil connection, empty Durable, the
+// KeepInProgress/MaxMessages conflict — can never succeed on retry and are
+// returned immediately; a nil return means a clean, ctx-driven exit.
+func Run(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.Msg)) error {
+	if err := cfg.validate(nc); err != nil {
+		return err
+	}
+	delay := runRetryInitial
+	for {
+		// Each attempt gets a child context so the cancel-watcher goroutine
+		// Start arms is released when the attempt dies, instead of one
+		// accumulating per recreate for the life of the process.
+		attemptCtx, cancelAttempt := context.WithCancel(ctx)
+		r, err := Start(attemptCtx, nc, cfg, onMsg)
+		if err != nil {
+			cancelAttempt()
+			if ctx.Err() != nil {
+				return nil //nolint:nilerr // a Start error during shutdown is a clean, ctx-driven exit, not a fault to report
+			}
+			cfg.logger().WarnContext(ctx, cfg.Name+": start consumer failed; retrying",
+				slog.Any("error", err), slog.Duration("retry_in", delay))
+		} else {
+			started := time.Now()
+			select {
+			case <-ctx.Done():
+				r.Stop()
+				cancelAttempt()
+				return nil
+			case <-r.closed:
+				cancelAttempt()
+				if ctx.Err() != nil {
+					return nil //nolint:nilerr // the loop closing during shutdown is the expected wind-down, not a fault
+				}
+				// A loop that ran long enough to be called healthy earns a
+				// fresh envelope; a flapping one keeps escalating.
+				if time.Since(started) >= runRetryMax {
+					delay = runRetryInitial
+				}
+				cfg.logger().WarnContext(ctx, cfg.Name+": consume loop closed; recreating",
+					slog.Duration("retry_in", delay))
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, runRetryMax)
+	}
 }
 
 // Process runs the per-message prologue shared by every consumer: open the
