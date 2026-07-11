@@ -365,6 +365,209 @@ func TestStartAppliesConsumerTunables(t *testing.T) {
 	}
 }
 
+// compressRunRetries shrinks Run's supervision envelope so recreate paths are
+// exercised in milliseconds, restoring it when the test ends.
+func compressRunRetries(t *testing.T) {
+	t.Helper()
+	origInitial, origMax := runRetryInitial, runRetryMax
+	runRetryInitial, runRetryMax = 20*time.Millisecond, 100*time.Millisecond
+	t.Cleanup(func() { runRetryInitial, runRetryMax = origInitial, origMax })
+}
+
+// runTestEnv boots an embedded JetStream server and a connection, returning
+// the JetStream context for stream/consumer manipulation.
+func runTestEnv(t *testing.T) (*nats.Conn, jetstream.JetStream) {
+	t.Helper()
+	url := runJetStreamServer(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	return nc, js
+}
+
+// TestRunRejectsInvalidConfig: configuration errors can never succeed on
+// retry, so Run must return them immediately instead of supervising forever.
+func TestRunRejectsInvalidConfig(t *testing.T) {
+	if err := Run(context.Background(), nil, testCfg, func(jetstream.Msg) {}); err == nil || !strings.Contains(err.Error(), "Durable") {
+		t.Fatalf("Run(empty Durable) err = %v, want immediate Durable-required error", err)
+	}
+}
+
+// TestRunDeliversAndReturnsOnCancel: the supervised loop delivers like Start
+// and exits nil once ctx is cancelled — the contract that lets it be the body
+// of a ShutdownGroup.Go goroutine.
+func TestRunDeliversAndReturnsOnCancel(t *testing.T) {
+	nc, js := runTestEnv(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
+		Name: "events_v1", Subjects: []string{"events.>"},
+	}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+
+	got := make(chan jetstream.Msg, 1)
+	done := make(chan error, 1)
+	cfg := Config{Stream: "events_v1", Durable: "run_durable", FilterSubject: "events.repo",
+		Name: "testconsumer", SpanName: "test.consume"}
+	go func() {
+		done <- Run(ctx, nc, cfg, func(m jetstream.Msg) {
+			if err := m.Ack(); err != nil {
+				t.Errorf("ack: %v", err)
+			}
+			got <- m
+		})
+	}()
+
+	if _, err := js.Publish(ctx, "events.repo", []byte("hello")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case m := <-got:
+		if string(m.Data()) != "hello" {
+			t.Errorf("payload = %q, want hello", m.Data())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("message did not reach onMsg")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v on cancel, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+}
+
+// TestRunToleratesMissingStreamAtBoot: a stream that is not provisioned yet
+// when the service boots (the declarative-provisioning race) is a retry, not
+// a crash — once the stream appears, the consumer comes up and delivers.
+func TestRunToleratesMissingStreamAtBoot(t *testing.T) {
+	compressRunRetries(t)
+	nc, js := runTestEnv(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	got := make(chan jetstream.Msg, 1)
+	done := make(chan error, 1)
+	cfg := Config{Stream: "late_v1", Durable: "late_durable", FilterSubject: "late.repo",
+		Name: "testconsumer", SpanName: "test.consume"}
+	go func() {
+		done <- Run(ctx, nc, cfg, func(m jetstream.Msg) {
+			if err := m.Ack(); err != nil {
+				t.Errorf("ack: %v", err)
+			}
+			got <- m
+		})
+	}()
+
+	// Let at least one create attempt fail against the absent stream.
+	time.Sleep(60 * time.Millisecond)
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
+		Name: "late_v1", Subjects: []string{"late.>"},
+	}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	if _, err := js.Publish(ctx, "late.repo", []byte("finally")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case m := <-got:
+		if string(m.Data()) != "finally" {
+			t.Errorf("payload = %q, want finally", m.Data())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("message did not arrive after the stream appeared")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v on cancel, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+}
+
+// TestRunRecreatesAfterConsumerDeleted: deleting the durable on the server is
+// a terminal error for the live consume loop (nats.go stops it and Closed
+// fires); Run must notice and recreate rather than leaving the service
+// running but deaf.
+func TestRunRecreatesAfterConsumerDeleted(t *testing.T) {
+	compressRunRetries(t)
+	nc, js := runTestEnv(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
+		Name: "events_v1", Subjects: []string{"events.>"},
+	}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+
+	got := make(chan string, 2)
+	done := make(chan error, 1)
+	cfg := Config{Stream: "events_v1", Durable: "recreate_durable", FilterSubject: "events.repo",
+		Name: "testconsumer", SpanName: "test.consume"}
+	go func() {
+		done <- Run(ctx, nc, cfg, func(m jetstream.Msg) {
+			if err := m.Ack(); err != nil {
+				t.Errorf("ack: %v", err)
+			}
+			got <- string(m.Data())
+		})
+	}()
+
+	if _, err := js.Publish(ctx, "events.repo", []byte("one")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case m := <-got:
+		if m != "one" {
+			t.Fatalf("first delivery = %q, want one", m)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first message did not arrive")
+	}
+
+	if err := js.DeleteConsumer(ctx, "events_v1", "recreate_durable"); err != nil {
+		t.Fatalf("delete consumer: %v", err)
+	}
+	if _, err := js.Publish(ctx, "events.repo", []byte("two")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	// Deleting the durable erased its delivery cursor, so the recreated
+	// consumer legitimately redelivers "one" before "two"; wait for "two".
+	deadline := time.After(10 * time.Second)
+	for m := ""; m != "two"; {
+		select {
+		case m = <-got:
+		case <-deadline:
+			t.Fatal("message did not arrive after the consumer was deleted and recreated")
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v on cancel, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+}
+
 // runJetStreamServer starts an in-process JetStream-enabled NATS server on a
 // random loopback port and returns its client URL.
 func runJetStreamServer(t *testing.T) string {
