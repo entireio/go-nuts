@@ -5,8 +5,7 @@
   "branch": "nodo/go-nuts-extension",
   "checkpoints_count": 4,
   "files_touched": [
-    "jsconsumer/jsconsumer.go",
-    "jsconsumer/jsconsumer_test.go"
+    "jsconsumer/jsconsumer.go"
   ],
   "sessions": [
     {
@@ -18,10 +17,10 @@
     }
   ],
   "token_usage": {
-    "input_tokens": 20,
-    "cache_creation_tokens": 19034,
-    "cache_read_tokens": 1824080,
-    "output_tokens": 15682,
-    "api_call_count": 10
+    "input_tokens": 6,
+    "cache_creation_tokens": 2162,
+    "cache_read_tokens": 584747,
+    "output_tokens": 1368,
+    "api_call_count": 3
   }
 }

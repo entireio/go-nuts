@@ -3,39 +3,38 @@
   "checkpoint_id": "fe2d2a21c454",
   "session_id": "72bff985-4a1a-4a24-ab7e-a7ad3dba9c7e",
   "strategy": "manual-commit",
-  "created_at": "2026-07-11T13:09:07.600395Z",
+  "created_at": "2026-07-11T13:10:00.49901Z",
   "branch": "nodo/go-nuts-extension",
   "checkpoints_count": 4,
   "files_touched": [
-    "jsconsumer/jsconsumer.go",
-    "jsconsumer/jsconsumer_test.go"
+    "jsconsumer/jsconsumer.go"
   ],
   "agent": "Claude Code",
   "model": "claude-opus-4-8[1m]",
   "turn_id": "21b501d59f8a",
-  "checkpoint_transcript_start": 284,
-  "transcript_lines_at_start": 284,
-  "compact_transcript_start": 66,
+  "checkpoint_transcript_start": 341,
+  "transcript_lines_at_start": 341,
+  "compact_transcript_start": 79,
   "token_usage": {
-    "input_tokens": 20,
-    "cache_creation_tokens": 19034,
-    "cache_read_tokens": 1824080,
-    "output_tokens": 15682,
-    "api_call_count": 10
+    "input_tokens": 6,
+    "cache_creation_tokens": 2162,
+    "cache_read_tokens": 584747,
+    "output_tokens": 1368,
+    "api_call_count": 3
   },
   "session_metrics": {
     "turn_count": 4
   },
   "initial_attribution": {
-    "calculated_at": "2026-07-11T13:09:07.570072Z",
-    "agent_lines": 302,
-    "agent_removed": 11,
-    "human_added": 0,
+    "calculated_at": "2026-07-11T13:10:00.464756Z",
+    "agent_lines": 2,
+    "agent_removed": 2,
+    "human_added": 203,
     "human_modified": 0,
     "human_removed": 0,
-    "total_committed": 302,
-    "total_lines_changed": 313,
-    "agent_percentage": 100,
+    "total_committed": 205,
+    "total_lines_changed": 207,
+    "agent_percentage": 1.932367149758454,
     "metric_version": 2
   }
 }
