@@ -311,6 +311,60 @@ func TestStopConcurrentWithCancel(t *testing.T) {
 	}
 }
 
+// TestStartAppliesConsumerTunables: InactiveThreshold and MaxAckPending must
+// land on the on-server consumer config — interest-stream consumers depend on
+// InactiveThreshold so a decommissioned durable stops pinning messages, and
+// shared-durable work queues bound their in-flight window with MaxAckPending.
+func TestStartAppliesConsumerTunables(t *testing.T) {
+	url := runJetStreamServer(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
+		Name: "events_v1", Subjects: []string{"events.>"},
+	}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+
+	run, err := Start(ctx, nc, Config{
+		Stream:            "events_v1",
+		Durable:           "tunables_durable",
+		FilterSubject:     "events.repo",
+		Name:              "testconsumer",
+		SpanName:          "test.consume",
+		InactiveThreshold: 72 * time.Hour,
+		MaxAckPending:     42,
+	}, func(jetstream.Msg) {})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer run.Stop()
+
+	cons, err := js.Consumer(ctx, "events_v1", "tunables_durable")
+	if err != nil {
+		t.Fatalf("look up consumer: %v", err)
+	}
+	info, err := cons.Info(ctx)
+	if err != nil {
+		t.Fatalf("consumer info: %v", err)
+	}
+	if got := info.Config.InactiveThreshold; got != 72*time.Hour {
+		t.Errorf("on-server InactiveThreshold = %v, want 72h", got)
+	}
+	if got := info.Config.MaxAckPending; got != 42 {
+		t.Errorf("on-server MaxAckPending = %d, want 42", got)
+	}
+}
+
 // runJetStreamServer starts an in-process JetStream-enabled NATS server on a
 // random loopback port and returns its client URL.
 func runJetStreamServer(t *testing.T) string {

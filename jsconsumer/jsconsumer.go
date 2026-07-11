@@ -62,6 +62,21 @@ type Config struct {
 	SpanName       string        // per-message consumer span name (e.g. "repolifecycle.consume")
 	Name           string        // short consumer name, used as the log prefix
 
+	// InactiveThreshold mirrors jetstream.ConsumerConfig.InactiveThreshold:
+	// how long the durable may go without an active subscription before the
+	// server deletes it; zero means never (the JetStream default for
+	// durables). Consumers on interest-retention streams set this so a
+	// decommissioned durable stops pinning every message it would have
+	// received, instead of holding them until the stream's MaxAge.
+	InactiveThreshold time.Duration
+
+	// MaxAckPending mirrors jetstream.ConsumerConfig.MaxAckPending: the
+	// server-side cap on deliveries outstanding un-acked across ALL replicas
+	// sharing the durable; zero uses the server default (1000). Distinct
+	// from MaxMessages below, which caps only this process's client-side
+	// buffer.
+	MaxAckPending int
+
 	// Tracer opens the per-message consumer span; nil uses the global OTel
 	// tracer provider.
 	Tracer trace.Tracer
@@ -198,12 +213,14 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 		return nil, fmt.Errorf("jsconsumer(%s): jetstream.New: %w", cfg.Name, err)
 	}
 	cons, err := js.CreateOrUpdateConsumer(ctx, cfg.Stream, jetstream.ConsumerConfig{
-		Durable:        cfg.Durable,
-		AckPolicy:      jetstream.AckExplicitPolicy,
-		AckWait:        cfg.EffectiveAckWait(),
-		MaxDeliver:     cfg.EffectiveMaxDeliver(),
-		FilterSubject:  cfg.FilterSubject,
-		FilterSubjects: cfg.FilterSubjects,
+		Durable:           cfg.Durable,
+		AckPolicy:         jetstream.AckExplicitPolicy,
+		AckWait:           cfg.EffectiveAckWait(),
+		MaxDeliver:        cfg.EffectiveMaxDeliver(),
+		FilterSubject:     cfg.FilterSubject,
+		FilterSubjects:    cfg.FilterSubjects,
+		InactiveThreshold: cfg.InactiveThreshold,
+		MaxAckPending:     cfg.MaxAckPending,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("jsconsumer(%s): create consumer %s/%s: %w", cfg.Name, cfg.Stream, cfg.Durable, err)
