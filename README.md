@@ -21,7 +21,9 @@ go get github.com/entireio/go-nuts
   long-lived service rides out a NATS outage instead of permanently closing
   after the client's default 60 attempts), a bounded drain timeout, optional
   rotation-aware mTLS, and lifecycle log handlers that don't mistake a clean
-  shutdown for a fault.
+  shutdown for a fault. Async errors (slow-consumer drops, permissions
+  violations) and lame-duck notices are logged through the configured logger
+  instead of nats.go's stderr default.
 - **`Drain` / `IsShutdownFetchErr`** — graceful shutdown. `Drain` starts
   nats.go's asynchronous drain and blocks until the connection flushes and
   closes (bounded by a timeout); `IsShutdownFetchErr` lets a fetch loop treat a
@@ -31,6 +33,10 @@ go get github.com/entireio/go-nuts
   `Drain` from racing an in-flight `Fetch`.
 
 ## Usage
+
+The example below drives a hand-rolled fetch loop on nats.go's legacy pull
+API; consumers on the modern `jetstream` API get the whole loop from
+[`jsconsumer`](#subpackages) instead.
 
 ```go
 ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -87,19 +93,25 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
 
 - **`natsmsg`** — small JetStream message helpers: W3C trace-context
   propagation over message headers (`Inject` / `ExtractHeader` /
-  `StartConsumerSpan`, so publish → consume stitches into one trace) and
-  `KeepInProgress`, an AckWait heartbeat for long handlers, capped so a wedged
-  handler still redelivers. `natsmsg/natsmsgtest` ships `FakeMsg`, a scriptable
-  `jetstream.Msg` for asserting a consumer's ack/nak/term disposition without a
-  broker.
+  `StartConsumerSpan`, so publish → consume stitches into one trace),
+  `Publisher` — the publish core (producer span + trace inject + `Nats-Msg-Id`
+  dedup + bounded pub-ack wait, with `StartProducerSpan` for callers composing
+  by hand) — and `KeepInProgress`, an AckWait heartbeat for long handlers,
+  capped so a wedged handler still redelivers. `natsmsg/natsmsgtest` ships
+  `FakeMsg`, a scriptable `jetstream.Msg` for asserting a consumer's
+  ack/nak/term disposition without a broker.
 - **`jsconsumer`** — the durable JetStream pull-consumer scaffold:
-  `Start` (create-or-update durable → consume → stop on context cancel) and
+  `Start` (create-or-update durable → consume → stop on context cancel),
+  `Run` (`Start` under supervision: recreate on a closed loop with exponential
+  backoff, tolerate a not-yet-provisioned stream at boot), and
   `Process` (consumer span re-parented across the NATS hop → decode →
   Term-on-undecodable → dispatch to the handler, which owns the message's
-  disposition). AckExplicit, bounded AckWait and MaxDeliver, shutdown-aware
-  consume-error logging, optional `KeepInProgress` heartbeat.
+  disposition). AckExplicit, bounded AckWait and MaxDeliver, optional
+  InactiveThreshold / MaxAckPending, shutdown-aware consume-error logging,
+  optional `KeepInProgress` heartbeat.
 - **`backoff`** — the redelivery policy for transiently-failed deliveries: a
-  flat `NakWithDelay` envelope bounded by MaxDeliver, with opt-in
+  `NakWithDelay` envelope — flat by default, optionally growing per delivery
+  (`Factor`/`MaxDelay`) — bounded by MaxDeliver, with opt-in
   Term-on-final-delivery so a work-queue message is removed cleanly instead of
   orphaning un-acked (COR-762).
 
