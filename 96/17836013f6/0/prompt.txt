@@ -1,0 +1,340 @@
+This report is a collection of best practices for NATS. want you to review the APIs that we expose in this library to see that they are simple and yet powerful capturing, uh, important use cases across services. I also want you to review how this can be used in your pipeline's entire API and entire db core. ensure that we don't break changes, and we actually provide a useful, um, logic.
+
+---
+
+<task-notification>
+<task-id>a53f1693914d56836</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-nodo-work-tasks-go-nuts-extension-go-nuts/72bff985-4a1a-4a24-ab7e-a7ad3dba9c7e/tasks/a53f1693914d56836.output</output-file>
+<status>completed</status>
+<summary>Agent "Map NATS usage in entire-api" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result># NATS / JetStream + go-nuts usage map: `entire-api`
+
+## 1. Dependencies (go.mod)
+
+- `github.com/entireio/go-nuts v0.4.0` — /Users/nodo/work/tasks/go-nuts-extension/entire-api/go.mod:19 (go.sum matches v0.4.0)
+- `github.com/nats-io/nats.go v1.51.0` — go.mod:32 (note: one minor behind the go-nuts repo's own bump to v1.52.0)
+- `github.com/nats-io/nats-server/v2 v2.14.3` — go.mod:31, used **only** for embedded test servers (multicellular harness + a few unit tests)
+
+## 2. Process topology and connection lifecycle
+
+Three binaries (docs/architecture.md:59-75): `cmd/api` dials **no** NATS (cmd/api/main.go:5); `cmd/repo-activity` and `cmd/user-activity` are workers wired in `internal/server`.
+
+**Local connection** — `internal/server/server.go`
+- `dialNATS` = `nuts.Connect(ctx, cfg.URL, nuts.WithName(serviceName))` (server.go:251-253); comment says nuts.Connect replaced hand-rolled `natsdial` (rotation-aware mTLS from `ENTIRE_INTERNAL_TLS_*` env vars, reconnect-forever, 2s reconnect wait, lifecycle log handlers) (server.go:246-250; also cluster_conns_test.go:66).
+- `serveWorker` dials once, `defer nuts.Drain(ctx, nc, serviceName, nil, natsDrainBackstop)` (server.go:218-222); `natsDrainBackstop = 12s`, sized to exceed nuts DrainTimeout (5s) + nats.go publish flush (5s) (server.go:240-244). Health probe checks `nc.IsConnected()` (server.go:226-231).
+- Config: `NATS{URL: ENTIRE_NATS_URL, TLS*: ENTIRE_INTERNAL_TLS_*}` (internal/config/config.go:138-146); `ACTIVITY_NATS_REGIONS` jurisdiction→URL map (config.go:376-385).
+
+**Remote (cross-region) connections** — `buildClusterConns` (server.go:713-757): one `nuts.Connect(ctx, url, nuts.WithName("activity-fwd-"+jurisdiction), nuts.WithRetryOnFailedConnect())` per remote jurisdiction (server.go:739-742), `jetstream.New` on each (server.go:719, 747); on error drains dialed conns (server.go:714-718, 744); shutdown cleanup drains remotes via `nuts.Drain` (server.go:369-373).
+
+## 3. Per-file publish/consume map
+
+All streams are provisioned declaratively in fleet (nack CRs); this binary only publishes and binds consumers. No KV, no object store, no request-reply anywhere; the only core-NATS subscription is the advisory reaper below.
+
+| File | Role | Stream / subject / durable | Ack policy &amp; shutdown |
+|---|---|---|---|
+| `internal/ingest/pipeline.go` | Live ref consumer (pull/Fetch loop) | `repo_refs_v1`, durable `activity-ingester`, filter `repo_refs_v1.&gt;` (pipeline.go:26, 96-103) | Hand-rolled: Fetch batch loop w/ `faultBackoff` (145-157, 291-300), FNV partitioned worker pool, dispatch-timeout `NakWithDelay(2s)` (169-175), Term on poison (218), `NakWithDelay(backoffFor)` exp 1s→300s (247, 305-323), MaxDeliver 8. Shutdown: ctx cancel → close worker chans + `wg.Wait()` (185-192) |
+| `internal/ingest/jobs.go` | Index-job **publisher** + two **consumers** (live + backfill) | Streams `repo_index_jobs` / `repo_index_jobs_backfill` (37-40), subject `&lt;stream&gt;.&lt;repoID&gt;` (248), durables `activity-index-jobs`[`-backfill`] (44, 87-92). Publisher: JS `PublishMsg` w/ `Nats-Msg-Id` dedup + `natsmsg.Inject` (283-295) | `Consume` callback → semaphore worker pool (493-512); heartbeat `msg.InProgress` ticker (1070-1087); Term on decode/schema (555, 561), Ack on repo-gone (582), Term + `recordJobExhausted` on final delivery (599-609), `NakWithDelay(backoffFor)` otherwise (615). **MAX_DELIVERIES advisory reaper**: core-NATS `QueueSubscribe("$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.&lt;stream&gt;.&lt;durable&gt;", …)` + `stream.GetMsg`/`DeleteMsg` (411-487). `Stop()` stops ConsumeContext, unsubscribes, waits in-flight (516-536) |
+| `internal/analysis/jobs.go` | Analysis **publisher** + **consumer** | Stream `repo_checkpoint_analysis_jobs` (27), durable `analysis-facets` (30), MaxDeliver 5, AckWait 60s (32-42, 197-204). Publish w/ dedup id + `natsmsg.Inject` (115-130) | heartbeat (336-352), Term poison/schema (239, 245), Ack on absent checkpoint (274-280), `NakWithDelay(30s)` (286, 304); Stop on ctx.Done (213-216, 223-228) |
+| `internal/forwarder/publisher.go` | Cross-region **publisher** (user activity → recipient's home region) | Subject `user_activity_v1.&lt;jur&gt;` into that region's stream, chosen from jurisdiction→JetStream map (256-263, 281-284); `Nats-Msg-Id` dedupe id (333-353); `natsmsg.Inject` (292); JS publish bounded by `publishTimeout = 5s` (31, 306-308) | Return-nil = caller acks (permanent drops), return err = caller naks (199-315). Conn lifecycle owned by server.go |
+| `internal/forwarder/consumer.go` | user-activity worker **consumer** | Stream `user_activity_v1`, durable `activity-consumer`, filter `user_activity_v1.&lt;jur&gt;` (25, 83-89), MaxDeliver 8 | `Consume` (93); Term poison/missing-recipient (127, 132), Ack foreign placement (144), Nak on DB error (157, 215); `go func(){&lt;-ctx.Done(); Stop()}` (98-101) |
+| `internal/settingsrelay/relay.go` | Outbox→NATS broadcast **publisher** | Drains `repo_settings_outbox` rows; broadcasts stored `(subject, payload, MsgID)` (`repo_settings.v1.&lt;localJur&gt;`) to EVERY jurisdiction's JetStream concurrently (269-296); `publishTimeout = 5s` (60) | Ticker loop, per-tick budget, returns nil on ctx cancel (112-128); row deleted only after ALL dests PubAck (212-258). No trace inject (payload from outbox) |
+| `internal/settingsconsumer/consumer.go` | Settings fan-out **consumer** | Stream `repo_settings_v1`, durable `repo-settings-consumer`, binds whole stream `repo_settings.v1.&gt;` (50-60) | **go-nuts jsconsumer**: `jsconsumer.Start` (97), `jsconsumer.Process` prologue (115); Nak transient, Ack no-placement/LWW-noop (141-208); `run.Stop()` (107-110) |
+| `internal/repolifecycle/consumer.go` | Repo seed/delete **consumer** | Stream `resource_lifecycle_v1`, durable `repo-lifecycle-consumer`, filter `resource_lifecycle_v1.repo.*` (23-42, contract.go:31-36) | **go-nuts jsconsumer**: Start (153), Process (179); Ack/Nak/Term in `onEvent` (184-247) |
+| `internal/mirrorlifecycle/consumer.go` | Mirror-placement **consumer** + directed **publisher** | Same stream, durable `mirror-lifecycle-consumer`, filter `...mirror.*` (29, 37-47); directed settings push publishes into the target cell's `repo_settings` stream via `dests[targetJurisdiction].PublishMsg`, MsgID-keyed, `publishTimeout = 5s` (54, 278-324) | **go-nuts jsconsumer**: Start (122), Process (148); Ack config-gap/no-op, Nak transient (234-258) |
+| `internal/reattribute/consumer.go` | Identity re-attribution **consumer** (also re-publishes /me via forwarder.Publisher) | Same stream, durable `author-reattribute-consumer`, FilterSubjects `github_handle.*`, `verified_email.*` (26, 122-127) | Hand-rolled: heartbeat (149-164), 10-min msgTimeout (41, 218), Term poison (188), Ack non-actionable (194, 209), Nak transient (229) |
+| `internal/userlifecycle/consumer.go` | Account-purge **consumer** (user-activity worker) | Same stream, durable `user-lifecycle-consumer`, FilterSubjects `resource_lifecycle_v1.user.*` (24, 65-71) | Hand-rolled; Term/Ack/Nak (109-144) |
+| `internal/githubmeta/consumer.go` | GitHub repo metadata **consumer** | Stream `github_meta_v1`, durable `github-meta-consumer`, filter `github_meta.v1.&lt;jur&gt;.&lt;cluster&gt;` (22, 71-78; contract.go:25-34) | Hand-rolled; Term poison/missing-key (117, 124), Nak DB (133) |
+| `internal/githubpr/consumer.go` | GitHub PR metadata **consumer** | Stream `github_pr_v1`, durable `github-pr-consumer`, filter `github_pr.v1.&lt;jur&gt;.&lt;cluster&gt;` (22, 71-78; contract.go:26-34) | Same posture (105-143) |
+| `internal/server/backfill.go` | CLI **publisher** (`repo-activity backfill`) | Enqueues `JobKindBackfill` onto `repo_index_jobs_backfill` (69-82) | `nuts.Connect` + `defer nuts.Drain` (61-65) |
+| `internal/server/enqueue_analysis.go` | CLI **publisher** (`enqueue-analysis`) | Publishes analysis jobs (58-70) | `nuts.Connect`/`Drain` (50-54) |
+| `internal/server/analysis_replay.go` | CLI **publisher** (`replay-deferred-analysis`) | Re-enqueues deferred label jobs (76-87) | Lazy `dialNATS` + `defer nuts.Drain` (66-70) |
+| `internal/multicellular/harness/nats.go` | **Test harness** | Embedded `nats-server` per cell (one island per jurisdiction), provisions 6 streams (37-44); raw `nats.Connect(… RetryOnFailedConnect, MaxReconnects(-1))` (64-66) | `t.Cleanup(nc.Close, ns.Shutdown)` (106) |
+
+Test-only raw `nats.Connect`: forwarder/integration_test.go:102-107, ingest/jobs_dedupe_test.go:128, ingest/jobs_reaper_test.go:29, server/cluster_conns_test.go:29, httpapi/pipeline_integration_test.go:116. `internal/facetrelay` touches NATS only indirectly via `forwarder.Publisher`.
+
+## 4. go-nuts APIs used (exact call sites)
+
+- **`nuts.Connect`** — server.go:252, 739; backfill.go:61; enqueue_analysis.go:50
+- **`nuts.WithName`** — server.go:252, 740; backfill.go:61; enqueue_analysis.go:50
+- **`nuts.WithRetryOnFailedConnect`** — server.go:741
+- **`nuts.Drain`** — server.go:222, 371, 716; backfill.go:65; enqueue_analysis.go:54; analysis_replay.go:70
+- **`jsconsumer.Config` / `Start` / `Process` / `Runner`** — repolifecycle/consumer.go:23, 133, 153, 179; mirrorlifecycle/consumer.go:37, 94, 122, 148; settingsconsumer/consumer.go:50, 77, 97, 115. All three set `Tracer: otelsetup.Tracer()` to keep span attribution on the service tracer.
+- **`natsmsg.Inject`** — forwarder/publisher.go:292; ingest/jobs.go:291; analysis/jobs.go:125
+- **`natsmsg.StartConsumerSpan`** — ingest/pipeline.go:208; ingest/jobs.go:547; analysis/jobs.go:231; forwarder/consumer.go:118; githubmeta/consumer.go:107; githubpr/consumer.go:107; reattribute/consumer.go:177; userlifecycle/consumer.go:99
+
+**NOT used anywhere**: `natsmsg.ExtractHeader` (directly — docs/observability.md:60-63 describes it, but only via StartConsumerSpan), `natsmsg.KeepInProgress`, `nuts.ShutdownGroup`, `nuts.IsShutdownFetchErr`, `go-nuts/backoff`, `go-nuts/natsmsgtest`, `jsconsumer` in the other seven consumers.
+
+## 5. Hand-rolled logic where go-nuts is not used
+
+- **Consumer scaffolding duplicated 7×**: forwarder, githubmeta, githubpr, reattribute, userlifecycle, ingest (pipeline + jobs), analysis each hand-roll `jetstream.New` → `CreateOrUpdateConsumer` → `Consume`/`Fetch` → `go func(){&lt;-ctx.Done(); Stop()}` → Term/Nak/Ack policy — the exact pattern `jsconsumer.Start/Process` covers for the three migrated consumers (migration comments at repolifecycle/consumer.go:30-32 etc. say "unchanged by the migration").
+- **Ack-heartbeat tickers** (`msg.InProgress` every AckWait/2) hand-rolled three times: ingest/jobs.go:1070-1087, analysis/jobs.go:336-352, reattribute/consumer.go:149-164 — precisely what `natsmsg.KeepInProgress` provides.
+- **Backoff**: per-message exponential nak delay `backoffFor` (1s doubling, 300s cap) at ingest/pipeline.go:305-323 (shared with jobs.go:615); fetch-fault backoff `faultBackoff` (1s&lt;&lt;n, 60s cap) at pipeline.go:291-300; fixed `jobBackoff = 30s` at analysis/jobs.go:41 — none use `go-nuts/backoff`.
+- **Fetch-loop error handling**: pipeline.go:139-183 hand-classifies Fetch faults (no `IsShutdownFetchErr`).
+- **MAX_DELIVERIES advisory reaper** for WorkQueue orphans: core-NATS `QueueSubscribe` + `GetMsg`/`DeleteMsg`, ingest/jobs.go:411-487.
+- **Publish bounding**: three copies of a 5s `publishTimeout` around `PublishMsg` because remote conns reconnect forever and nats.go buffers publishes — forwarder/publisher.go:31 + 306; settingsrelay/relay.go:60 + 284; mirrorlifecycle/consumer.go:54 + 309.
+- **Test harness** dials raw `nats.Connect` with `RetryOnFailedConnect`/`MaxReconnects(-1)` (harness/nats.go:64-66) instead of nuts.Connect.
+
+## 6. Docs
+
+- **docs/jobs.md** — the job/pipeline inventory: two WorkQueue index-job streams (`repo_index_jobs`, `repo_index_jobs_backfill`) + `repo_checkpoint_analysis_jobs`; job-kind table (commit/checkpoint/rollup/backfill/snapshot_refresh, lines 28-35); full consumer/durable/gate table (94-105); `CONSUME_*` gate semantics; the api process binds no consumers (6-8).
+- **docs/architecture.md** — binary/NATS matrix (59-75); two-stage chunked ingest (288-333); **"There is no NATS supercluster"** — per-region islands, direct publish into destination region (371-380); delivery/redelivery/dead-letter posture table: MaxDeliver 8, NakWithDelay exp backoff cap 300s, Term on poison, no DLQ (561-593); env table `ENTIRE_NATS_URL` / `ACTIVITY_NATS_REGIONS` / `ENTIRE_INTERNAL_TLS_*` (648-658).
+- **docs/observability.md** — trace propagation "via message headers (`go-nuts/natsmsg`, the shared-module lift of the old `internal/otelnats`) — Inject on every publish, ExtractHeader on every JetStream consume" (60-64); consumer/producer span table (47-58); baggage convention (36-43).
+- **CLAUDE.md** — points NATS/cross-cell changes at the `internal/multicellular` real-transport suite (lines 5-14).
+- **Runbooks** touching NATS ops: activity-backfill.md, backfill-kill-switch.md, checkpoint-analysis-{disable,enqueue,usage-cap}.md, settings-backfill.md, repo-seeding-backfill.md, outbox-relay-backlog.md.
+
+## 7. Job/pipeline system
+
+Yes — docs/jobs.md is exactly that: a NATS-WorkQueue job system. Live ref events (`repo_refs_v1`) are classified into typed, self-continuing paged jobs on `repo_index_jobs` (subject-per-repo, `Nats-Msg-Id` dedup, continuations re-enqueued by the consumer itself, ingest/jobs.go:750-757), with a separate throttled `repo_index_jobs_backfill` stream, plus an LLM-isolated `repo_checkpoint_analysis_jobs` stream, transactional outboxes drained to NATS (settingsrelay, facetrelay), and cross-region forwarding on `user_activity_v1`.</result>
+<usage><subagent_tokens>189508</subagent_tokens><tool_uses>39</tool_uses><duration_ms>333994</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a1dc58dd3b9158b44</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-nodo-work-tasks-go-nuts-extension-go-nuts/72bff985-4a1a-4a24-ab7e-a7ad3dba9c7e/tasks/a1dc58dd3b9158b44.output</output-file>
+<status>completed</status>
+<summary>Agent "Map NATS usage in mirror-pipeline" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All exploration complete. Here is the structured report.
+
+---
+
+# NATS / JetStream + go-nuts usage map — `mirror-pipeline`
+
+## 1. go.mod
+
+- `github.com/entireio/go-nuts v0.3.0` — `/Users/nodo/work/tasks/go-nuts-extension/mirror-pipeline/go.mod:9`
+- `github.com/nats-io/nats.go v1.50.0` — `go.mod:12` (also `github.com/nats-io/nuid v1.0.1`, `go.mod:13`, used by `failindex.RekickMsg` for fresh msg-ids)
+- Vendored go-nuts (`vendor/github.com/entireio/go-nuts/`, confirmed via `vendor/modules.txt`) contains **only the root package** (`connect.go`, `drain.go`, `shutdown.go`, `doc.go`). The subpackages `jsconsumer`, `natsmsg`, `backoff`, `natsmsgtest` do **not exist in v0.3.0** — the vendored `doc.go` explicitly says: "Consumer scaffolding (jsconsumer), message helpers (natsmsg), and the redelivery/DLQ policy (backoff) will land here as those services converge onto the module. Tracking: COR-925."
+- Everything uses the **legacy `nats.JetStreamContext` API** — zero imports of the modern `nats-io/nats.go/jetstream` package outside vendor (fanoutengine's doc comment says the modern `jetstream.Consume` shape "lands when this graduates to the standalone module", `pkg/fanoutengine/engine.go:9-13`).
+
+## 2. Every non-vendor NATS code path
+
+### Streams / KV inventory (all provisioned declaratively by fleet/nack; binaries only bind/publish, except gitjobs/webhookevents which have `EnsureStream` used by dev/loadtest)
+
+| Stream/bucket | Subjects | Contract owner |
+|---|---|---|
+| `webhooks_github_v1` (Interest retention, 5m dedup, 48h MaxAge, 5 GiB, DiscardNew) | `webhooks.github.v1.&lt;event&gt;` | `pkg/webhookevents/events.go:17-57`, `stream.go:48-90` |
+| `mirror_git_v1` (WorkQueue, 1s dedup, 6h MaxAge, 1 GiB) | `mirror.git.v1.&lt;jur&gt;.&lt;cluster&gt;.&lt;src&gt;.&lt;op&gt;` | `pkg/gitjobs/jobs.go:18-48,344-354` |
+| `github_meta_v1` | `github_meta.v1.&lt;jur&gt;.&lt;cluster&gt;` | `pkg/metajobs/jobs.go:32-43` |
+| `github_pr_v1` | `github_pr.v1.&lt;jur&gt;.&lt;cluster&gt;` | `pkg/prjobs/jobs.go:37-48` |
+| `github_push_author_v1` | `github_push_author.v1.&lt;jur&gt;.&lt;cluster&gt;` | `pkg/pushauthorjobs/jobs.go:26-35` |
+| `repo_ops_v1` | `repo.ops.v1.&lt;jur&gt;.&lt;cluster&gt;.mirror_done` | `pkg/donejobs/jobs.go:35-54` |
+| `github_meta_backfill` (work queue) | `github_meta_backfill.jobs` | `cmd/meta-fanout/backfill.go:31-37` |
+| `github_pr_backfill` (work queue) | `github_pr_backfill.jobs` | `cmd/meta-fanout/backfill_prs.go:30-32` |
+| `resource_lifecycle_v1` | `resource_lifecycle_v1.&gt;` | `cmd/meta-fanout/lifecycle.go:25-43` |
+| `webhooks_github_dlq` | `webhooks.github.dlq.&lt;source&gt;` | `pkg/webhookdlq/dlq.go:48-64` |
+| KV bucket `mirror_sync_failed` | (KV) | `pkg/failindex/failindex.go:28-29` |
+
+### Shared plumbing
+
+- **`internal/natspub/natspub.go`** — the shared JS publish core behind all typed publishers: producer span, `Nats-Msg-Id` header, 5s bounded pub-ack wait via `nats.Context(pubCtx)` (`natspub.go:26-40,80-131`). `AckWait = 5s` at `natspub.go:35`.
+- **`pkg/otelnats/nats.go`** — hand-rolled W3C trace-context `Inject`/`Extract` over `nats.Header` (`nats.go:39-53`). This is the local equivalent of a future `natsmsg.Inject/Extract`.
+- **`internal/natsregions/natsregions.go`** — multi-region island transport: `ParseConfig` (`FANOUT_NATS_REGIONS` env, `:45`), `DialRemotes` dials each remote via `nuts.Connect(..., nuts.WithRetryOnFailedConnect(), nuts.WithNATSOptions(nats.DisconnectErrHandler…, nats.ReconnectHandler…))` (`:193-224`), `Health` (local conn gates `/readyz`, remotes only feed a gauge, `:111-145`), generic `Resolve` (`:159`).
+- **`pkg/fanoutengine/`** — the shared consumer runtime (see §3/§4). `engine.go`, `route.go`, `dlq.go`, `routememo.go`.
+- **Typed publishers** (all delegate to natspub): `internal/mirrorjobs/publisher.go:30-51` (mirror.git.publish, msg-id `op/kind/owner/repo/ulid`), `pkg/metajobs/publisher.go:31`, `pkg/prjobs/publisher.go:31`, `pkg/pushauthorjobs/publisher.go:34`, `pkg/donejobs/publisher.go:30-42` (msg-id `ulid/status`), `pkg/webhookevents/publisher.go:81-106` (msg-id = GitHub delivery-id; also KEDA-scaling publish-latency metrics).
+
+### Services
+
+**`cmd/webhook-ingest`** (HTTP → NATS producer). `nuts.Connect` at `main.go:55`, `defer nuts.Drain(ctx, nc, "webhook-ingest", nil, 12s)` at `main.go:59`, `nc.JetStream()` at `:61`. Publishes `ForwardedWebhook` to `webhooks.github.v1.&lt;event&gt;` via `webhookevents.Publisher` (`forward.go:137`); publish failure → HTTP 500 so GitHub redelivers (dedup by delivery-id). Readiness = `nc.IsConnected()` (`main.go:81-86`).
+
+**`cmd/webhook-forwarder`** (consumer → HTTP POST to entire-web). Hand-rolled pull consumer, no fanoutengine: `js.PullSubscribe(webhooks.github.v1.&gt;, durable[default "webhook-forwarder"], ManualAck, AckWait 30s, MaxDeliver 8, InactiveThreshold 72h)` (`forwarder.go:128-133`) with `ensureInactiveThreshold` reconcile via `ConsumerInfo`/`UpdateConsumer` (`forwarder.go:100-121`), serial `Fetch(1, MaxWait 5s)` loop using `nuts.IsShutdownFetchErr` (`forwarder.go:176`). Disposition: 2xx→Ack; 401/403→DLQ capture + Term; other 4xx→DLQ+Term; 5xx/network→`NakWithDelay(30s)` or DLQ+Term on final delivery (`forwarder.go:287-351`); panic→recover + NakWithDelay (`:230-241`). Lifecycle: `nuts.Connect` with `webhookdlq.PermErrorHandler` dial option when DLQ enabled, `defer nuts.Drain(..., 12s)` (`main.go:76-80`), and a bounded wait on `forwarderDone` before Drain closes the conn (`main.go:148-158`).
+
+**`cmd/fanout`** (webhook → `mirror_git_v1` git-sync jobs, cross-region). Uses `fanoutengine` with a worker pool: config at `consumer.go:57-73` (subject `webhooks.github.v1.&gt;`, env `FANOUT_DURABLE` required per region, AckWait 30s, MaxDeliver 8, NakDelay 30s, InactiveThreshold 72h, `FANOUT_DISPATCH_CONCURRENCY`/`FANOUT_FETCH_BATCH` pool with fetchBatch≤concurrency AckWait bound `main.go:288-301`). Resolver: push event → `entire-core RepoLookup` (mTLS HTTP, cached) → one `gitSyncRoute` per placement (`dispatch.go:46-129`); route publishes via `mirrorjobs.NewPublisher(js).PublishGitSyncJob`. Opt-in DLQ (`ENTIRE_WEBHOOK_DLQ_ENABLED`) → `webhookdlq.Publisher` + advisory `Backstop` goroutine (`main.go:196-205`). Multi-region: `natsregions.DialRemotes` → `fanoutengine.Regions.ByKey[cluster_id] = remoteJS` (`main.go:150-173`). Lifecycle: `nuts.Connect` at `main.go:126`, `defer nuts.Drain(..., 12s)` at `:130`, bounded consumer-done wait at `:258-262`.
+
+**`cmd/core-fanout`** (push → `github_push_author_v1`). Same fanoutengine pattern, serial (no pool), subject `webhooks.github.v1.push`, durable default `core-fanout` (`main.go:32,86-89`; retry envelope `consumer.go:23-50` — MaxDeliver 8 must keep redelivery span &lt; the stream's 5m dedup window). `nuts.Connect` `main.go:105`, `nuts.Drain` `:109`.
+
+**`cmd/meta-fanout`** (4 consumers + 2 enqueue subcommands; modes `full`/`lifecycle`, `main.go:44-71`):
+- Live webhook fan: fanoutengine on `webhooks.github.v1.&gt;`, durable default `meta-fanout` (`main.go:38,254-266`; config `consumer.go:60-68`). Resolver handles `star|fork|repository` → `metajobs.Job` routes and `pull_request` → `prjobs.Job` routes (`dispatch.go:55-263`).
+- `github_meta_backfill` consumer: fanoutengine on `github_meta_backfill.&gt;`, durable `meta-fanout-backfill`, **`TermOnExhaustion: true`** (work-queue drain, COR-762) (`backfill_consumer.go:26-30,259-267`); worker fetches repo metadata from GitHub with STS-minted installation tokens, throttled per-replica.
+- `github_pr_backfill` consumer: same shape, durable `meta-fanout-backfill-prs`, `TermOnExhaustion: true` (`backfill_prs_consumer.go:26-30,238-246`).
+- Lifecycle fan: **hand-rolled** consumer (not fanoutengine) on local `resource_lifecycle_v1.&gt;`, durable `meta-fanout-lifecycle` (`lifecycle.go:207-261`): `PullSubscribe(ManualAck, AckWait 30s, MaxDeliver 8)`, serial Fetch(1); re-publishes subject+payload verbatim into every **remote** region's stream with `Entire-Lifecycle-Fanned-By` one-generation echo guard (`lifecycle.go:53-63,326-331`) and preserved/derived `Nats-Msg-Id` (`lifecycle.go:356-372`); no Term path; partial fan failure → NakWithDelay(30s). NOTE: its `consumeLoop` (`lifecycle.go:244-261`) does **not** call `nuts.IsShutdownFetchErr` — a shutdown-drain fetch error logs as "Lifecycle fetch error". On `mirror.created` it also best-effort enqueues a meta backfill (`mirror_seed.go:66+`).
+- Subcommands `backfill`/`backfill-prs` enqueue jobs with a bare `js.PublishMsg` + `Nats-Msg-Id = owner/repo:observedAt` and 5s pub wait (`backfill.go:86-101,141-145`; `backfill_prs.go:131-145`), each with its own `nuts.Connect(WithName…)`/`nuts.Drain`.
+- Lifecycle wiring: `nuts.Connect` `main.go:172`, `nuts.Drain` `:176`, per-consumer bounded drain loop `main.go:427-440`, readiness gate depends on mode (`main.go:463-479`).
+
+**`cmd/worker`** (mirror-worker; the heaviest consumer):
+- Connection: `nuts.NewShutdownGroup(ctx)` + `defer g.Shutdown()` (`main.go:230-231`), `nuts.Connect(ctx, natsURL, nuts.WithName("mirror-worker"), nuts.WithNATSOptions(nats.ErrorHandler(advisoryPermErrorHandler(metrics))))` (`main.go:237-239`), `g.AddConn("mirror-worker", nc)` (`:244`), loops registered via `g.Go` (`:393,403`) — the cancel→join→drain ordering (COR-923).
+- Consumer: `js.PullSubscribe("mirror.git.v1.&lt;jur&gt;.&lt;cluster&gt;.&gt;", "mirror-git-v1-&lt;jur&gt;-&lt;cluster&gt;", ManualAck, AckWait 15m, MaxDeliver 10)` (`consumer.go:23-28,106-124`), exponential subscribe-retry 1s→30s (`:117-155`), serial `Fetch(1, MaxWait 5s)` with `nuts.IsShutdownFetchErr` (`:167`). KEDA scales on the same durable (`consumer.go:102-107`; pending gauge via `js.ConsumerInfo` in `metrics.go:452-477`).
+- Per message: `otelnats.Extract` → consumer span → panic-recover→NakWithDelay (`:182-266`); subject/payload validation Terms with failure-index record; **in-progress ack extender** `msg.InProgress()` every AckWait/3 = 5m during long syncs (`consumer.go:29-33,322,705-740`); 30m sync budget (`:34-42,331-336`).
+- Disposition tree `disposeResult` (`:391-485`): Ack (publish `donejobs` `ready` completion **before** Ack, `:401-407,501-523`); Noop (empty source → ready + Ack, no index clear); Term (permanent → record failindex + best-effort `failed` completion, fail-open on KV errors); Nak → `NakWithDelay(30s)`, escalating to Term + failindex `max_deliveries` on the final delivery (`isLastDelivery`, `:602-607`); Raced (concurrent-ref) → Nak without failed-completion.
+- Advisory backstop (`advisory.go`): `nc.ChanQueueSubscribe` on `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.mirror_git_v1.&gt;` and `…MSG_TERMINATED.mirror_git_v1.&gt;` in queue group `mirror-worker-failindex-advisory` (`:62-69,158-169`), 1024-buffer channel drained by 16 workers (`:81-91,197-217`), `js.GetMsg(stream, seq)` to refetch the job (`:240`), then the same `failindex.RecordFailure` CAS (idempotent by stream seq). Missing grants / slow-consumer drops surface via the connection `ErrHandler` (`:339-359`).
+- Failure index: `failindex.Open(js, bucket)` binds KV, degrades to nil if unbound (`main.go:351-361`), with corrupt-entry and max-age-eviction handlers (`main.go:328-350`).
+
+**`cmd/rekicker`** (CronJob). `nuts.Connect(ctx, natsURL, nuts.WithNATSOptions(nats.ErrorHandler(permErrorHandler(metrics))))` + `defer nc.Close()` (no Drain; run-to-completion) (`main.go:105-109`), `failindex.Open` (`:116`), one pass: `Keys(ctx)` (a hand-driven `kv.WatchAll(IgnoreDeletes, MetaOnly)` listing with sentinel/close semantics, `failindex.go:380-439`), per-key `Get`, skip `permanent`/bad-subject, then `js.PublishMsg(failindex.RekickMsg(ulid, fs))` — the stored subject+payload verbatim with `Mirror-Rekick` header + fresh `nuid` msg-id (`rekick.go:223`, `failindex.go:47-53`). Per-tick cap (500) + rate throttle (20/s) + 20-consecutive-error circuit breaker + 600s pass deadline (`main.go:74-96`, `rekick.go:50,97-249`). Dry-run mode via `ENTIRE_REKICK_DRY_RUN`.
+
+**`cmd/mirror-pipeline-admin`** (operator CLI). `dialJetStream` = `nuts.Connect(WithName("mirror-pipeline-admin"), WithNATSOptions(ErrorHandler(permErrorHandler)))`, caller `nc.Close()` (`nats.go:33-51`). Ops: DLQ scan via ephemeral `js.SubscribeSync(subject, nats.OrderedConsumer(), nats.DeliverAll())` (`dlq.go:114`), `js.GetMsg(webhooks_github_dlq, seq)` (`dlq.go:225`), replay = `js.PublishMsg` of the stored envelope back onto `webhooks.github.v1.&gt;` (`dlq.go:379-387`); failindex list/show/delete via `failindex.Open/Keys/Get/Delete` (`failindex.go:51-58`); manual rekick via `js.PublishMsg(failindex.RekickMsg(...))` (`rekick.go:109`); backfill queue status/purge via `js.StreamInfo`/`js.ConsumerInfo`/`js.PurgeStream(&amp;nats.StreamPurgeRequest{Sequence})` (`backfill.go:106,117,239`). `webhooks.go`/`githubapp.go` are GitHub-API-only (no NATS).
+
+**Load tools**: `cmd/loadgen` — `nuts.Connect` + `nc.Close()` (`main.go:208-218`), publishes synthetic mirror jobs via `mirrorjobs.NewPublisher`. `cmd/loadtest-jetstream` — `nuts.Connect`, `gitjobs.EnsureStream` (the only production-code `AddStream/UpdateStream` path, `pkg/gitjobs/jobs.go:310-336`; mirrored by `webhookevents.EnsureStream`, `stream.go:14-40`) and `js.PurgeStream` (`main.go:50-75`). `cmd/mockgithub` — no NATS.
+
+**`pkg/webhookdlq/advisory.go`** — the DLQ crash backstop shared by fanout + forwarder: per-durable advisory subjects `$JS.EVENT.ADVISORY.CONSUMER.{MAX_DELIVERIES,MSG_TERMINATED}.&lt;stream&gt;.&lt;durable&gt;` (`advisory.go:128-134`), queue group `&lt;durable&gt;-dlq-advisory` (`:140`), `ChanQueueSubscribe` + worker-pool drain + `js.GetMsg` + DLQ publish, deduped against the inline capture by the same `Nats-Msg-Id` (`dlq.go:166-172`); `PermErrorHandler` for silent-rejection surfacing (`:458+`). The DLQ publisher itself deliberately hand-rolls its publish (not natspub) because it detaches the pub-ack deadline from the shutdown ctx and needs the `PubAck.Duplicate` bit (`publisher.go:19-32,116-127`).
+
+## 3. go-nuts APIs used (v0.3.0 root package only)
+
+| API | Call sites |
+|---|---|
+| `nuts.Connect` | `cmd/webhook-ingest/main.go:55`, `cmd/webhook-forwarder/main.go:76`, `cmd/fanout/main.go:126`, `cmd/core-fanout/main.go:105`, `cmd/meta-fanout/main.go:172`, `cmd/meta-fanout/backfill.go:141`, `cmd/meta-fanout/backfill_prs.go:131`, `cmd/worker/main.go:237`, `cmd/rekicker/main.go:105`, `cmd/mirror-pipeline-admin/nats.go:37`, `cmd/loadgen/main.go:208`, `cmd/loadtest-jetstream/main.go:87`, `internal/natsregions/natsregions.go:197` |
+| `nuts.WithName` | worker `main.go:238`, admin `nats.go:38`, meta-fanout backfills `backfill.go:141`/`backfill_prs.go:131` |
+| `nuts.WithNATSOptions` | fanout `main.go:126`, forwarder `main.go:76`, worker `main.go:239`, rekicker `main.go:105`, admin `nats.go:39`, natsregions `:199` — always to attach `nats.ErrorHandler` (perm/slow-consumer classifiers) or disconnect/reconnect handlers |
+| `nuts.WithRetryOnFailedConnect` | `internal/natsregions/natsregions.go:198` (remote islands must not crashloop boot) |
+| `nuts.Drain` | ingest `main.go:59`, forwarder `main.go:80`, fanout `main.go:130`, core-fanout `main.go:109`, meta-fanout `main.go:176` + `backfill.go:145` + `backfill_prs.go:135` — all with a 12s backstop documented as "&gt; DrainTimeout (5s) + publish-flush (5s)" and paired with a bounded consumer-done wait before the deferred Drain |
+| `nuts.IsShutdownFetchErr` | `cmd/worker/consumer.go:167`, `cmd/webhook-forwarder/forwarder.go:176`, `pkg/fanoutengine/engine.go:351,406` |
+| `nuts.NewShutdownGroup` / `Go` / `AddConn` / `Shutdown` | **only `cmd/worker`**: `main.go:230-231,244,393,403` |
+
+Not used anywhere (don't exist in v0.3.0): `jsconsumer.*`, `natsmsg.*`, `backoff.*`, `natsmsgtest.*`, `TLSConfigFromFiles` (TLS comes from env inside `Connect`).
+
+Two lifecycle idioms coexist: worker uses `ShutdownGroup` (cancel→join→drain); all other long-lived services use `defer nuts.Drain` + an explicit bounded `select` on a consumer-done channel; CronJob/CLI binaries (rekicker, admin, loadgen, loadtest) use bare `nc.Close()`.
+
+## 4. Hand-rolled logic NOT in go-nuts (the extraction surface)
+
+- **Consumer scaffold** (the future `jsconsumer`): three near-identical copies — `pkg/fanoutengine/engine.go:286-419` (`Run` subscribe-with-1s→30s-exponential-backoff, `consumeLoop` serial Fetch(1)/`consumeLoopPool` unbuffered-channel worker pool, `Ready()` atomic for /readyz), `cmd/worker/consumer.go:110-180`, `cmd/webhook-forwarder/forwarder.go:123-186`, plus `cmd/meta-fanout/lifecycle.go:207-261` (which lacks the IsShutdownFetchErr check).
+- **Disposition/classification**: fanoutengine's `InputError`→Term / plain error→NakWithDelay / final-delivery Term+DLQ (`TermOnExhaustion`) tree (`engine.go:453-697`); worker's richer `classifyDisposition` (ack/noop/term/nak/raced, `consumer.go:563-580`) driven by a `syncError{permanent}` wrapper (`syncer_errors.go`).
+- **Redelivery/backoff policy** (the future `backoff` package): flat `NakWithDelay(30s)` everywhere (no escalating schedule; `nats.BackOff` deliberately dropped — `forwarder.go:39-50`), `MaxDeliver` 8 (fanouts/forwarder, bounded by stream dedup-window invariants) or 10 (worker), `isLastDelivery`/`isFinalDelivery` checks by `meta.NumDelivered`.
+- **Message helpers** (the future `natsmsg`): `pkg/otelnats` Inject/Extract (`nats.go:39-53`); consumer-span + `messaging.*` attribute stamping repeated in 4 places (`engine.go:421-445`, worker `consumer.go:186-221`, forwarder `forwarder.go:188-208`, lifecycle `lifecycle.go:263-283`); `startInProgressExtender` (KeepInProgress equivalent, worker `consumer.go:718-740`); `natspub.Publish` producer core (`internal/natspub/natspub.go:80-131`).
+- **Advisory backstops** ×2 (worker failindex `cmd/worker/advisory.go`; webhook DLQ `pkg/webhookdlq/advisory.go`) — ChanQueueSubscribe + queue group + worker pool + GetMsg + idempotent record.
+- **DLQ**: `pkg/webhookdlq` (verbatim-envelope dead letters, per-source subjects, sha256 fallback msg-id, fail-open capture) + `fanoutengine.DLQ` sink interface (`dlq.go:26-28`).
+- **Fail-index**: `pkg/failindex` KV CAS upsert with seq dedup, revision-guarded clear/evict, ctx-bounded `Keys` watcher (`failindex.go:206-439`); re-driven by `cmd/rekicker` and self-cleared by the worker.
+- **Route memo**: in-process per-delivery region-success memo so a partial fan-out Nak doesn't re-publish already-acked regions past `mirror_git_v1`'s 1s dedup window (`pkg/fanoutengine/routememo.go`, used `engine.go:540-556`).
+- **Region routing**: `internal/natsregions` + `fanoutengine.Regions` (deliberately duplicated at `route.go:66-95` to keep the engine free of `internal/` for future extraction).
+
+## 5. Docs
+
+- **`README.md`** — full architecture diagram: GitHub webhook → `webhook-ingest` → `webhooks_github_v1` → four independent durables (`fanout`→`mirror_git_v1`→`worker`→entiredb; `meta-fanout`→`github_meta_v1`/`github_pr_v1`; `core-fanout`→`github_push_author_v1`; `webhook-forwarder`→entire-web). Worker records terminal failures in KV; rekicker re-drives on cron.
+- **`docs/design/mirror-sync-failure-index.md`** — three-layer recovery model rationale (why KV index over DLQ or O(repos) reconcile), the nack-owned KV bucket, in-process + advisory dual-write.
+- **`docs/design/mirror-worker-capacity.md`**, **`webhook-ingest-autoscaling.md`** — KEDA scaling off the durable's NumPending and publish-latency p95.
+- **`docs/multi-region/`** — `multi-region-fanout-design.md` (two-stage model: webhook→home sync, then EntireDB post-receive→replica fan), `fanout-engine-design.md` + `fanout-engine-l1-design.md` (the engine extraction; explicitly cites go-nuts/COR-925 as the destination module), `fanout-route-memo.md`, `webhook-flowchart.md` (per-stage ASCII flowcharts), `multi-region-fanout-impl-plan.md`. (`natsregions.go:14` references a `cross-region-nats-cutover.md` that is not present in docs/.)
+- **`docs/runbooks/`** — `webhook-dlq.md` (ordered DLQ enablement: fleet stream + grants before `ENTIRE_WEBHOOK_DLQ_ENABLED`), `webhook-redelivery.md` (GitHub-side redelivery), `github-meta-backfill.md`, `github-pr-backfill.md`, `mirror-stuck-refs-without-objects.md`.
+- **`docs/loadtest-design.md` / `loadtest-local.md`** — loadgen/mockgithub/loadtest-jetstream harness.
+
+**Summary judgment for the caller**: this repo is a heavy consumer of go-nuts's *connection-lifecycle* slice (Connect/Drain/IsShutdownFetchErr/ShutdownGroup, 13 Connect sites) but pins v0.3.0, which predates jsconsumer/natsmsg/backoff — all of that behavior currently lives hand-rolled here, chiefly in `pkg/fanoutengine`, `internal/natspub`, `pkg/otelnats`, the worker's consumer/advisory files, and the forwarder/lifecycle loops, which are the natural donors for the next go-nuts slices.</result>
+<usage><subagent_tokens>243907</subagent_tokens><tool_uses>59</tool_uses><duration_ms>526662</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a40342f2d8a5ef3f3</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-nodo-work-tasks-go-nuts-extension-go-nuts/72bff985-4a1a-4a24-ab7e-a7ad3dba9c7e/tasks/a40342f2d8a5ef3f3.output</output-file>
+<status>completed</status>
+<summary>Agent "Map NATS usage in entiredb" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>The map is complete. Here is the structured report.
+
+---
+
+# NATS / JetStream usage map — `/Users/nodo/work/tasks/go-nuts-extension/entiredb`
+
+## 1. Dependencies (go.mod)
+
+- **`github.com/entireio/go-nuts` is NOT imported.** No hit in `go.mod`, `go.sum`, any `modules/*/go.mod` (analytics, authmtls, jwtverify, ratelimit, resend), or any `.go` file.
+- `github.com/nats-io/nats.go v1.52.0` — `/Users/nodo/work/tasks/go-nuts-extension/entiredb/go.mod:40`
+- `github.com/nats-io/nats-server/v2 v2.14.3` — `go.mod:39`; used **only** to embed a JetStream server in tests (`test/testutils/natstest.go:7`)
+- Indirect: `nats-io/jwt/v2 v2.8.2`, `nkeys v0.4.16`, `nuid v1.0.1`.
+
+Instead of go-nuts, the repo has two **internal helper packages** that cover the same ground:
+- `internal/natsx/` — connection drain + supervised pull-consumer loop
+- `internal/natsmsg/` — trace-context extraction, AckWait heartbeat, DLQ helper (note: same package name as go-nuts' `natsmsg`, but a separate implementation under `entire.io/internal/natsmsg`)
+
+## 2. Every NATS code path
+
+### 2a. Shared infrastructure (hand-rolled, go-nuts-equivalent)
+
+**`internal/natsx/natsx.go`** — `natsx.Drain(ctx, name, nc, timeout)` (`natsx.go:31-51`): installs a `ClosedHandler`, calls `nc.Drain()`, blocks until CLOSED or timeout (because `nats.Conn.Drain()` is async). Used as the cleanup for nearly every entire-core connection.
+
+**`internal/natsx/pullconsumer.go`** — `natsx.PullConsumer` (`pullconsumer.go:33-121`): the supervise loop shared by all pull consumers. `CreateOrUpdateConsumer` → `Consume` with `jetstream.PullMaxMessages(FetchBatch)` + `ConsumeErrHandler`; on `ConsumeContext.Closed()` it recreates after exponential backoff (`backoffSleep`, `pullconsumer.go:131-139`, doubles to `RetryBackoffMax`, resets only after a healthy run ≥ max, `pullconsumer.go:113-115`); `jetstream.ErrStreamNotFound` logs Warn-not-Error (`pullconsumer.go:68`); on ctx cancel calls `cc.Stop()` (`pullconsumer.go:105`).
+
+**`internal/natsmsg/`**:
+- `tracecontext.go:16-21` `ExtractTraceContext(ctx, header)`; `HeaderCarrier` OTel TextMapCarrier adapter (`tracecontext.go:25-45`); `ClampToInt64` (`tracecontext.go:49`).
+- `keepinprogress.go:34-70` `KeepInProgress(inProgress, ackWait)` — ticks `msg.InProgress()` at AckWait/3, capped at 15 ticks (~5×AckWait, `keepinprogress.go:18`), idempotent blocking stop.
+- `deadletter.go:76-96` `DeadLetter(ctx, pub, dlqSubject, msg, reason)` — republishes poison with `Nats-Dlq-Reason/Origin-Subject/Delivered/Stream-Seq` headers (`deadletter.go:22-26`), 15 s publish timeout (`deadletter.go:17`); `SubjectToken` sanitizer (`deadletter.go:41-61`). Callers Ack the original only if the DLQ publish succeeded (WorkQueue semantics — COR-944).
+- `natsmsgtest/fakemsg.go` — fake `jetstream.Msg` for tests.
+
+### 2b. Connection sites (`nats.Connect`)
+
+| Site | Binary | Options / lifecycle |
+|---|---|---|
+| `internal/entirecore/serve_mode_global.go:353` (`connectNATSURL`, `:312-359`) | entire-core (all modes + workers) | mTLS mandatory (`:313-319`), `nats.DrainTimeout(5s)`, `RetryOnFailedConnect(true)`, `MaxReconnects(-1)`, `ReconnectWait(2s)`, Disconnect/Closed/Reconnect/ReconnectErr handlers (`:321-352`); TLS config re-reads cert per handshake (`buildNATSTLSConfig`, `:367-383`). Shutdown: `natsx.Drain` per connection, `natsDrainTimeout = 5s` (`:38`). |
+| `internal/entireserver/ref_events_publisher.go:77` (`openRefEventsPublisher`, `:18-94`) | entire-server (data plane) | Same option set minus DrainTimeout (`:51-76`); SVCTOK-cert-preferred mTLS (`:34-45`); returns legacy `nc.JetStream()` context; cleanup is plain `nc.Close` (`:93`). |
+| `internal/ciwebhooks/serve.go:197` (`dialNATS`, `:169-211`) | entire-ci-webhooks | mTLS, `RetryOnFailedConnect`, `MaxReconnects(-1)` (`:181-196`); shutdown via `defer natsx.Drain(ctx, "ci-webhooks", nc, 5s)` (`serve.go:59`). |
+| `test/testutils/natstest.go:34` (`EmbeddedJetStream`) | tests | Embedded `nats-server/v2` with JetStream in `t.TempDir()`, torn down via `t.Cleanup` (ADR `docs/adrs/20260704-embedded-nats-for-e2e-tests.md`). |
+
+entire-core opens a **separate connection per subsystem**, each with its own `natsx.Drain` cleanup: gitjobs publisher (`serve_mode_global.go:256-275`), lifecycle emitter (`:284-303`), perms-webhook consumer (`perms_wiring.go:84-135`), read-model consumer (`perms_wiring.go:217-256`), repo-ops consumers — 3 consumers, 1 conn (`repoops_wiring.go:326-391`), mirror-done (`mirrordone_wiring.go:66-96`), perms-backfill pub/consumer (`permsbackfill_wiring.go:29-38, 65-93`), verified-email (`verifiedemail_wiring.go:43-87`), transactional email (`transactionalemail_wiring.go:123-138`), perms-sweep worker (`perms_sweep_worker.go:83-103`), sweep enumerator CronJob (`permsreconciler_runonce.go:108-121`, `defer nc.Close()` — publish-only run-once). Shutdown ordering (COR-923): cancel bg ctx → join consumer loops bounded by `subsystemStopTimeout = 15s` (`serve.go:38-41`, `:328-336`) → deferred `natsx.Drain`s run last; overall listener drain 25 s (`serve.go:36`).
+
+### 2c. Streams, publishers, consumers
+
+**`repo_refs_v1`** (subjects `repo_refs_v1.&lt;repo-ulid&gt;`; fleet-owned stream, never created here — `ref_events_publisher.go:87-90`)
+- Publisher: `refevents/` — transactional outbox. Pushes enqueue rows in-tx (`refevents/outbox.go`, table `ref_event_outbox`, `outbox.go:29`); relay drains via taskloop every 1 s (`internal/entireserver/serve.go:174-189`), 64 hash shards each under a pg advisory lock (`outbox.go:74-85, 113-127`), batch 64, publish with `PublishMsg(..., nats.Context(spanCtx))` (`outbox.go:484`), delete-on-PubAck with detached 5 s commit grace (`outbox.go:58-66`); at-least-once, dedup via `nats.MsgIdHdr` = content-derived `NATSMsgID` (`refevents/refevents.go:235-237`). A best-effort direct `Emitter` exists for sim/tests (`refevents.go:102-146`; wired in `internal/sim/env.go:788-793` against `internal/sim/nats_recorder.go`).
+- Consumer: ci-webhooks dispatcher (`internal/ciwebhooks/dispatcher/dispatcher.go`) — durable `ci-webhooks`, filter `repo_refs_v1.&gt;` (`dispatcher.go:37-42`), AckWait 2 m, MaxDeliver 10, NakDelay 5 s, FetchBatch 1 (`:44-48`), runs on `natsx.PullConsumer` (`:128-131`); decode→fan out to Buildkite→Ack; 5xx/network → `NakWithDelay`; poison → `Term`. Health probe checks `nc.IsConnected` equivalent (`internal/ciwebhooks/probes/probes.go:35`).
+
+**`mirror_git_v1`** (subjects `mirror.git.v1.&lt;jur&gt;.&lt;cluster&gt;.github.sync_repo`; stream owned by out-of-repo mirror-pipeline — `core/mirrorrepo/gitjobs/jobs.go:32-35`)
+- Publisher only: `core/mirrorrepo/gitjobs/publisher.go:57-129` `PublishSyncRepo` — `Nats-Msg-Id` = `op/source-kind/owner/repo/ulid` (`:96-99`), OTel producer span + header inject (`:79-106`), sync `PublishMsg` with `nats.Context`. Called from mirror create (`core/api/mirrors.go:860`); publish failure returns 502 to the caller rather than 2xx (`mirrors.go:769-787`). Boot fails if no NATS URL in regional/standalone (`serve_mode_global.go:260-263`).
+
+**`repo_ops_v1`** (WorkQueue; subjects `repo.ops.v1.&lt;jurisdiction&gt;.&lt;cluster&gt;.&lt;op&gt;`; contract owned here — `internal/entirecore/repoops/jobs.go:1-58`)
+- Stream contract: `WorkQueuePolicy`, `FileStorage`, `DiscardNew`, dup window 10 s, MaxAge 48 h (`repoops/stream.go:87-95`, `jobs.go:41-58`); `EnsureStream` boot-time create/reconcile, replicas from `ENTIRE_REPO_OPS_STREAM_REPLICAS` (`stream.go:23-70`); fleet "nack" operator owns it declaratively in prod.
+- Ops on the bus:
+  - **teardown / suspend / resume** — publisher: `repoops/publisher.go:55-131` (global core's webhook fan-out, `repoops_wiring.go:54-292`; msg-id `op/ULID/observedAt` `publisher.go:110`). Consumers: regional core, one durable per (op, jurisdiction): `entirecore-repoops-&lt;op&gt;-&lt;jur|all&gt;`, filter `repo.ops.v1.&lt;jur|*&gt;.*.&lt;op&gt;` (`repoops/consumer.go:26-39, 267-279`); AckExplicit, AckWait 2 m, **MaxDeliver -1 (unlimited)** (`consumer.go:46-60`), NakDelay 5 s growing geometrically to 30 s (`consumer.go:796-809`), FetchBatch 1; `EnsureConsumer` pre-creates the shared durable at boot (`consumer.go:312-317`); handler: trace extract + consumer span (`:346-354`), `KeepInProgress` heartbeat (`:412`), last-writer-wins / attachment / installation-suspended gates (`:436-673`), poison → `natsmsg.DeadLetter` to `repo.ops.dlq.v1.&lt;op&gt;.&lt;reason&gt;` then Ack (`:715-733`), panic recovery dead-letters (`:758-772`). Wiring: `repoops_wiring.go:320-392`, run in `serve.go:237-241`.
+  - **mirror_done** — consumer only (producer is mirror-pipeline worker): `internal/entirecore/mirrordone/` filter `repo.ops.v1.&lt;jur|*&gt;.*.mirror_done` (`event.go:56-61`), runs on `natsx.PullConsumer` (`consumer.go:157-166`), flips `mirror_repos.status` ready|failed; poison → DLQ `repo.ops.dlq.v1.mirror_done.&lt;reason&gt;`; wired `mirrordone_wiring.go:56-97` against the in-cell NATS.
+  - **perms_backfill** — publisher `internal/entirecore/permsbackfill/publisher.go` (mirror create enqueues collaborator backfill, `core/api/mirrors.go:406`); consumer same regional process, filter `repo.ops.v1.&lt;jur|*&gt;.*.perms_backfill` (`permsbackfill/event.go:48-53`), durable JetStream hop on purpose (`event.go:14-16`); wiring `permsbackfill_wiring.go`.
+  - **perms_sweep** — publisher: hourly `sync-accessible-repos` CronJob enumerator (`permsreconciler_runonce.go:107-166`; subject `repo.ops.v1.&lt;jur|global&gt;.sweep.perms_sweep`, cluster slot = literal `"sweep"`, `permssweep/event.go:43-70`; 15 s publish timeout `publisher.go:31`; per-run liveness canary `publisher.go:111-153`). Consumer: `perms-sweep-worker` Deployment (`perms_sweep_worker.go:45-140`; `cmd/entire-core/cli/permssweepworker.go`) — shared durable `entirecore-perms-sweep`, N concurrent Consume slots (default 10, `permssweep/consumer.go:26-115`), AckWait 2 m + KeepInProgress (`consumer.go:322`), MaxDeliver 5 (jobs re-derivable), busy-lease Acks (`ErrInstallationBusy`), DLQ `repo.ops.dlq.v1.perms_sweep.&lt;reason&gt;`. ADR: `docs/adrs/20260706-perms-sweep-nats-fanout.md`.
+- Backlog observability: stream oldest-age gauge from `StreamInfo` (`repoops/backlog.go:49-71`, COR-918 rail-loss alert).
+
+**`webhooks_github_v1`** (subjects `webhooks.github.v1.&lt;event&gt;`; US-only, nack-owned; producer is out-of-repo `cmd/webhook-ingest`)
+- Metadata consumer: `internal/entirecore/permswebhook/` durable `entirecore-webhook-meta`, `FilterSubjects` = installation / installation_repositories / repository (`events.go:31-45`), AckWait 2 m, MaxDeliver -1, FetchBatch 1, **InactiveThreshold 72 h** (interest-retention stream protection, `consumer.go:57-73`), runs on `natsx.PullConsumer` (`consumer.go:205-208`), KeepInProgress during teardown fan-outs (`consumer.go:276`), poison `Term` (`:305,328,348`). Runs in global + standalone (`serve_mode_global.go:196`, `serve_mode_standalone.go:224`).
+- Read-model consumer: second durable `entirecore-webhook-perms` (`permswebhook/permsapply.go:25`) for member/team/membership/organization events → `github_user_repo_access` + SpiceDB projection; gated by `ENTIRE_GITHUB_PERMS_READ_MODEL_ENABLED` (`perms_wiring.go:183-256`).
+
+**`github_push_author_v1`** (subjects `github_push_author.v1.&lt;jurisdiction&gt;.&lt;cluster&gt;`; per-region island, producer is mirror-pipeline core-fanout)
+- Consumer: `internal/entirecore/verifiedemailwebhook/` filter `github_push_author.v1.&lt;jur&gt;.&gt;` (`events.go:35-57`), `natsx.PullConsumer` (`consumer.go:163-166`), writes `verified_emails`; runs in-process in regional serve (`serve_mode_regional.go:259`) or as the dedicated `verified-email-consumer` Deployment (`internal/entirecore/verified_email_consumer.go`, `cmd/entire-core/cli/verified_email_consumer.go`). Backlog gauge via legacy `ConsumerInfo` (`verifiedemailwebhook/backlog.go`).
+
+**`email_v1`** (subject `email_v1.requested`, filter `email_v1.&gt;`, operator-owned — `core/email/event.go:10-18`)
+- Producer: transactional outbox `email_outbox` table (`core/email/outbox.go:18, 57-70`), per-region relay claims own-jurisdiction rows `FOR UPDATE SKIP LOCKED` every 1 s (`outbox.go:121-203`), core-publish with `nats.MsgIdHdr = eventID` (`outbox.go:178-180`).
+- Consumer: `core/email/consumer.go` durable `entirecore-email-&lt;jurisdiction&gt;` (`consumer.go:86-90`), AckWait 2 m, **MaxDeliver 50** (`consumer.go:33`), NakDelay 30 s, `natsx.PullConsumer` (`consumer.go:134-143`), `ErrPoison` → Term, transient → NakWithDelay; max-deliver-exhausted metric (`consumer.go:169-173`). Backlog gauges from `ConsumerInfo` (`core/email/backlog.go:31-70`). Wiring + capture/drain feature gates: `transactionalemail_wiring.go:20-169`. Doc: `docs/entire-core/transactional-email.md`, runbook `docs/runbooks/transactional-email.md`.
+
+**`resource_lifecycle_v1`** (subjects `resource_lifecycle_v1.&lt;resource_type&gt;.&lt;op&gt;` — `core/resourceevents/resourceevents.go:34-40`)
+- Publisher only, **core NATS (no JetStream, no PubAck), best-effort at-most-once by design** (`resourceevents.go:5-12`): `Emitter.Publish` over `*nats.Conn` (`resourceevents.go:193-279`), producer span + trace inject, failures logged and swallowed. ~30 call sites in `core/api`, `core/coreapi`, `core/mirrorprimary/reconciler.go:65`, `internal/entirecore/authorbackfill/processor.go:660`, `verifiedemailwebhook/apply.go:136`. Consumers live out-of-repo (entire-search, entire-api). Ops tool: `entire-core broadcast-processing-primaries` re-announces `repo_group.primary_changed` (`cmd/entire-core/cli/broadcast_processing_primaries.go`, `internal/entirecore/broadcast_processing_primaries.go:71-78`).
+
+**No NATS KV, object store, queue-group (core `QueueSubscribe`), or request-reply usage anywhere.** The only core-NATS `Subscribe` is in a test (`internal/natsx/natsx_test.go:39`).
+
+## 3. go-nuts APIs used
+
+None. The library is entirely absent. (The internal `natsmsg`/`natsx` packages mirror go-nuts concepts — `Drain`, pull-consumer supervision, `KeepInProgress`, `ExtractTraceContext`, `DeadLetter`, backoff — but are locally implemented under `entire.io/internal/...`.)
+
+## 4. Hand-rolled logic replacing go-nuts (summary with cites)
+
+- **Connect/reconnect policy**: duplicated in 3 places — `serve_mode_global.go:321-352`, `ref_events_publisher.go:51-76`, `ciwebhooks/serve.go:181-196` (same options; ciwebhooks omits `ClosedHandler`/`ReconnectErrHandler` and `DrainTimeout`). All: `RetryOnFailedConnect`, infinite reconnects, 2 s wait, slog handlers, per-handshake cert reload (`buildNATSTLSConfig` ×3: `serve_mode_global.go:367`, `ref_events_publisher.go:102`, `ciwebhooks/serve.go:213`).
+- **Drain**: `natsx.Drain` (`natsx.go:31-51`); entire-server's ref-events publisher uses bare `nc.Close` instead (`ref_events_publisher.go:93`).
+- **Shutdown grouping**: subsystem manifest + `runSubsystems` + bounded `waitBounded(&amp;bg, 15s)` before deferred drains (`internal/entirecore/serve.go:36-41, 328-336`) — a hand-rolled ShutdownGroup equivalent.
+- **Trace propagation**: `natsmsg.ExtractTraceContext` on the consume side; on the publish side each publisher has its own duplicated `headerCarrier` (`repoops/publisher.go:134-152`, `gitjobs/publisher.go:133-151`, `resourceevents.go:282-300`) or uses `natsmsg.HeaderCarrier` (`permssweep/publisher.go:80`).
+- **Ack/Nak/backoff policy**: per-consumer, hand-rolled — geometric NakDelay backoff on unlimited-MaxDeliver work queues (`repoops/consumer.go:796-809`), fixed NakDelay elsewhere; Term for structural poison on interest streams; DLQ+Ack for poison on the WorkQueue (`natsmsg.DeadLetter`).
+- **Heartbeat**: `natsmsg.KeepInProgress` (capped extension) in repoops, permswebhook, permssweep handlers.
+- **Consumer supervision/backoff**: `natsx.PullConsumer.Run` + `backoffSleep` (`pullconsumer.go:56-139`); permssweep has its own variant loop for N concurrent slots (`permssweep/consumer.go:180-230`).
+- **Dedup**: hand-set `Nats-Msg-Id` headers everywhere (`gitjobs/publisher.go:24`, `repoops/publisher.go:28`, `permssweep/publisher.go:23`, `refevents.go:235`, `email/outbox.go:179`).
+- **No ordered consumers, no KV watchers.** Cluster coordination (routing tables, repair queues, DHT membership) does **not** use NATS at all — it rides memberlist gossip (`:9999`) and mTLS gRPC/HTTP between entire-server nodes (`docs/repo-map.md:133`; `dht/repair_queue.go` is gRPC/OTel only).
+
+## 5. Docs describing NATS architecture
+
+- `README.md:250-274` — optional `repo_refs_v1` event stream; `nats sub "repo_refs_v1.&gt;"`; disabled when `ENTIRE_NATS_URL` unset.
+- `LOCALDEV.md:12, 38-39, 88, 144-155` — dev topology (`mirror_git_v1`), single-node dev NATS (`ENTIRE_NATS_STREAM_REPLICAS=1`), streams created by `mise run dev:prereqs`, prod streams owned by fleet `apps/nats-streams`.
+- `docs/repo-map.md:22, 62, 102, 127, 133-134` — component map: ci-webhooks = NATS→Buildkite bridge; NATS optional for tlog events; **explicitly: replication/repair/DHT use gRPC + memberlist, not NATS**.
+- ADRs: `20260706-perms-sweep-nats-fanout.md` (enumerator→worker fan-out on repo_ops_v1), `20260704-embedded-nats-for-e2e-tests.md` (test strategy), `20260622-mirror-teardown-on-upstream-removal.md` + `20260703-teardown-on-app-uninstall.md` (repo_ops teardown design), `20260702-verified-email-consumer-deployment.md`, `20260629-cross-region-author-email-resolution.md` (github_push_author islands), `20260526-entire-webhook-mvp.md` / `20260609-inbound-buildkite-webhooks.md` (ci-webhooks).
+- Runbooks: `docs/runbooks/ref-events-outbox-backlog.md`, `docs/runbooks/transactional-email.md`; `docs/entire-core/transactional-email.md`.
+- Dev broker config: `deploy/dev/nats.conf` — JetStream on, mTLS `verify_and_map` mapping cert SANs to users (`entiredb`, `spiffe://partial.to/local/{entire-core,mirror-worker,webhook-ingest,entire-api}`); `docker-compose.yml:14-25` (profile `nats`).
+- `AGENTS.md` and `MILESTONES.md` contain **no** NATS content.
+
+## 6. Naming conventions &amp; queue patterns
+
+- **Streams**: snake_case with `_v1` version suffix: `repo_refs_v1`, `mirror_git_v1`, `repo_ops_v1`, `webhooks_github_v1`, `github_push_author_v1`, `email_v1`, `resource_lifecycle_v1`.
+- **Subjects**: dotted, versioned, mostly placement-scoped: `repo.ops.v1.&lt;jurisdiction&gt;.&lt;cluster&gt;.&lt;op&gt;`, `mirror.git.v1.&lt;jur&gt;.&lt;cluster&gt;.&lt;source&gt;.&lt;op&gt;`, `webhooks.github.v1.&lt;event&gt;`, `github_push_author.v1.&lt;jur&gt;.&lt;cluster&gt;`, `repo_refs_v1.&lt;repo-ulid&gt;`, `resource_lifecycle_v1.&lt;type&gt;.&lt;op&gt;`, `email_v1.requested`. DLQ: `repo.ops.dlq.v1.&lt;op&gt;.&lt;reason&gt;`.
+- **Durables**: `entirecore-&lt;purpose&gt;[-&lt;op&gt;][-&lt;jurisdiction|all&gt;]` (`entirecore-repoops-teardown-eu`, `entirecore-webhook-meta`, `entirecore-webhook-perms`, `entirecore-email-&lt;jur&gt;`, `entirecore-perms-sweep`), plus `ci-webhooks`. Names are load-bearing/pinned (renames orphan durables — `repoops/consumer.go:26-39`).
+- **Work-queue pattern**: `repo_ops_v1` is a `WorkQueuePolicy` stream shared by 6 ops via **non-overlapping filter subjects** (a WorkQueue requirement), one durable per op shared by all replicas of a region (replicas split work through the shared durable — the JetStream equivalent of a queue group). No core-NATS queue groups exist.
+- **Two NATS "planes"**: central NATS (`ENTIRE_NATS_URL`) carries `webhooks_github_v1` + the global→regional `repo_ops_v1` ops; per-cell/in-cell islands (`ENTIRE_MIRROR_GIT_NATS_URL`, fallback `ENTIRE_NATS_URL`, resolver `inCellNatsURL()` at `internal/entirecore/config.go:469-477`) carry `mirror_git_v1`, `mirror_done`, `perms_backfill`, `perms_sweep`, `github_push_author_v1`, `email_v1`.
+- **Delivery-guarantee tiers**: transactional Postgres outbox → JetStream (refevents, email); durable JetStream publish with Msg-Id dedup + gated idempotent consumers (repo_ops, mirror_git); best-effort core-NATS at-most-once (resource_lifecycle).</result>
+<usage><subagent_tokens>238333</subagent_tokens><tool_uses>73</tool_uses><duration_ms>683879</duration_ms></usage>
+</task-notification>
+
+---
+
+sounds good, go ahead
