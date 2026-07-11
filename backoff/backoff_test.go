@@ -2,6 +2,7 @@ package backoff
 
 import (
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -115,6 +116,97 @@ func TestNakOrTermZeroMaxDeliverNaks(t *testing.T) {
 	}
 	if msg.Termed {
 		t.Error("termed on the first delivery with an unset MaxDeliver")
+	}
+}
+
+// TestDelayForFlatByDefault pins zero-value compatibility: without a Factor
+// the envelope stays flat at NakDelay for every delivery, exactly the
+// pre-growth behavior.
+func TestDelayForFlatByDefault(t *testing.T) {
+	p := Policy{NakDelay: testDelay}
+	for _, n := range []int{0, 1, 2, 5, 50} {
+		if got := p.DelayFor(n); got != testDelay {
+			t.Errorf("flat DelayFor(%d) = %v, want %v", n, got, testDelay)
+		}
+	}
+}
+
+// TestDelayForGrows covers the two envelopes the services actually run:
+// entire-api's 1s doubling capped at 300s and entiredb's 5s doubling capped
+// at 30s.
+func TestDelayForGrows(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		p    Policy
+		want map[int]time.Duration
+	}{
+		{
+			name: "1s doubling capped at 300s",
+			p:    Policy{NakDelay: time.Second, Factor: 2, MaxDelay: 300 * time.Second},
+			want: map[int]time.Duration{
+				0: time.Second, 1: time.Second, 2: 2 * time.Second, 3: 4 * time.Second,
+				9: 256 * time.Second, 10: 300 * time.Second, 20: 300 * time.Second,
+			},
+		},
+		{
+			name: "5s doubling capped at 30s",
+			p:    Policy{NakDelay: 5 * time.Second, Factor: 2, MaxDelay: 30 * time.Second},
+			want: map[int]time.Duration{
+				1: 5 * time.Second, 2: 10 * time.Second, 3: 20 * time.Second,
+				4: 30 * time.Second, 8: 30 * time.Second,
+			},
+		},
+	} {
+		for n, want := range tc.want {
+			if got := tc.p.DelayFor(n); got != want {
+				t.Errorf("%s: DelayFor(%d) = %v, want %v", tc.name, n, got, want)
+			}
+		}
+	}
+}
+
+// TestDelayForSaturatesWithoutCap: uncapped growth must saturate rather than
+// wrap negative — a negative NakWithDelay would redeliver immediately, the
+// opposite of backing off.
+func TestDelayForSaturatesWithoutCap(t *testing.T) {
+	p := Policy{NakDelay: time.Hour, Factor: 10}
+	if got := p.DelayFor(30); got != time.Duration(math.MaxInt64) {
+		t.Errorf("uncapped DelayFor(30) = %v, want saturation at MaxInt64", got)
+	}
+	if got := p.DelayFor(30); got < 0 {
+		t.Errorf("uncapped DelayFor(30) went negative: %v", got)
+	}
+}
+
+// TestNakOrTermUsesGrownDelay: NakOrTerm must nak with the delay for THIS
+// delivery's count from the message metadata, not the base delay.
+func TestNakOrTermUsesGrownDelay(t *testing.T) {
+	p := Policy{NakDelay: time.Second, Factor: 2, MaxDelay: 300 * time.Second, MaxDeliver: 8}
+	msg := delivered(3)
+
+	got, err := p.NakOrTerm(msg)
+	if err != nil {
+		t.Fatalf("NakOrTerm: %v", err)
+	}
+	if got != OutcomeNak {
+		t.Errorf("outcome = %q, want nak", got)
+	}
+	if len(msg.NakDelays) != 1 || msg.NakDelays[0] != 4*time.Second {
+		t.Errorf("NakDelays = %v, want one nak with the grown 4s delay", msg.NakDelays)
+	}
+}
+
+// TestNakOrTermGrownDelayMissingMetadata: without metadata the delivery count
+// is unknown; the policy naks with the base delay (first-delivery read).
+func TestNakOrTermGrownDelayMissingMetadata(t *testing.T) {
+	p := Policy{NakDelay: time.Second, Factor: 2, MaxDelay: 300 * time.Second}
+	msg := &natsmsgtest.FakeMsg{MetaErr: errors.New("no metadata")}
+
+	if _, err := p.NakOrTerm(msg); err != nil {
+		t.Fatalf("NakOrTerm: %v", err)
+	}
+	if len(msg.NakDelays) != 1 || msg.NakDelays[0] != time.Second {
+		t.Errorf("NakDelays = %v, want one nak with the base delay", msg.NakDelays)
 	}
 }
 
