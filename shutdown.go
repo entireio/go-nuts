@@ -236,7 +236,7 @@ func (g *ShutdownGroup) shutdown() {
 		g.wg.Wait()
 		close(done)
 	}()
-	if joinTimedOut(done, g.joinTimeout) {
+	if waitTimedOut(done, g.joinTimeout) {
 		g.logger.WarnContext(g.ctx, "nuts: background loops did not stop within join timeout; draining anyway",
 			slog.Duration("join_timeout", g.joinTimeout))
 		g.recordError(fmt.Errorf("nuts: background loop join timeout after %s", g.joinTimeout), false)
@@ -257,11 +257,11 @@ func (g *ShutdownGroup) shutdown() {
 	dwg.Wait()
 }
 
-// joinTimedOut waits for the tracked loops and reports whether the timeout won.
-// If completion and the timer become ready together, prefer completion: the
-// group did join within the observable boundary and must not fail shutdown due
-// to select choosing the timer pseudo-randomly.
-func joinTimedOut(done <-chan struct{}, timeout time.Duration) bool {
+// waitTimedOut waits for a completion signal and reports whether the timeout
+// won. If completion and the timer become ready together, prefer completion:
+// work that finished within the observable boundary must not be reported as a
+// failure just because select chose the timer pseudo-randomly.
+func waitTimedOut[T any](done <-chan T, timeout time.Duration) bool {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 

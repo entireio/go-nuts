@@ -112,6 +112,20 @@ func TestDrainTimeoutIsReturnedAndCloses(t *testing.T) {
 	}
 }
 
+// TestDrainTimeoutPrefersCompletedDrain makes the CLOSED signal and timeout
+// ready together. Drain's shared wait helper must prefer CLOSED so a completed
+// drain is never turned into ErrDrainTimeout by select choosing the timer.
+func TestDrainTimeoutPrefersCompletedDrain(t *testing.T) {
+	closed := make(chan nats.Status)
+	close(closed)
+
+	for range 100 {
+		if waitTimedOut(closed, 0) {
+			t.Fatal("waitTimedOut reported a timeout for an already-closed connection")
+		}
+	}
+}
+
 // TestDrainAlreadyClosedConn is the second origin test: Drain on a
 // pre-closed connection is a prompt no-op, not a block on the CLOSED wait.
 func TestDrainAlreadyClosedConn(t *testing.T) {

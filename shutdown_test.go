@@ -81,8 +81,8 @@ func TestJoinTimedOutPrefersCompletedJoin(t *testing.T) {
 	close(done)
 
 	for range 100 {
-		if joinTimedOut(done, 0) {
-			t.Fatal("joinTimedOut reported a timeout for an already-completed join")
+		if waitTimedOut(done, 0) {
+			t.Fatal("waitTimedOut reported a timeout for an already-completed join")
 		}
 	}
 }

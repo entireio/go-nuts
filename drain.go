@@ -93,15 +93,12 @@ func Drain(ctx context.Context, nc *nats.Conn, name string, logger *slog.Logger,
 		return fmt.Errorf("nuts: drain %s: %w", name, err)
 	}
 
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-closed:
+	if !waitTimedOut(closed, timeout) {
 		logger.InfoContext(ctx, "nuts: NATS drained", slog.String("conn", name))
 		return nil
-	case <-timer.C:
-		logger.WarnContext(ctx, "nuts: NATS drain timed out before close", slog.String("conn", name))
-		nc.Close()
-		return fmt.Errorf("%w: %s after %s", ErrDrainTimeout, name, timeout)
 	}
+
+	logger.WarnContext(ctx, "nuts: NATS drain timed out before close", slog.String("conn", name))
+	nc.Close()
+	return fmt.Errorf("%w: %s after %s", ErrDrainTimeout, name, timeout)
 }
