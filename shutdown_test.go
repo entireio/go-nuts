@@ -3,6 +3,7 @@ package nuts
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,7 +25,9 @@ func TestShutdownGroupJoinsLoops(t *testing.T) {
 	g.AddConn("nil-conn", nil)
 
 	start := time.Now()
-	g.Shutdown()
+	if err := g.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() err = %v, want nil", err)
+	}
 	if elapsed := time.Since(start); elapsed > DefaultJoinTimeout {
 		t.Fatalf("Shutdown took %v, expected prompt return", elapsed)
 	}
@@ -38,7 +41,9 @@ func TestShutdownGroupCancelsContext(t *testing.T) {
 	if g.Context().Err() != nil {
 		t.Fatal("context cancelled before Shutdown")
 	}
-	g.Shutdown()
+	if err := g.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() err = %v, want nil", err)
+	}
 	if g.Context().Err() == nil {
 		t.Fatal("context not cancelled after Shutdown")
 	}
@@ -52,9 +57,12 @@ func TestShutdownGroupJoinTimeout(t *testing.T) {
 	})
 
 	start := time.Now()
-	g.Shutdown() // must return after ~joinTimeout, not hang
+	err := g.Shutdown() // must return after ~joinTimeout, not hang
 	elapsed := time.Since(start)
 	close(release) // let the stuck goroutine exit
+	if err == nil || !strings.Contains(err.Error(), "join timeout") {
+		t.Fatalf("Shutdown() err = %v, want join-timeout error", err)
+	}
 
 	if elapsed < 50*time.Millisecond {
 		t.Fatalf("Shutdown returned in %v, before the join timeout", elapsed)
@@ -71,38 +79,57 @@ func TestShutdownIsIdempotent(t *testing.T) {
 		<-ctx.Done()
 		runs.Add(1)
 	})
-	g.Shutdown()
-	g.Shutdown() // second call is a no-op
+	if err := g.Shutdown(); err != nil {
+		t.Fatalf("first Shutdown() err = %v, want nil", err)
+	}
+	if err := g.Shutdown(); err != nil { // second call is a no-op
+		t.Fatalf("second Shutdown() err = %v, want nil", err)
+	}
 	if runs.Load() != 1 {
 		t.Fatalf("loop ran %d times, want 1", runs.Load())
 	}
 }
 
-// TestGoRecoversPanic guards that a panic in one loop is contained and logged
-// rather than crashing the whole process. If the panic escaped, the test
-// process itself would die.
-func TestGoRecoversPanic(t *testing.T) {
+// TestGoPanicCancelsGroup guards that a panic is recovered for graceful
+// teardown but still becomes a process-visible group failure. If it were only
+// logged, a critical consumer could die while the pod remained ready.
+func TestGoPanicCancelsGroup(t *testing.T) {
 	logger, h := newCapturingLogger()
 	g := NewShutdownGroup(t.Context(), WithGroupLogger(logger))
 
-	var sibling atomic.Bool
+	siblingStopped := make(chan struct{})
 	g.Go(func(ctx context.Context) {
 		<-ctx.Done()
-		sibling.Store(true) // a sibling loop must survive the panic
+		close(siblingStopped)
 	})
 	g.Go(func(context.Context) { panic("boom") })
 
 	h.waitFor(t, "nuts: background loop panicked")
+	select {
+	case <-g.Context().Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("group context was not cancelled after loop panic")
+	}
+	if cause := context.Cause(g.Context()); cause == nil || !strings.Contains(cause.Error(), "panicked") {
+		t.Fatalf("context cause = %v, want panic failure", cause)
+	}
+	select {
+	case <-siblingStopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sibling loop was not cancelled after loop panic")
+	}
+	if err := g.Err(); err == nil || !strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("Err() = %v, want panic failure", err)
+	}
 
-	g.Shutdown() // must complete despite the earlier panic
-	if !sibling.Load() {
-		t.Fatal("sibling loop did not run to completion after the panic")
+	if err := g.Shutdown(); err == nil || !strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("Shutdown() err = %v, want panic failure", err)
 	}
 }
 
-// TestGoLogsPrematureReturn guards the dead-man detection: a loop that returns
-// while the context is still live is surfaced at ERROR.
-func TestGoLogsPrematureReturn(t *testing.T) {
+// TestGoPrematureReturnCancelsGroup guards the dead-man detection: a loop that
+// returns while the context is still live is a process-visible failure.
+func TestGoPrematureReturnCancelsGroup(t *testing.T) {
 	logger, h := newCapturingLogger()
 	g := NewShutdownGroup(t.Context(), WithGroupLogger(logger))
 
@@ -111,6 +138,17 @@ func TestGoLogsPrematureReturn(t *testing.T) {
 	})
 
 	h.waitFor(t, "nuts: background loop returned before shutdown")
+	select {
+	case <-g.Context().Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("group context was not cancelled after premature return")
+	}
+	if cause := context.Cause(g.Context()); cause == nil || !strings.Contains(cause.Error(), "returned before shutdown") {
+		t.Fatalf("context cause = %v, want premature-return failure", cause)
+	}
+	if err := g.Shutdown(); err == nil || !strings.Contains(err.Error(), "returned before shutdown") {
+		t.Fatalf("Shutdown() err = %v, want premature-return failure", err)
+	}
 }
 
 // TestGoCleanReturnOnShutdownIsSilent guards that a normal return in response to
@@ -120,7 +158,9 @@ func TestGoCleanReturnOnShutdownIsSilent(t *testing.T) {
 	g := NewShutdownGroup(t.Context(), WithGroupLogger(logger))
 
 	g.Go(func(ctx context.Context) { <-ctx.Done() })
-	g.Shutdown()
+	if err := g.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() err = %v, want nil", err)
+	}
 
 	if h.has("nuts: background loop returned before shutdown") {
 		t.Fatalf("a cancellation-driven return was wrongly flagged; saw %v", h.snapshot())
@@ -131,7 +171,9 @@ func TestGoCleanReturnOnShutdownIsSilent(t *testing.T) {
 // begun does not start it (it would never be joined before draining).
 func TestGoAfterShutdownIsRefused(t *testing.T) {
 	g := NewShutdownGroup(t.Context())
-	g.Shutdown()
+	if err := g.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() err = %v, want nil", err)
+	}
 
 	ran := make(chan struct{})
 	g.Go(func(context.Context) { close(ran) })
@@ -159,7 +201,9 @@ func TestAddConnAfterShutdownIsRefused(t *testing.T) {
 
 	logger, h := newCapturingLogger()
 	g := NewShutdownGroup(t.Context(), WithGroupLogger(logger))
-	g.Shutdown()
+	if err := g.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() err = %v, want nil", err)
+	}
 
 	g.AddConn("late", nc) // after shutdown: must be refused, not drained
 
@@ -185,7 +229,9 @@ func TestGoConcurrentWithShutdown(t *testing.T) {
 				g.Go(func(ctx context.Context) { <-ctx.Done() })
 			}()
 		}
-		g.Shutdown()
+		if err := g.Shutdown(); err != nil {
+			t.Fatalf("Shutdown() err = %v, want nil", err)
+		}
 		starters.Wait()
 	}
 }
@@ -230,7 +276,9 @@ func TestShutdownGroupDrainsAllConns(t *testing.T) {
 		conns = append(conns, nc)
 	}
 
-	g.Shutdown()
+	if err := g.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() err = %v, want nil", err)
+	}
 
 	for i, nc := range conns {
 		if !nc.IsClosed() {

@@ -136,15 +136,44 @@ func (c Config) EffectiveMaxDeliver() int {
 // validate rejects the configuration errors no retry can fix; shared by
 // [Start] (one-shot) and [Run] (supervised, which must fail fast on these
 // rather than retry them forever).
-func (c Config) validate(nc *nats.Conn) error {
+func (c Config) validate(nc *nats.Conn, onMsg func(jetstream.Msg)) error {
 	if c.KeepInProgress && c.MaxMessages > 1 {
 		return fmt.Errorf("jsconsumer(%s): KeepInProgress requires MaxMessages <= 1: the heartbeat extends only the in-flight delivery, so %d buffered messages would exhaust AckWait behind a long handler", c.Name, c.MaxMessages)
+	}
+	if c.Stream == "" {
+		return fmt.Errorf("jsconsumer(%s): Stream is required", c.Name)
 	}
 	if c.Durable == "" {
 		// CreateOrUpdateConsumer accepts an empty durable and silently makes
 		// an ephemeral, server-named consumer — losing the stable
 		// resume-across-restarts behavior this scaffold promises.
 		return fmt.Errorf("jsconsumer(%s): Durable is required", c.Name)
+	}
+	if onMsg == nil {
+		return fmt.Errorf("jsconsumer(%s): onMsg is required", c.Name)
+	}
+	if c.FilterSubject != "" && len(c.FilterSubjects) != 0 {
+		return fmt.Errorf("jsconsumer(%s): set FilterSubject or FilterSubjects, not both", c.Name)
+	}
+	for i, subject := range c.FilterSubjects {
+		if subject == "" {
+			return fmt.Errorf("jsconsumer(%s): FilterSubjects[%d] is empty", c.Name, i)
+		}
+	}
+	if c.AckWait < 0 {
+		return fmt.Errorf("jsconsumer(%s): AckWait must not be negative", c.Name)
+	}
+	if c.MaxDeliver < -1 {
+		return fmt.Errorf("jsconsumer(%s): MaxDeliver must be -1 (unlimited), 0 (default), or positive", c.Name)
+	}
+	if c.MaxMessages < 0 {
+		return fmt.Errorf("jsconsumer(%s): MaxMessages must not be negative", c.Name)
+	}
+	if c.MaxAckPending < -1 {
+		return fmt.Errorf("jsconsumer(%s): MaxAckPending must be -1 (unlimited), 0 (server default), or positive", c.Name)
+	}
+	if c.InactiveThreshold < 0 {
+		return fmt.Errorf("jsconsumer(%s): InactiveThreshold must not be negative", c.Name)
 	}
 	if nc == nil {
 		return fmt.Errorf("jsconsumer(%s): nil nats conn", c.Name)
@@ -187,7 +216,11 @@ type Runner struct {
 	// post-Stop race) — it closes when the consume loop has fully wound
 	// down, including an in-flight handler.
 	closed <-chan struct{}
-	stop   sync.Once
+	// watcherDone closes when Start's context-cancellation watcher exits. It is
+	// intentionally internal: callers synchronize on Stop, while tests pin that
+	// an explicit Stop does not retain a goroutine until the parent context ends.
+	watcherDone <-chan struct{}
+	stop        sync.Once
 }
 
 // Stop halts the consume loop and blocks until it has fully wound down —
@@ -215,7 +248,7 @@ func (r *Runner) Stop() {
 // both the core nats.go sentinels ([nuts.IsShutdownFetchErr]) and jetstream's
 // own connection-closed error — which is a clean exit rather than a fault.
 func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.Msg)) (*Runner, error) {
-	if err := cfg.validate(nc); err != nil {
+	if err := cfg.validate(nc, onMsg); err != nil {
 		return nil, err
 	}
 	js, err := jetstream.New(nc)
@@ -251,12 +284,54 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 	if err != nil {
 		return nil, fmt.Errorf("jsconsumer(%s): consume %s: %w", cfg.Name, cfg.Stream, err)
 	}
-	r := &Runner{cc: cc, closed: cc.Closed()}
+	watcherDone := make(chan struct{})
+	r := &Runner{cc: cc, closed: cc.Closed(), watcherDone: watcherDone}
 	go func() {
-		<-ctx.Done()
-		r.Stop()
+		defer close(watcherDone)
+		select {
+		case <-ctx.Done():
+			r.Stop()
+		case <-r.closed:
+		}
 	}()
 	return r, nil
+}
+
+// isRetryableStartError classifies the narrow set of failures that can become
+// healthy without changing Config or replacing nc. Everything else returns to
+// the owner so a bad deployment cannot stay alive indefinitely with no
+// consumer. Unknown server-side 5xx responses are retried, except known
+// permanent JetStream configuration/account errors whose API happens to use a
+// 5xx status.
+func isRetryableStartError(err error) bool {
+	if errors.Is(err, jetstream.ErrStreamNotFound) ||
+		errors.Is(err, nats.ErrNoResponders) ||
+		errors.Is(err, nats.ErrTimeout) ||
+		errors.Is(err, nats.ErrDisconnected) {
+		return true
+	}
+
+	var jsErr jetstream.JetStreamError
+	if !errors.As(err, &jsErr) || jsErr.APIError() == nil {
+		return false
+	}
+	apiErr := jsErr.APIError()
+	switch apiErr.ErrorCode { //nolint:exhaustive // unrecognized 5xx codes are deliberately retryable; all other unknown codes fail closed
+	case jetstream.JSErrCodeBadRequest,
+		jetstream.JSErrCodeConsumerCreate,
+		jetstream.JSErrCodeConsumerNameExists,
+		jetstream.JSErrCodeMaximumConsumersLimit,
+		jetstream.JSErrCodeJetStreamNotEnabledForAccount,
+		jetstream.JSErrCodeJetStreamNotEnabled,
+		jetstream.JSErrCodeConsumerAlreadyExists,
+		jetstream.JSErrCodeDuplicateFilterSubjects,
+		jetstream.JSErrCodeOverlappingFilterSubjects,
+		jetstream.JSErrCodeConsumerEmptyFilter,
+		jetstream.JSErrCodeConsumerExists:
+		return false
+	default:
+		return apiErr.Code >= 500
+	}
 }
 
 // Retry envelope for [Run]'s supervision: exponential from runRetryInitial
@@ -286,11 +361,13 @@ var (
 //		}
 //	})
 //
-// Configuration errors — nil connection, empty Durable, the
-// KeepInProgress/MaxMessages conflict — can never succeed on retry and are
-// returned immediately; a nil return means a clean, ctx-driven exit.
+// Local configuration errors and permanent server responses (invalid consumer
+// configuration, authorization/account setup) can never succeed on retry and
+// are returned immediately. A missing declarative stream, temporary transport
+// failure, or unknown server-side 5xx response remains supervised. A nil return
+// means a clean, ctx-driven exit.
 func Run(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.Msg)) error {
-	if err := cfg.validate(nc); err != nil {
+	if err := cfg.validate(nc, onMsg); err != nil {
 		return err
 	}
 	delay := runRetryInitial
@@ -304,6 +381,9 @@ func Run(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.Ms
 			cancelAttempt()
 			if ctx.Err() != nil {
 				return nil //nolint:nilerr // a Start error during shutdown is a clean, ctx-driven exit, not a fault to report
+			}
+			if !isRetryableStartError(err) {
+				return err
 			}
 			cfg.logger().WarnContext(ctx, cfg.Name+": start consumer failed; retrying",
 				slog.Any("error", err), slog.Duration("retry_in", delay))
