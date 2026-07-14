@@ -3,6 +3,7 @@ package jsconsumer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -179,6 +180,71 @@ func TestStartRejectsEmptyDurable(t *testing.T) {
 	}
 }
 
+func TestStartRejectsPermanentLocalConfigErrors(t *testing.T) {
+	valid := Config{Stream: "events_v1", Durable: "events_durable", Name: "testconsumer"}
+	tests := []struct {
+		name  string
+		cfg   Config
+		onMsg func(jetstream.Msg)
+		want  string
+	}{
+		{"empty stream", func() Config { c := valid; c.Stream = ""; return c }(), func(jetstream.Msg) {}, "Stream"},
+		{"nil handler", valid, nil, "onMsg"},
+		{"both filter forms", func() Config {
+			c := valid
+			c.FilterSubject = "events.one"
+			c.FilterSubjects = []string{"events.two"}
+			return c
+		}(), func(jetstream.Msg) {}, "FilterSubject"},
+		{"empty multi filter", func() Config {
+			c := valid
+			c.FilterSubjects = []string{"events.one", ""}
+			return c
+		}(), func(jetstream.Msg) {}, "FilterSubjects"},
+		{"negative ack wait", func() Config { c := valid; c.AckWait = -time.Second; return c }(), func(jetstream.Msg) {}, "AckWait"},
+		{"invalid max deliver", func() Config { c := valid; c.MaxDeliver = -2; return c }(), func(jetstream.Msg) {}, "MaxDeliver"},
+		{"negative max messages", func() Config { c := valid; c.MaxMessages = -1; return c }(), func(jetstream.Msg) {}, "MaxMessages"},
+		{"invalid max ack pending", func() Config { c := valid; c.MaxAckPending = -2; return c }(), func(jetstream.Msg) {}, "MaxAckPending"},
+		{"negative inactive threshold", func() Config { c := valid; c.InactiveThreshold = -time.Second; return c }(), func(jetstream.Msg) {}, "InactiveThreshold"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := Start(context.Background(), nil, tt.cfg, tt.onMsg); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Start() err = %v, want error containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestRetryableStartError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"missing declarative stream", fmt.Errorf("create: %w", jetstream.ErrStreamNotFound), true},
+		{"no JetStream responder", fmt.Errorf("create: %w", nats.ErrNoResponders), true},
+		{"request timeout", fmt.Errorf("create: %w", nats.ErrTimeout), true},
+		{"disconnected", fmt.Errorf("create: %w", nats.ErrDisconnected), true},
+		{"closed connection", fmt.Errorf("create: %w", nats.ErrConnectionClosed), false},
+		{"server failure", fmt.Errorf("create: %w", &jetstream.APIError{Code: 500, ErrorCode: 10999, Description: "temporarily unavailable"}), true},
+		{"permission violation", fmt.Errorf("create: %w", nats.ErrPermissionViolation), false},
+		{"bad consumer config", fmt.Errorf("create: %w", jetstream.ErrBadRequest), false},
+		{"JetStream disabled", fmt.Errorf("create: %w", jetstream.ErrJetStreamNotEnabled), false},
+		{"JetStream disabled for account", fmt.Errorf("create: %w", jetstream.ErrJetStreamNotEnabledForAccount), false},
+		{"generic error", errors.New("boom"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRetryableStartError(tt.err); got != tt.want {
+				t.Fatalf("isRetryableStartError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestIsShutdownConsumeErr pins the classifier over BOTH error families: the
 // jetstream consume loop emits its own jetstream.ErrConnectionClosed (a
 // distinct value wrapping neither core sentinel), and either family is benign
@@ -311,6 +377,20 @@ func TestStopConcurrentWithCancel(t *testing.T) {
 	}
 }
 
+// TestExplicitStopReleasesWatcher guards the one-shot Start lifecycle: a
+// caller may stop a Runner while retaining the parent context, and doing so
+// must not leave Start's cancellation watcher parked until that parent ends.
+func TestExplicitStopReleasesWatcher(t *testing.T) {
+	run, _, _ := startTestConsumer(t, func(jetstream.Msg) {})
+	run.Stop()
+
+	select {
+	case <-run.watcherDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start cancellation watcher remained alive after explicit Stop")
+	}
+}
+
 // TestStartAppliesConsumerTunables: InactiveThreshold and MaxAckPending must
 // land on the on-server consumer config — interest-stream consumers depend on
 // InactiveThreshold so a decommissioned durable stops pinning messages, and
@@ -396,6 +476,37 @@ func runTestEnv(t *testing.T) (*nats.Conn, jetstream.JetStream) {
 func TestRunRejectsInvalidConfig(t *testing.T) {
 	if err := Run(context.Background(), nil, testCfg, func(jetstream.Msg) {}); err == nil || !strings.Contains(err.Error(), "Durable") {
 		t.Fatalf("Run(empty Durable) err = %v, want immediate Durable-required error", err)
+	}
+}
+
+// TestRunReturnsPermanentServerConfigError guards the retry classifier beyond
+// local validation. Overlapping filters are rejected by the server and cannot
+// become valid by retrying, so Run must return rather than leave the process
+// alive with no consumer.
+func TestRunReturnsPermanentServerConfigError(t *testing.T) {
+	nc, js := runTestEnv(t)
+	if _, err := js.CreateStream(t.Context(), jetstream.StreamConfig{
+		Name: "events_v1", Subjects: []string{"events.>"},
+	}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+
+	cfg := Config{
+		Stream:         "events_v1",
+		Durable:        "invalid_filters",
+		FilterSubjects: []string{"events.>", "events.repo"},
+		Name:           "testconsumer",
+	}
+	done := make(chan error, 1)
+	go func() { done <- Run(t.Context(), nc, cfg, func(jetstream.Msg) {}) }()
+
+	select {
+	case err := <-done:
+		if err == nil || !errors.Is(err, jetstream.ErrOverlappingFilterSubjects) {
+			t.Fatalf("Run() err = %v, want ErrOverlappingFilterSubjects", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run retried a permanent server configuration error")
 	}
 }
 

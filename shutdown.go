@@ -2,6 +2,8 @@ package nuts
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"sync"
@@ -26,11 +28,11 @@ const DefaultJoinTimeout = 10 * time.Second
 //	nc, _ := nuts.Connect(g.Context(), url, nuts.WithName("worker"))
 //	g.AddConn("worker", nc)
 //	g.Go(func(ctx context.Context) { consumer.Run(ctx) }) // returns on ctx.Done
-//	<-ctx.Done() // SIGTERM/SIGINT
-//	g.Shutdown()
+//	<-g.Context().Done() // SIGTERM/SIGINT, panic, or premature loop return
+//	if err := g.Shutdown(); err != nil { return err }
 type ShutdownGroup struct {
 	ctx          context.Context
-	cancel       context.CancelFunc
+	cancel       context.CancelCauseFunc
 	logger       *slog.Logger
 	joinTimeout  time.Duration
 	drainTimeout time.Duration
@@ -38,7 +40,8 @@ type ShutdownGroup struct {
 	wg     sync.WaitGroup
 	mu     sync.Mutex
 	conns  []groupConn
-	closed bool // set under mu once shutdown starts; gates Go registration
+	closed bool  // set under mu once shutdown starts; gates Go registration
+	err    error // first unexpected loop or shutdown failure
 	once   sync.Once
 }
 
@@ -72,8 +75,7 @@ func WithGroupDrainTimeout(d time.Duration) GroupOption {
 // NewShutdownGroup returns a group whose context derives from parent and is
 // cancelled by [ShutdownGroup.Shutdown].
 func NewShutdownGroup(parent context.Context, opts ...GroupOption) *ShutdownGroup {
-	//nolint:gosec // cancel is retained in g.cancel and invoked by Shutdown (via shutdown), not leaked
-	ctx, cancel := context.WithCancel(parent)
+	ctx, cancel := context.WithCancelCause(parent)
 	g := &ShutdownGroup{
 		ctx:          ctx,
 		cancel:       cancel,
@@ -90,19 +92,28 @@ func NewShutdownGroup(parent context.Context, opts ...GroupOption) *ShutdownGrou
 	return g
 }
 
-// Context returns the group's context, cancelled when Shutdown is called. Pass
-// it to every background loop and to [Connect] so the loops exit before their
-// connections are drained.
+// Context returns the group's context, cancelled when Shutdown is called or a
+// tracked loop fails. Pass it to every background loop and to [Connect] so the
+// loops exit before their connections are drained.
 func (g *ShutdownGroup) Context() context.Context { return g.ctx }
+
+// Err returns the first unexpected loop or shutdown failure, or nil while the
+// group is healthy and after a clean shutdown. It is safe to call from a
+// readiness check while the group is running.
+func (g *ShutdownGroup) Err() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.err
+}
 
 // Go runs fn as a tracked background loop. fn MUST return when its context is
 // cancelled; Shutdown blocks (bounded by the join timeout) until it does.
 //
-// A panic in fn is recovered and logged with a stack (at ERROR) rather than
-// crashing the whole process, so one bad message in one loop does not take down
-// every other loop on the pod. A return while the group context is still live
-// is treated as a dead subsystem and logged at ERROR too — a tracked loop is
-// expected to run until Shutdown cancels it.
+// A panic in fn is recovered so Shutdown can still join the other loops and
+// drain connections, but it remains fatal to the group: the panic is recorded,
+// logged with a stack, and cancels the group context. A return while the group
+// context is still live is handled the same way. The owning process can observe
+// the failure through [ShutdownGroup.Err] or [ShutdownGroup.Shutdown].
 //
 // Registering a loop after Shutdown has begun is a no-op: the loop would not be
 // joined before the connections drain, so it is refused and logged rather than
@@ -125,19 +136,57 @@ func (g *ShutdownGroup) Go(fn func(ctx context.Context)) {
 		defer g.wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
+				err := fmt.Errorf("nuts: background loop panicked: %v", r)
 				g.logger.ErrorContext(g.ctx, "nuts: background loop panicked",
 					slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
+				g.recordError(err, true)
 				return
 			}
-			// A clean return before the context is cancelled means the loop
-			// stopped supervising its subsystem while it was still supposed to
-			// be running — surface it instead of letting the pod look healthy.
-			if g.ctx.Err() == nil {
+			if g.recordPrematureReturn() {
 				g.logger.ErrorContext(g.ctx, "nuts: background loop returned before shutdown")
 			}
 		}()
 		fn(g.ctx)
 	}()
+}
+
+// recordPrematureReturn atomically distinguishes a real dead subsystem from a
+// loop returning concurrently with Shutdown. Shutdown marks closed under the
+// same lock before cancelling, so a normal teardown cannot be misclassified.
+func (g *ShutdownGroup) recordPrematureReturn() bool {
+	err := errors.New("nuts: background loop returned before shutdown")
+	g.mu.Lock()
+	if g.closed || g.ctx.Err() != nil {
+		g.mu.Unlock()
+		return false
+	}
+	if g.err != nil {
+		g.mu.Unlock()
+		return false
+	}
+	g.err = err
+	g.mu.Unlock()
+	g.cancel(err)
+	return true
+}
+
+// recordError stores the first group failure. cancelGroup is true for a live
+// loop failure, which must stop siblings and the owner; shutdown-time failures
+// are returned by Shutdown without re-cancelling an already cancelled group.
+func (g *ShutdownGroup) recordError(err error, cancelGroup bool) {
+	if err == nil {
+		return
+	}
+	g.mu.Lock()
+	recorded := false
+	if g.err == nil {
+		g.err = err
+		recorded = true
+	}
+	g.mu.Unlock()
+	if cancelGroup && recorded {
+		g.cancel(err)
+	}
 }
 
 // AddConn registers a connection to be drained after the loops have joined.
@@ -163,10 +212,12 @@ func (g *ShutdownGroup) AddConn(name string, nc *nats.Conn) {
 }
 
 // Shutdown cancels the group context, waits (bounded by the join timeout) for
-// every Go loop to return, then drains every registered connection. It is safe
-// to call more than once; only the first call has an effect.
-func (g *ShutdownGroup) Shutdown() {
+// every Go loop to return, then drains every registered connection. It returns
+// the first unexpected loop, join, or drain failure. It is safe to call more
+// than once; later calls return the same result.
+func (g *ShutdownGroup) Shutdown() error {
 	g.once.Do(g.shutdown)
+	return g.Err()
 }
 
 func (g *ShutdownGroup) shutdown() {
@@ -178,18 +229,17 @@ func (g *ShutdownGroup) shutdown() {
 	conns := g.conns
 	g.mu.Unlock()
 
-	g.cancel()
+	g.cancel(nil)
 
 	done := make(chan struct{})
 	go func() {
 		g.wg.Wait()
 		close(done)
 	}()
-	select {
-	case <-done:
-	case <-time.After(g.joinTimeout):
+	if waitTimedOut(done, g.joinTimeout) {
 		g.logger.WarnContext(g.ctx, "nuts: background loops did not stop within join timeout; draining anyway",
 			slog.Duration("join_timeout", g.joinTimeout))
+		g.recordError(fmt.Errorf("nuts: background loop join timeout after %s", g.joinTimeout), false)
 	}
 
 	// Drain the connections concurrently: they are independent, so the group's
@@ -199,10 +249,33 @@ func (g *ShutdownGroup) shutdown() {
 		dwg.Add(1)
 		go func() {
 			defer dwg.Done()
-			Drain(g.ctx, c.nc, c.name, g.logger, g.drainBackstop(c.nc))
+			if err := Drain(g.ctx, c.nc, c.name, g.logger, g.drainBackstop(c.nc)); err != nil {
+				g.recordError(err, false)
+			}
 		}()
 	}
 	dwg.Wait()
+}
+
+// waitTimedOut waits for a completion signal and reports whether the timeout
+// won. If completion and the timer become ready together, prefer completion:
+// work that finished within the observable boundary must not be reported as a
+// failure just because select chose the timer pseudo-randomly.
+func waitTimedOut[T any](done <-chan T, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		return false
+	case <-timer.C:
+		select {
+		case <-done:
+			return false
+		default:
+			return true
+		}
+	}
 }
 
 // drainBackstop returns the total time-to-CLOSED budget for draining nc. It

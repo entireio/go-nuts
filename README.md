@@ -28,11 +28,14 @@ go get github.com/entireio/go-nuts
   instead of nats.go's stderr default.
 - **`Drain` / `IsShutdownFetchErr`** — graceful shutdown. `Drain` starts
   nats.go's asynchronous drain and blocks until the connection flushes and
-  closes (bounded by a timeout); `IsShutdownFetchErr` lets a fetch loop treat a
-  drain/close during shutdown as a clean exit rather than an error.
+  closes (bounded by a timeout), returning an error and force-closing when it
+  cannot complete; `IsShutdownFetchErr` lets a fetch loop treat a drain/close
+  during shutdown as a clean exit rather than an error.
 - **`ShutdownGroup`** — cancels tracked background loops, waits for them to
   return, then drains the registered connections — the ordering that keeps a
-  `Drain` from racing an in-flight `Fetch`.
+  `Drain` from racing an in-flight `Fetch`. A panic or unexpected return in a
+  tracked loop cancels the group and is returned by `Shutdown`, so a dead
+  consumer cannot leave its process looking healthy.
 
 ## Usage
 
@@ -79,8 +82,10 @@ g.Go(func(ctx context.Context) {
 	}
 })
 
-<-ctx.Done()
-g.Shutdown() // cancel loops → join → drain, in that order
+<-g.Context().Done() // process signal, or a tracked loop failed
+if err := g.Shutdown(); err != nil { // cancel loops → join → drain, in that order
+	return err
+}
 ```
 
 By default `Connect` builds mTLS from the `ENTIRE_INTERNAL_TLS_{CERT,KEY,CA}_FILE`
