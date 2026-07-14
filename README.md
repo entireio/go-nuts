@@ -4,10 +4,12 @@
 
 # go-nuts
 
-Connection-lifecycle helpers for [NATS](https://nats.io) pull consumers in Go —
-a small, dependency-light layer over
-[`nats.go`](https://github.com/nats-io/nats.go) for connecting, draining, and
-shutting down cleanly.
+A small, dependency-light toolkit over
+[`nats.go`](https://github.com/nats-io/nats.go) for building
+[NATS](https://nats.io) and JetStream services in Go. The root package handles
+connection lifecycle — connecting, draining, and shutting down cleanly; opt-in
+subpackages add a durable JetStream pull-consumer scaffold, a publish helper,
+trace-context propagation, and a redelivery policy.
 
 ## Install
 
@@ -15,7 +17,7 @@ shutting down cleanly.
 go get github.com/entireio/go-nuts
 ```
 
-## What it provides
+## Connection lifecycle (root package)
 
 - **`Connect`** — dial with a resilient default posture: reconnect-forever (so a
   long-lived service rides out a NATS outage instead of permanently closing
@@ -113,7 +115,7 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
   `NakWithDelay` envelope — flat by default, optionally growing per delivery
   (`Factor`/`MaxDelay`) — bounded by MaxDeliver, with opt-in
   Term-on-final-delivery so a work-queue message is removed cleanly instead of
-  orphaning un-acked (COR-762).
+  orphaning un-acked.
 
 ## Development
 
