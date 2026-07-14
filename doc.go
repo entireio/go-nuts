@@ -13,8 +13,9 @@
 //
 // The subpackages carry the message-layer pieces those services shared
 // (COR-929) — [natsmsg] (trace-context propagation over message headers, the
-// bounded deduped Publisher, the KeepInProgress AckWait heartbeat, and the
-// natsmsgtest.FakeMsg test double), [jsconsumer] (the durable JetStream
+// bounded deduped Publisher, the KeepInProgress AckWait heartbeat, the
+// DeadLetter dead-letter capture, and the natsmsgtest.FakeMsg test double),
+// [jsconsumer] (the durable JetStream
 // pull-consumer scaffold, one-shot via Start or supervised via Run), and
 // [backoff] (the NakWithDelay redelivery policy — flat or growing — with
 // Term-on-final-delivery, COR-762). natsmsg and jsconsumer additionally

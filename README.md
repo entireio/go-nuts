@@ -98,8 +98,11 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
   `StartConsumerSpan`, so publish → consume stitches into one trace),
   `Publisher` — the publish core (producer span + trace inject + `Nats-Msg-Id`
   dedup + bounded pub-ack wait, with `StartProducerSpan` for callers composing
-  by hand) — and `KeepInProgress`, an AckWait heartbeat for long handlers,
-  capped so a wedged handler still redelivers. `natsmsg/natsmsgtest` ships
+  by hand) — `KeepInProgress`, an AckWait heartbeat for long handlers,
+  capped so a wedged handler still redelivers, and `DeadLetter` / `SubjectToken`,
+  the dead-letter capture that copies a poison message to a DLQ subject with
+  `Nats-Dlq-*` provenance before a consumer gives up on it (the capture step
+  `backoff`'s Term-on-exhaustion below expects). `natsmsg/natsmsgtest` ships
   `FakeMsg`, a scriptable `jetstream.Msg` for asserting a consumer's
   ack/nak/term disposition without a broker.
 - **`jsconsumer`** — the durable JetStream pull-consumer scaffold:
