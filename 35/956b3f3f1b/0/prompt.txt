@@ -1,0 +1,29 @@
+create a pr
+
+---
+
+merged
+
+---
+
+sure let's tag v0.5.0
+
+---
+
+ok go-nuts is now public
+
+---
+
+continue
+
+---
+
+can you add a description?
+
+---
+
+is the readme ok?
+
+---
+
+can you fix it?
