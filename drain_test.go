@@ -135,6 +135,34 @@ func TestDrainAlreadyClosedConn(t *testing.T) {
 	}
 }
 
+// TestDrainConcurrentCloseIsClean stresses the race between the initial
+// IsClosed check and nc.Drain. If Close wins after the check, nats.go returns
+// ErrConnectionClosed; Drain must still classify that as the documented clean
+// already-closed no-op.
+func TestDrainConcurrentCloseIsClean(t *testing.T) {
+	url := runEmbeddedServer(t)
+	for range 100 {
+		nc, err := Connect(t.Context(), url, WithoutTLS())
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+
+		start := make(chan struct{})
+		closed := make(chan struct{})
+		go func() {
+			<-start
+			nc.Close()
+			close(closed)
+		}()
+		close(start)
+
+		if err := Drain(t.Context(), nc, "worker", nil, time.Second); err != nil {
+			t.Fatalf("Drain racing Close() err = %v, want nil", err)
+		}
+		<-closed
+	}
+}
+
 // TestDrainPreservesCallerClosedHandler guards the fix for Drain clobbering the
 // connection's ClosedHandler: a handler the caller installed must still fire.
 func TestDrainPreservesCallerClosedHandler(t *testing.T) {

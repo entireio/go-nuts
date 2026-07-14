@@ -178,11 +178,13 @@ func (g *ShutdownGroup) recordError(err error, cancelGroup bool) {
 		return
 	}
 	g.mu.Lock()
+	recorded := false
 	if g.err == nil {
 		g.err = err
+		recorded = true
 	}
 	g.mu.Unlock()
-	if cancelGroup {
+	if cancelGroup && recorded {
 		g.cancel(err)
 	}
 }

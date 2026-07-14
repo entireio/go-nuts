@@ -2,6 +2,7 @@ package nuts
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -124,6 +125,25 @@ func TestGoPanicCancelsGroup(t *testing.T) {
 
 	if err := g.Shutdown(); err == nil || !strings.Contains(err.Error(), "panicked") {
 		t.Fatalf("Shutdown() err = %v, want panic failure", err)
+	}
+}
+
+// TestRecordErrorCancelsOnlyForStoredFailure guards the first-failure
+// invariant shared by Err and the group's cancellation cause. A later live
+// failure must not cancel with an error that lost the race to be recorded.
+func TestRecordErrorCancelsOnlyForStoredFailure(t *testing.T) {
+	g := NewShutdownGroup(t.Context())
+	first := errors.New("first failure")
+	second := errors.New("second failure")
+
+	g.recordError(first, false)
+	g.recordError(second, true)
+
+	if got := g.Err(); !errors.Is(got, first) {
+		t.Fatalf("Err() = %v, want first failure", got)
+	}
+	if cause := context.Cause(g.Context()); cause != nil {
+		t.Fatalf("context cause = %v, want nil; losing failure cancelled the group", cause)
 	}
 }
 

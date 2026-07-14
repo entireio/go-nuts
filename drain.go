@@ -81,6 +81,12 @@ func Drain(ctx context.Context, nc *nats.Conn, name string, logger *slog.Logger,
 	defer nc.RemoveStatusListener(closed)
 
 	if err := nc.Drain(); err != nil {
+		// The connection can close after the IsClosed check above but before
+		// Drain takes its lock. That is the same clean no-op as entering this
+		// function with an already-closed connection, not a shutdown failure.
+		if errors.Is(err, nats.ErrConnectionClosed) {
+			return nil
+		}
 		logger.WarnContext(ctx, "nuts: NATS drain failed; closing",
 			slog.String("conn", name), slog.Any("error", err))
 		nc.Close()
