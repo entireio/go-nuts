@@ -236,9 +236,7 @@ func (g *ShutdownGroup) shutdown() {
 		g.wg.Wait()
 		close(done)
 	}()
-	select {
-	case <-done:
-	case <-time.After(g.joinTimeout):
+	if joinTimedOut(done, g.joinTimeout) {
 		g.logger.WarnContext(g.ctx, "nuts: background loops did not stop within join timeout; draining anyway",
 			slog.Duration("join_timeout", g.joinTimeout))
 		g.recordError(fmt.Errorf("nuts: background loop join timeout after %s", g.joinTimeout), false)
@@ -257,6 +255,27 @@ func (g *ShutdownGroup) shutdown() {
 		}()
 	}
 	dwg.Wait()
+}
+
+// joinTimedOut waits for the tracked loops and reports whether the timeout won.
+// If completion and the timer become ready together, prefer completion: the
+// group did join within the observable boundary and must not fail shutdown due
+// to select choosing the timer pseudo-randomly.
+func joinTimedOut(done <-chan struct{}, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		return false
+	case <-timer.C:
+		select {
+		case <-done:
+			return false
+		default:
+			return true
+		}
+	}
 }
 
 // drainBackstop returns the total time-to-CLOSED budget for draining nc. It

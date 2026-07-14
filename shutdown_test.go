@@ -73,6 +73,20 @@ func TestShutdownGroupJoinTimeout(t *testing.T) {
 	}
 }
 
+// TestJoinTimedOutPrefersCompletedJoin makes both select cases ready and
+// verifies completion always wins. Without the timeout-branch recheck this is
+// pseudo-random and can turn a clean shutdown into a join-timeout failure.
+func TestJoinTimedOutPrefersCompletedJoin(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+
+	for range 100 {
+		if joinTimedOut(done, 0) {
+			t.Fatal("joinTimedOut reported a timeout for an already-completed join")
+		}
+	}
+}
+
 func TestShutdownIsIdempotent(t *testing.T) {
 	g := NewShutdownGroup(t.Context())
 	var runs atomic.Int32
