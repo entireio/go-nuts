@@ -59,8 +59,11 @@ type Publisher struct {
 	// already-cancelled ctx still fails fast.
 	Timeout time.Duration
 	// Operation is the caller-selected producer span name (e.g.
-	// "repo.ops.publish"), also recorded as messaging.operation.name. Empty
-	// falls back to "publish <subject>".
+	// "repo.ops.publish"); empty falls back to "publish <subject>". It names the
+	// span only — the messaging operation is recorded as the standard
+	// messaging.operation.type=publish attribute, per OTel semantic conventions,
+	// which reserve messaging.operation.name for the system-specific operation
+	// (send/ack/nack), not an application span name.
 	Operation string
 }
 
@@ -71,13 +74,18 @@ type Publisher struct {
 // already on msg untouched. Trace context from ctx is injected into msg's
 // headers (msg is mutated) so the consumer span re-parents across the hop.
 //
+// attrs are the caller's domain span attributes (placement, job identity, …) —
+// appended to the standard messaging.* set on the producer span. They stay
+// caller-owned: the shared package does not know them, but records them on the
+// span it owns so a Phase 3 replacement keeps its existing producer-span tags.
+//
 // The returned PubAck reports where the message landed and whether the
 // broker deduplicated it (PubAck.Duplicate) — a duplicate is a normal
 // outcome for an at-least-once producer retrying, not an error. The
 // stream, sequence, and duplicate outcome are also recorded on the span.
-func (p Publisher) Publish(ctx context.Context, msg *nats.Msg, msgID string) (*jetstream.PubAck, error) {
+func (p Publisher) Publish(ctx context.Context, msg *nats.Msg, msgID string, attrs ...attribute.KeyValue) (*jetstream.PubAck, error) {
 	var native *jetstream.PubAck
-	err := publish(ctx, publishConfig{tracer: p.Tracer, operation: p.Operation, timeout: p.Timeout}, msg, msgID,
+	err := publish(ctx, publishConfig{tracer: p.Tracer, operation: p.Operation, timeout: p.Timeout}, msg, msgID, attrs,
 		func(pubCtx context.Context, m *nats.Msg) (ack, error) {
 			pa, perr := p.JS.PublishMsg(pubCtx, m)
 			if perr != nil {
@@ -119,17 +127,17 @@ type LegacyPublisher struct {
 	// DefaultPublishTimeout.
 	Timeout time.Duration
 	// Operation is the caller-selected producer span name (e.g.
-	// "repo.ops.publish"), also recorded as messaging.operation.name. Empty
-	// falls back to "publish <subject>".
+	// "repo.ops.publish"); empty falls back to "publish <subject>". It names the
+	// span only — see [Publisher.Operation].
 	Operation string
 }
 
-// Publish behaves exactly as [Publisher.Publish] — same span, headers, msg-id,
-// bounded ack, and telemetry — over the legacy [nats.JetStreamContext] API,
-// returning its native [nats.PubAck].
-func (p LegacyPublisher) Publish(ctx context.Context, msg *nats.Msg, msgID string) (*nats.PubAck, error) {
+// Publish behaves exactly as [Publisher.Publish] — same span, caller attrs,
+// headers, msg-id, bounded ack, and telemetry — over the legacy
+// [nats.JetStreamContext] API, returning its native [nats.PubAck].
+func (p LegacyPublisher) Publish(ctx context.Context, msg *nats.Msg, msgID string, attrs ...attribute.KeyValue) (*nats.PubAck, error) {
 	var native *nats.PubAck
-	err := publish(ctx, publishConfig{tracer: p.Tracer, operation: p.Operation, timeout: p.Timeout}, msg, msgID,
+	err := publish(ctx, publishConfig{tracer: p.Tracer, operation: p.Operation, timeout: p.Timeout}, msg, msgID, attrs,
 		func(pubCtx context.Context, m *nats.Msg) (ack, error) {
 			pa, perr := p.JS.PublishMsg(m, nats.Context(pubCtx))
 			if perr != nil {
@@ -162,25 +170,23 @@ type publishConfig struct {
 }
 
 // publish is the publish prologue shared by [Publisher] and [LegacyPublisher]:
-// open the producer span (named by cfg.operation or "publish <subject>"), stamp
-// the Nats-Msg-Id, inject trace context, and bound the ack wait — then run do,
-// the one step that differs between the modern and legacy clients, and record
-// the PubAck telemetry (or the error) on the span. do reports the normalized
-// ack and returns the raw publish error unwrapped so the core can wrap it and
-// callers can still classify the underlying cause.
-func publish(ctx context.Context, cfg publishConfig, msg *nats.Msg, msgID string, do func(context.Context, *nats.Msg) (ack, error)) error {
+// open the producer span (named by cfg.operation or "publish <subject>", tagged
+// with the caller's attrs alongside the standard messaging.* set), stamp the
+// Nats-Msg-Id, inject trace context, and bound the ack wait — then run do, the
+// one step that differs between the modern and legacy clients, and record the
+// PubAck telemetry (or the error) on the span. do reports the normalized ack and
+// returns the raw publish error unwrapped so the core can wrap it and callers
+// can still classify the underlying cause.
+func publish(ctx context.Context, cfg publishConfig, msg *nats.Msg, msgID string, attrs []attribute.KeyValue, do func(context.Context, *nats.Msg) (ack, error)) error {
 	tr := cfg.tracer
 	if tr == nil {
 		tr = otel.Tracer("github.com/entireio/go-nuts/natsmsg")
 	}
 	name := cfg.operation
-	var extra []attribute.KeyValue
-	if cfg.operation == "" {
+	if name == "" {
 		name = "publish " + msg.Subject
-	} else {
-		extra = append(extra, attribute.String("messaging.operation.name", cfg.operation))
 	}
-	ctx, span := StartProducerSpan(ctx, tr, msg.Subject, name, extra...)
+	ctx, span := StartProducerSpan(ctx, tr, msg.Subject, name, attrs...)
 	defer span.End()
 
 	if msgID != "" {

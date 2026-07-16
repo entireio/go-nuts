@@ -240,11 +240,20 @@ func TestPublisherErrorsOnUnboundSubject(t *testing.T) {
 	}
 }
 
+// parityAttrs are the caller-owned domain span attributes both publishers must
+// forward onto the producer span they own (placement / job-identity style tags,
+// the kind mirror-pipeline's natspub passes through).
+var parityAttrs = []attribute.KeyValue{
+	attribute.String("entire.target_ulid", "ulid-1"),
+	attribute.Int64("entire.github_repo_id", 42),
+}
+
 // TestPublisherParity drives the identical publish through BOTH the modern
 // Publisher and the legacy LegacyPublisher against fake backends, asserting they
-// stamp the same headers, record the same producer span (caller-selected
-// operation name + standard messaging attrs + PubAck telemetry), and report the
-// same ack — the single behavioral contract the shared core guarantees.
+// stamp the same headers, record the same producer span (caller-selected span
+// name + standard messaging attrs + forwarded domain attrs + PubAck telemetry),
+// and report the same ack — the single behavioral contract the shared core
+// guarantees.
 func TestPublisherParity(t *testing.T) {
 	for _, backend := range []string{"modern", "legacy"} {
 		t.Run(backend, func(t *testing.T) {
@@ -263,7 +272,7 @@ func TestPublisherParity(t *testing.T) {
 			case "modern":
 				f := &fakeModernJS{ack: &jetstream.PubAck{Stream: testStream, Sequence: 7, Duplicate: true}}
 				var a *jetstream.PubAck
-				a, err = Publisher{JS: f, Operation: "repo.ops.publish"}.Publish(prodCtx, msg, "msg-1")
+				a, err = Publisher{JS: f, Operation: "repo.ops.publish"}.Publish(prodCtx, msg, "msg-1", parityAttrs...)
 				last = f.last
 				if err == nil {
 					stream, seq, dup = a.Stream, a.Sequence, a.Duplicate
@@ -271,7 +280,7 @@ func TestPublisherParity(t *testing.T) {
 			case "legacy":
 				f := &fakeLegacyJS{ack: &nats.PubAck{Stream: testStream, Sequence: 7, Duplicate: true}}
 				var a *nats.PubAck
-				a, err = LegacyPublisher{JS: f, Operation: "repo.ops.publish"}.Publish(prodCtx, msg, "msg-1")
+				a, err = LegacyPublisher{JS: f, Operation: "repo.ops.publish"}.Publish(prodCtx, msg, "msg-1", parityAttrs...)
 				last = f.last
 				if err == nil {
 					stream, seq, dup = a.Stream, a.Sequence, a.Duplicate
@@ -311,21 +320,31 @@ func assertProducerSpan(t *testing.T, rec *tracetest.SpanRecorder, wantName stri
 	if span.SpanContext().TraceID() != wantTrace {
 		t.Errorf("span trace id = %s, want the producer's %s (span did not re-parent)", span.SpanContext().TraceID(), wantTrace)
 	}
+	seen := map[attribute.Key]bool{}
 	got := map[attribute.Key]attribute.Value{}
 	for _, kv := range span.Attributes() {
 		got[kv.Key] = kv.Value
+		seen[kv.Key] = true
 	}
 	for key, want := range map[attribute.Key]string{
 		"messaging.system":           "nats",
 		"messaging.operation.type":   "publish",
-		"messaging.operation.name":   wantName,
 		"messaging.destination.name": "pub.repo",
 		"messaging.message.id":       "msg-1",
 		"messaging.nats.stream":      testStream,
+		"entire.target_ulid":         "ulid-1", // caller-forwarded domain attr
 	} {
 		if got[key].AsString() != want {
 			t.Errorf("span attr %s = %q, want %q", key, got[key].AsString(), want)
 		}
+	}
+	if got["entire.github_repo_id"].AsInt64() != 42 {
+		t.Errorf("caller-forwarded entire.github_repo_id = %d, want 42", got["entire.github_repo_id"].AsInt64())
+	}
+	// messaging.operation.name is reserved for the system-specific operation
+	// (send/ack/nack), not the application span name — it must not carry wantName.
+	if seen["messaging.operation.name"] {
+		t.Errorf("messaging.operation.name = %q set; the caller span name belongs on the span name only", got["messaging.operation.name"].AsString())
 	}
 	if got["messaging.nats.sequence"].AsInt64() != 7 {
 		t.Errorf("sequence attr = %d, want 7", got["messaging.nats.sequence"].AsInt64())
