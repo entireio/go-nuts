@@ -101,15 +101,21 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
 - **`natsmsg`** — small JetStream message helpers: W3C trace-context
   propagation over message headers (`Inject` / `ExtractHeader` /
   `StartConsumerSpan`, so publish → consume stitches into one trace),
-  `Publisher` — the publish core (producer span + trace inject + `Nats-Msg-Id`
-  dedup + bounded pub-ack wait, with `StartProducerSpan` for callers composing
-  by hand) — `KeepInProgress`, an AckWait heartbeat for long handlers,
-  capped so a wedged handler still redelivers, and `DeadLetter` / `SubjectToken`,
-  the dead-letter capture that copies a poison message to a DLQ subject with
-  `Nats-Dlq-*` provenance before a consumer gives up on it (the capture step
-  `backoff`'s Term-on-exhaustion below expects). `natsmsg/natsmsgtest` ships
-  `FakeMsg`, a scriptable `jetstream.Msg` for asserting a consumer's
-  ack/nak/term disposition without a broker.
+  `Publisher` — the publish core (producer span with a caller-selected
+  `Operation` name + standard `messaging.*` attributes + trace inject +
+  `Nats-Msg-Id` dedup + bounded pub-ack wait + PubAck telemetry, with
+  `StartProducerSpan` for callers composing by hand); it owns just that
+  prologue — subject construction, payload encoding, domain metrics/logging, and
+  the response to a failed publish stay with the caller. `LegacyPublisher` is the
+  same core over the legacy `nats.JetStreamContext` API, a transitional bridge
+  while callers migrate to the modern `jetstream.JetStream`. Also `KeepInProgress`,
+  an AckWait heartbeat for long handlers, capped so a wedged handler still
+  redelivers, and `DeadLetter` / `SubjectToken`, the dead-letter capture that
+  copies a poison message to a DLQ subject with `Nats-Dlq-*` provenance before a
+  consumer gives up on it (the capture step `backoff`'s Term-on-exhaustion below
+  expects). `natsmsg/natsmsgtest` ships `FakeMsg` / `FakeLegacyMsg`, scriptable
+  modern and legacy messages for asserting a consumer's ack/nak/term disposition
+  without a broker.
 - **`jsconsumer`** — the durable JetStream pull-consumer scaffold:
   `Start` (create-or-update durable → consume → stop on context cancel),
   `Run` (`Start` under supervision: recreate on a closed loop with exponential
@@ -123,7 +129,12 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
   `NakWithDelay` envelope — flat by default, optionally growing per delivery
   (`Factor`/`MaxDelay`) — bounded by MaxDeliver, with opt-in
   Term-on-final-delivery so a work-queue message is removed cleanly instead of
-  orphaning un-acked.
+  orphaning un-acked. It owns disposition and delay calculation only, and drives
+  both the modern `jetstream.Msg` API (`NakOrTerm`) and the legacy `*nats.Msg`
+  API (`NakOrTermLegacy`). MaxDeliver mirrors `jetstream.ConsumerConfig`: a
+  non-positive value (`0` or `UnlimitedMaxDeliver`) means unlimited redeliveries,
+  so bridge an unset `jsconsumer` consumer with its `EffectiveMaxDeliver()`
+  rather than the raw field.
 
 ## Development
 

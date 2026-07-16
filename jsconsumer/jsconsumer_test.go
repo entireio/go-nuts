@@ -15,6 +15,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/entireio/go-nuts/backoff"
 	"github.com/entireio/go-nuts/natsmsg/natsmsgtest"
 )
 
@@ -148,6 +149,49 @@ func TestConfigEffectiveValues(t *testing.T) {
 	}
 	if got := set.EffectiveMaxDeliver(); got != 3 {
 		t.Errorf("set EffectiveMaxDeliver = %d, want 3", got)
+	}
+}
+
+// TestEffectiveMaxDeliverComposesWithBackoff pins the documented bridge between
+// the two packages' MaxDeliver conventions: jsconsumer reads 0 as "default to
+// DefaultMaxDeliver", backoff reads <=0 as unlimited (the jetstream.ConsumerConfig
+// semantics). Feeding EffectiveMaxDeliver() — never the raw field — into a
+// backoff.Policy is what keeps an unset consumer MaxDeliver finite in the policy
+// instead of accidentally unlimited (which would make TermOnExhaustion never
+// fire and orphan work-queue messages, COR-762).
+func TestEffectiveMaxDeliverComposesWithBackoff(t *testing.T) {
+	delivered := func(n uint64) *natsmsgtest.FakeMsg {
+		return &natsmsgtest.FakeMsg{Meta: &jetstream.MsgMetadata{NumDelivered: n}}
+	}
+	for _, tc := range []struct {
+		name          string
+		cfg           Config
+		wantEffective int
+		finalAt       uint64 // delivery that should read as final; 0 => never final (unlimited)
+	}{
+		{"unset defaults to DefaultMaxDeliver", Config{}, DefaultMaxDeliver, DefaultMaxDeliver},
+		{"positive passes through", Config{MaxDeliver: 3}, 3, 3},
+		{"unlimited -1 stays unlimited", Config{MaxDeliver: -1}, -1, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eff := tc.cfg.EffectiveMaxDeliver()
+			if eff != tc.wantEffective {
+				t.Fatalf("EffectiveMaxDeliver = %d, want %d", eff, tc.wantEffective)
+			}
+			policy := backoff.Policy{MaxDeliver: eff}
+			if tc.finalAt == 0 {
+				if backoff.IsFinalDelivery(delivered(1000), policy.MaxDeliver) {
+					t.Error("unlimited policy read a delivery as final")
+				}
+				return
+			}
+			if backoff.IsFinalDelivery(delivered(tc.finalAt-1), policy.MaxDeliver) {
+				t.Errorf("delivery %d/%d read as final", tc.finalAt-1, eff)
+			}
+			if !backoff.IsFinalDelivery(delivered(tc.finalAt), policy.MaxDeliver) {
+				t.Errorf("delivery %d/%d not read as final", tc.finalAt, eff)
+			}
+		})
 	}
 }
 
