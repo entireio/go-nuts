@@ -1,0 +1,205 @@
+let's work on https://linear.app/entirehq/issue/COR-984/go-nuts-phase-2-deepen-publishing-and-redelivery-apis
+
+---
+
+<task-notification>
+<task-id>a0816d0e126b88e4a</task-id>
+<tool-use-id>toolu_0143Sqtt3P3w98oAY23NySGR</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-nodo-work-tasks-COR-984-go-nuts-go-nuts/033c3992-c4df-4e86-a73c-f74bbec4bd33/tasks/a0816d0e126b88e4a.output</output-file>
+<status>completed</status>
+<summary>Agent "Survey mirror-pipeline job publishers" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have everything needed. Here is my report.
+
+---
+
+# natspub callers in mirror-pipeline — findings for the shared `Publisher` API
+
+## The shared core being mirrored
+
+`internal/natspub/natspub.go` defines the contract every caller uses. Key facts (confirming what you read):
+
+- **Legacy JetStream only.** The publisher interface is the classic `nats.JetStreamContext` shape, and `Publish` calls `PublishMsg` with a `nats.Context` timeout. No modern `jetstream.JetStream` anywhere on the publish path (see section 3).
+  - `natspub.go:37-40` — `type JetStreamPublisher interface { PublishMsg(m *nats.Msg, opts ...nats.PubOpt) (*nats.PubAck, error) }`
+  - `natspub.go:109-111` — `pubCtx, cancel := context.WithTimeout(ctx, AckWait); ... ack, err := js.PublishMsg(msg, nats.Context(pubCtx))`
+- `natspub.go:35` — `const AckWait = 5 * time.Second`
+- `natspub.go:26` — `const MsgIDHeader = "Nats-Msg-Id"`
+- The `Publication` struct (`natspub.go:44-68`) has exactly the fields you listed: `Tracer`, `SpanName`, `ErrKind`, `LogMsg`, `Subject`, `MsgID`, `Marshal func() ([]byte, error)`, `SpanAttrs []attribute.KeyValue`, `LogAttrs []slog.Attr`.
+- `Publish` (`natspub.go:80-131`) prepends a fixed messaging.* triplet to `SpanAttrs`, starts a `SpanKindProducer` span on `otel.Tracer(pub.Tracer)`, runs `Marshal` **inside** the span, sets the `Nats-Msg-Id` header, calls `otelnats.Inject(ctx, msg)`, publishes, then stamps `messaging.nats.sequence` / `messaging.nats.duplicate` and logs one INFO line.
+- Helper `natspub.PlacementAttrs(jurisdiction, cluster)` (`natspub.go:72-77`) returns `entire.target_jurisdiction` + `entire.target_cluster_id`.
+
+## 1. The callers of `natspub.Publish` / `natspub.Publication`
+
+There are **six** call sites of `natspub.Publish`, all constructing a `natspub.Publication` literal. Each typed publisher is a thin `Publisher{ js JetStreamPublisher }` wrapper (`JetStreamPublisher = natspub.JetStreamPublisher`, `NatsMsgIDHeader = natspub.MsgIDHeader`), delegating mechanics to natspub and owning only the domain parts.
+
+| Package (file:line) | Tracer | SpanName (caller-selected op name) | ErrKind | LogMsg |
+|---|---|---|---|---|
+| `pkg/metajobs/publisher.go:31` | `"metajobs"` | `"github_meta.publish"` | `"meta job"` | `"Published github_meta job"` |
+| `pkg/prjobs/publisher.go:31` | `"prjobs"` | `"github_pr.publish"` | `"pr job"` | `"Published github_pr job"` |
+| `pkg/pushauthorjobs/publisher.go:34` | `"core-fanout"` | `"github_push_author.publish"` | `"push-author job"` | `"Published github_push_author job"` |
+| `pkg/donejobs/publisher.go:31` | `"donejobs"` | `"mirror.done.publish"` | `"done job"` | `"Published mirror completion"` |
+| `internal/mirrorjobs/publisher.go:40` | `"mirrorjobs"` | `"mirror.git.publish"` | `"git mirror job"` | `"Published git mirror job"` |
+| `pkg/webhookevents/publisher.go:89` | `"webhookevents"` | `"webhook.publish"` | `"forwarded webhook"` | `"Published forwarded webhook"` |
+
+Note two things the shared API must accommodate:
+- **Tracer name is not always the package name.** `pushauthorjobs` sets `Tracer: "core-fanout"` (the binary/scope name), while its `SpanName` is `"github_push_author.publish"`. Tracer and SpanName are fully independent, caller-chosen strings.
+- **SpanName conventions vary**: dotted domain names like `github_meta.publish`, `mirror.done.publish`, `mirror.git.publish`, `webhook.publish`. All are literal strings passed straight to `otel.Tracer(Tracer).Start(ctx, SpanName, ...)`.
+
+### Representative construction details
+
+**metajobs** (`pkg/metajobs/publisher.go:30-42`) — the canonical placement-scoped shape:
+```go
+func (p *Publisher) PublishMetaJob(ctx context.Context, jurisdiction, cluster string, job Job) error {
+	return natspub.Publish(ctx, p.js, natspub.Publication{
+		Tracer:    tracerName,               // "metajobs"
+		SpanName:  "github_meta.publish",
+		ErrKind:   "meta job",
+		LogMsg:    "Published github_meta job",
+		Subject:   Subject(jurisdiction, cluster),
+		MsgID:     MsgID(job.GitHubRepoID, job.ObservedAt),
+		Marshal:   func() ([]byte, error) { return Marshal(job) },
+		SpanAttrs: append(natspub.PlacementAttrs(jurisdiction, cluster), job.SpanAttrs()...),
+		LogAttrs:  job.LogAttrs(),
+	})
+}
+```
+- **Subject** (`pkg/metajobs/jobs.go:62-64`): `SubjectPrefix + jurisdiction + "." + cluster`.
+- **MsgID** (`jobs.go:115-117`): `strconv.FormatInt(githubRepoID,10) + "/" + observedAt.UTC().Format(time.RFC3339Nano)` — stable across redeliveries so republishes collapse in the dedup window.
+- **Marshal**: closure over `Marshal(job)` which stamps schema version, validates, then `json.Marshal`.
+- **SpanAttrs**: `PlacementAttrs(...)` **appended with** `job.SpanAttrs()` (`jobs.go:171-177`: `entire.target_ulid`, `entire.github_repo_id`, `entire.source_repo`).
+- **LogAttrs** (`jobs.go:180-186`): unprefixed counterparts `target_ulid`, `github_repo_id`, `source_repo`.
+
+**pushauthorjobs** (`pkg/pushauthorjobs/publisher.go:33-52`) — shows a caller building `SpanAttrs`/`LogAttrs` **inline** rather than from job methods, and mixing attribute types:
+```go
+return natspub.Publish(ctx, p.js, natspub.Publication{
+	Tracer:   tracerName,                       // "core-fanout"
+	SpanName: "github_push_author.publish",
+	ErrKind:  "push-author job",
+	LogMsg:   "Published github_push_author job",
+	Subject:  Subject(jurisdiction, cluster),
+	MsgID:    MsgID(job.DeliveryID, job.RepoULID),   // deliveryID + "/" + repoULID
+	Marshal:  func() ([]byte, error) { return Marshal(job) },  // plain json.Marshal(j)
+	SpanAttrs: append(natspub.PlacementAttrs(jurisdiction, cluster),
+		attribute.String("entire.target_ulid", job.RepoULID),
+		attribute.Int64("entire.github_repo_id", job.GitHubRepoID),
+		attribute.Int("entire.push.authors", len(job.Authors)),
+	),
+	LogAttrs: []slog.Attr{
+		slog.String("target_ulid", job.RepoULID),
+		slog.Int64("github_repo_id", job.GitHubRepoID),
+	},
+})
+```
+Note the attribute value types used across callers: `attribute.String`, `attribute.Int64`, `attribute.Int` (the shared API's `SpanAttrs []attribute.KeyValue` already covers all of these).
+
+**mirrorjobs** (`internal/mirrorjobs/publisher.go:30-51`) — most complex Subject/MsgID derivation; builds a `gitjobs.ParsedSubject` and composes MsgID inline with `fmt.Sprintf`:
+```go
+parsed := gitjobs.ParsedSubject{Placement: route.Placement, SourceKind: route.SourceKind, Op: gitjobs.OpSyncRepo}
+job := gitjobs.Job{Source: route.Source, Target: route.Target}
+return natspub.Publish(ctx, p.js, natspub.Publication{
+	Tracer:    tracerName,               // "mirrorjobs"
+	SpanName:  "mirror.git.publish",
+	ErrKind:   "git mirror job",
+	LogMsg:    "Published git mirror job",
+	Subject:   gitjobs.Subject(parsed),
+	MsgID:     fmt.Sprintf("%s/%s/%s/%s/%s", parsed.Op, parsed.SourceKind, route.Source.Owner, route.Source.Repo, route.Target.ULID),
+	Marshal:   func() ([]byte, error) { return gitjobs.Marshal(job) },
+	SpanAttrs: append(parsed.SpanAttrs(), job.SpanAttrs()...),   // NOT PlacementAttrs — subject-derived attrs
+	LogAttrs:  append(parsed.LogAttrs(), job.LogAttrs()...),
+})
+```
+Takeaway: not every caller uses `PlacementAttrs`; `SpanAttrs` is an arbitrary caller-assembled slice.
+
+**webhookevents** (`pkg/webhookevents/publisher.go:81-106`) — the one caller that wraps `natspub.Publish` with **its own metrics** (counter + latency histogram, recorded in a `defer`), and builds attrs fully inline (no placement, no job methods):
+```go
+SpanAttrs: []attribute.KeyValue{
+	attribute.String("github.event", f.Event),
+	attribute.String("github.delivery_id", f.DeliveryID),
+},
+LogAttrs: []slog.Attr{
+	slog.String("event", f.Event),
+	slog.String("delivery_id", f.DeliveryID),
+},
+```
+`Subject(f.Event)` and `MsgID(f.DeliveryID)` (`events.go:114`, `:141`). This one is worth noting for the shared API: the caller layers outcome/duration metrics **around** the shared publish call, classifying the returned error (`classifyPublishError` → `stream_full`/`other`). If the shared `Publisher` is to support this, it must return the raw publish error unchanged (natspub does: `fmt.Errorf("publish %s: %w", ...)` preserves the NATS error for `strings.Contains(err.Error(), "maximum bytes exceeded")`).
+
+**donejobs** (`pkg/donejobs/publisher.go:30-42`) mirrors metajobs exactly, with `MsgID(job.RepoULID, job.Status)` and `SpanName: "mirror.done.publish"`.
+
+### Summary of what `Publication` must express (confirmed by real callers)
+- Independent, free-form `Tracer` **and** `SpanName` strings (tracer ≠ package name in `pushauthorjobs`; span names use varied dotted conventions).
+- `ErrKind` and `LogMsg` as free strings.
+- `Subject` fully resolved caller-side (placement concatenation, or `gitjobs.Subject(parsed)`, or `Subject(event)`).
+- `MsgID` derived caller-side by many strategies: numeric-id/timestamp, `a/b` concatenation, 5-part `fmt.Sprintf`, or a bare delivery id.
+- `Marshal` as a closure (may stamp version + validate before JSON, or plain `json.Marshal`).
+- `SpanAttrs` as an arbitrary `[]attribute.KeyValue` (String/Int64/Int seen), sometimes `PlacementAttrs(...)`-based, sometimes subject-derived, sometimes fully inline. `LogAttrs` as arbitrary `[]slog.Attr`.
+- The helper `PlacementAttrs(jurisdiction, cluster)` is shared by the four placement-scoped publishers; the other two don't use it. Worth carrying into the shared API as an optional helper, not a required field.
+
+## 2. `pkg/otelnats` vs go-nuts `natsmsg`
+
+**mirror-pipeline `pkg/otelnats/nats.go`** (`otelnats.Inject`, lines 39-44):
+```go
+func Inject(ctx context.Context, msg *nats.Msg) {
+	if msg.Header == nil {
+		msg.Header = nats.Header{}
+	}
+	otel.GetTextMapPropagator().Inject(ctx, HeaderCarrier(msg.Header))
+}
+```
+It adapts `nats.Header` to `propagation.TextMapCarrier` via `HeaderCarrier` (Get/Set/Keys). `Extract` (lines 48-53) does the mirror. This is the only otelnats helper on the publish path — `natspub.Publish` calls `otelnats.Inject(ctx, msg)` at `natspub.go:106`, right after setting the `Nats-Msg-Id` header. No other otelnats helper is used when publishing (Extract is consumer-side).
+
+**go-nuts `natsmsg/tracecontext.go`** (`Inject`, lines 58-63) is **byte-for-byte the same body** — identical `HeaderCarrier` Get/Set/Keys and the same `Inject` implementation. The go-nuts package is the superset/unification (its doc at `tracecontext.go:1-10` says it unifies entire-core's `internal/natsmsg` and entire-api's `internal/otelnats`, "itself ported from mirror-pipeline"; tracking COR-929). Differences that matter for the shared API:
+
+1. **`natsmsg.HeaderCarrier` additionally implements `propagation.ValuesGetter`** via `Values(key)` (`tracecontext.go:38-41`, asserted at `:51-54`). The comment explains why: without it the baggage propagator falls back to `Get` and reads only the first of multiple same-named headers, **truncating multi-header W3C baggage**. mirror-pipeline's `otelnats.HeaderCarrier` has no `Values` method — so it has that latent baggage-truncation bug the go-nuts version fixes.
+2. **`natsmsg.Extract` delegates to `ExtractHeader(ctx, msg.Header)`** and adds `ExtractHeader(ctx, h nats.Header)` (`:67-79`) so it works for both `*nats.Msg` (`msg.Header`) and modern `jetstream.Msg` (`msg.Headers()`). mirror-pipeline's `otelnats.Extract` only takes `*nats.Msg`.
+3. natsmsg bundles extras not in otelnats: `StartConsumerSpan(...)` (`:92-99`, collapses Extract+Start with standard messaging attrs) and `ClampToInt64` (`:103-108`, saturating uint64→int64 for sequence/delivery-count attributes). These are consumer-side conveniences; the publish path only needs `Inject`.
+
+Net: for the publish API, go-nuts `natsmsg.Inject` is a drop-in replacement for `otelnats.Inject` (same behavior) and strictly better on the carrier (ValuesGetter). The shared publisher should call `natsmsg.Inject`.
+
+## 3. Legacy vs modern JetStream, and consumer-side redelivery/backoff
+
+**Publish path is legacy `nats.JetStreamContext` exclusively.** `grep` for the modern API import (`github.com/nats-io/nats.go/jetstream`) across the whole repo (excluding vendor) returns **nothing**. The only occurrence of the token `jetstream.` is a comment in `pkg/fanoutengine/engine.go:12` ("The modern `jetstream.Consume` shape lands when this graduates to the standalone module"). Every publish uses `PublishMsg(m *nats.Msg, opts ...nats.PubOpt) (*nats.PubAck, error)`:
+- `natspub.go:39,111` (the shared core)
+- Direct `PublishMsg` callers outside natspub: `pkg/webhookdlq/publisher.go:127`, `cmd/rekicker/rekick.go:63,223`, `cmd/meta-fanout/{lifecycle.go:156,backfill.go:97,backfill_prs.go:85}`, `cmd/mirror-pipeline-admin/{rekick.go:109,dlq.go:387}`. All legacy.
+- `webhookdlq` and the `meta-fanout` backfill/lifecycle publishers reuse `natspub.AckWait` / `natspub.MsgIDHeader` but hand-roll their own `PublishMsg` + span rather than going through `natspub.Publish` (a sign the shared API may want to cover a few more shapes, but they're still legacy `PublishMsg`).
+
+**Consumer-side redelivery/backoff = `pkg/fanoutengine/engine.go`** (this is the COR-762 work). The engine is explicitly kept "on the current legacy `nats.JetStreamContext` API" (`engine.go:11-13`); it holds a `js nats.JetStreamContext` (`:216`) and subscribes via `js.PullSubscribe(...)` (`:299`).
+
+Two distinct backoffs:
+- **Subscribe-retry backoff** (`engine.go:40-45`, `:307-313`): `backoffInit = 1s`, `backoffMax = 30s`, doubling `backoff = min(backoff*2, backoffMax)` between failed `PullSubscribe` attempts.
+- **Per-message redelivery** via `NakWithDelay(c.cfg.NakDelay)` — a **flat** delay (all three fanout binaries set `NakDelay = consumerFailureDelay = 30s`, `MaxDeliver = 8` = first attempt + 7 retries, `AckWait = 30s`; `cmd/fanout/consumer.go:25,30,35`, `cmd/meta-fanout/consumer.go`, `cmd/core-fanout/consumer.go`).
+
+The **Nak/Term decision tree** lives in `nakOrExhaust` (`engine.go:605-640`) and the panic path `handlePanic` (`:667-697`):
+
+```go
+// nakOrExhaust — transient (resolve-error / publish-failure) disposition:
+if isFinalDelivery(msg, c.cfg.MaxDeliver) {
+	c.memo.forget(env.DeliveryID)
+}
+// On the final delivery, Term instead of a silently-dropped Nak when a DLQ is
+// wired OR TermOnExhaustion is set (work-queue streams — COR-762):
+if isFinalDelivery(msg, c.cfg.MaxDeliver) &amp;&amp; (c.cfg.DLQ != nil || c.cfg.TermOnExhaustion) {
+	c.deadLetter(ctx, span, ReasonMaxDeliveries, subject, env, data, numDelivered(msg), cause)
+	span.SetAttributes(attribute.Bool("entire.message.terminated", true))
+	c.recordDispatch(ctx, env.Event, OutcomeTerm, ReasonMaxDeliveries)
+	_ = msg.Term()
+	return OutcomeTerm
+}
+// otherwise: redeliver with the flat NakDelay
+_ = msg.NakWithDelay(c.cfg.NakDelay)
+return OutcomeNak
+```
+
+- **`Term()` immediate**, no redelivery, for permanent errors: bad envelope (`engine.go:483-487`, `ReasonBadEnvelope`) and `*InputError` from the resolver (`:511-526`, `ReasonInputError` or a caller sub-reason like `repo_gone`).
+- **`isFinalDelivery`** (`:717-722`): `meta.NumDelivered &gt;= uint64(maxDeliver)`.
+- **`TermOnExhaustion`** (Config field, `:193-198`) is the COR-762 fix: on a **work-queue** stream a Nak on the final delivery leaves the message un-acked and orphaned until `max_age`, so instead the engine `Term()`s on exhaustion (reason `max_deliveries`) even without a DLQ. In this repo it's enabled only on the meta-fanout backfill consumers (`cmd/meta-fanout/backfill_consumer.go:267`, `backfill_prs_consumer.go:246`, both with `NakDelay: consumerFailureDelay`); the webhook/durable fanout consumers leave it off (plain Nak, or Term + DLQ capture). The panic path honors it too (`engine.go:685-692`: Term the poison-pill on final delivery to drain the queue).
+- Fan-out publish aggregation: `dispatchRoutes` publishes **all** routes, then Naks if any failed (`:568-579`), with an in-process route memo so already-PubAck'd regions are skipped on redelivery (`:537-556`) — because `mirror_git_v1`'s 1s server-side dedup window does not cover the ~30s redelivery (`:498-507`).
+
+The `AckableMsg` interface the engine narrows to (`engine.go:203-209`) is the concrete signature surface for the Ack/Nak/Term/delay contract: `Ack`, `Nak`, `NakWithDelay(delay time.Duration, ...)`, `Term`, `Metadata() (*nats.MsgMetadata, error)` — all legacy `nats.AckOpt`-based.
+
+### Bottom line for the shared API design
+- The shared `Publisher`/`Publication` must keep `Tracer` and `SpanName` as **independent free strings** (pushauthorjobs proves they diverge) and `SpanAttrs`/`LogAttrs` as **fully caller-assembled slices** (mirrorjobs and webhookevents don't use `PlacementAttrs`). All six caller-selected operation names above are just literal `SpanName` values — the current struct already expresses every one.
+- It must **return the underlying publish error unwrapped-enough** for callers like webhookevents to string-match (`%w` wrapping is sufficient).
+- Swap `otelnats.Inject` → go-nuts `natsmsg.Inject` (identical body, plus the `ValuesGetter` baggage fix).
+- Keep it on legacy `PublishMsg` + `nats.Context(timeout)` — that's what 100% of the mirror-pipeline publish path uses today; the modern `jetstream.JetStream` API appears nowhere.</result>
+<usage><subagent_tokens>68628</subagent_tokens><tool_uses>20</tool_uses><duration_ms>181127</duration_ms></usage>
+</task-notification>

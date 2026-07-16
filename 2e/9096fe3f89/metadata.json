@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.8.43-nightly.202607110651.7cd666280",
+  "checkpoint_id": "2e9096fe3f89",
+  "strategy": "manual-commit",
+  "branch": "nodo/cor-984-go-nuts-phase-2-deepen-publishing-and-redelivery-apis",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "go.sum"
+  ],
+  "sessions": [
+    {
+      "metadata": "/2e/9096fe3f89/0/metadata.json",
+      "transcript": "/2e/9096fe3f89/0/full.jsonl",
+      "compact_transcript": "/2e/9096fe3f89/0/transcript.jsonl",
+      "content_hash": "/2e/9096fe3f89/0/content_hash.txt",
+      "prompt": "/2e/9096fe3f89/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 4412,
+    "cache_creation_tokens": 320521,
+    "cache_read_tokens": 17450292,
+    "output_tokens": 147765,
+    "api_call_count": 82
+  }
+}
