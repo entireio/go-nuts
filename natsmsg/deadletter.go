@@ -26,12 +26,12 @@ const (
 	DLQStreamSeqHeader = "Nats-Dlq-Stream-Seq"
 )
 
-// DLQPublisher is the publish surface DeadLetter needs — satisfied by
-// nats.JetStreamContext. Kept minimal so wiring can hand it the same
-// JetStreamContext the per-cell publishers already hold, and tests can stub it.
-type DLQPublisher interface {
-	PublishMsg(m *nats.Msg, opts ...nats.PubOpt) (*nats.PubAck, error)
-}
+// DLQPublisher is the publish surface DeadLetter needs — the legacy
+// [LegacyJetStream] publish primitive (satisfied by nats.JetStreamContext),
+// aliased so DeadLetter's signature reads in DLQ terms. Kept minimal so wiring
+// can hand it the same JetStreamContext the per-cell publishers already hold,
+// and tests can stub it.
+type DLQPublisher = LegacyJetStream
 
 // SubjectToken sanitizes s into a single valid NATS subject token. NATS tokens
 // cannot contain spaces, dots, or wildcards, so every character outside
