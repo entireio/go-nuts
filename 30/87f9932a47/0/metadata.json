@@ -1,0 +1,50 @@
+{
+  "cli_version": "0.8.43-nightly.202607110651.7cd666280",
+  "checkpoint_id": "3087f9932a47",
+  "session_id": "033c3992-c4df-4e86-a73c-f74bbec4bd33",
+  "strategy": "manual-commit",
+  "created_at": "2026-07-16T11:27:42.192683Z",
+  "branch": "nodo/cor-984-go-nuts-phase-2-deepen-publishing-and-redelivery-apis",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "natsmsg/publish.go",
+    "natsmsg/publish_test.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "b3b212861313",
+  "checkpoint_transcript_start": 597,
+  "transcript_lines_at_start": 597,
+  "compact_transcript_start": 117,
+  "token_usage": {
+    "input_tokens": 25,
+    "cache_creation_tokens": 23312,
+    "cache_read_tokens": 4460101,
+    "output_tokens": 21474,
+    "api_call_count": 13
+  },
+  "session_metrics": {
+    "turn_count": 3
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-07-16T11:27:42.133441Z",
+    "agent_lines": 54,
+    "agent_removed": 29,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 54,
+    "total_lines_changed": 83,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    }
+  ]
+}

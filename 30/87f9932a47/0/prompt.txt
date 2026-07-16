@@ -1,0 +1,7 @@
+two P2s:   1. [P2] Preserve caller-owned span attributes. natsmsg/publish.go:51 exposes no way to add domain attributes to its internally owned producer span. Phase 3 replacements would lose attributes such as placement and job
+     identity currently passed through mirror-pipeline’s natspub (https://github.com/entirehq/mirror-pipeline/blob/878e8eaf3036f58a2e635a1503bdd3c56278abd4/internal/natspub/natspub.go). Wrapping Publish in another span changes
+     span topology and leaves the actual publish span untagged. Add caller-supplied attributes/options forwarded to StartProducerSpan.
+
+  2. [P2] Don’t store application span names as messaging.operation.name. natsmsg/publish.go:176 records values such as repo.ops.publish in that semantic field. The pinned OTel convention defines it as the system-specific
+     messaging operation—examples include ack, nack, and send (/Users/nodo/go/pkg/mod/go.opentelemetry.io/otel@v1.44.0/semconv/v1.41.0/attribute_group.go:11447). Keep the caller value as the span name, while setting
+     messaging.operation.name to the NATS operation (publish) or omitting it.
