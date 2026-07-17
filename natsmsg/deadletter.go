@@ -26,12 +26,12 @@ const (
 	DLQStreamSeqHeader = "Nats-Dlq-Stream-Seq"
 )
 
-// DLQPublisher is the publish surface DeadLetter needs — the legacy
-// [LegacyJetStream] publish primitive (satisfied by nats.JetStreamContext),
-// aliased so DeadLetter's signature reads in DLQ terms. Kept minimal so wiring
-// can hand it the same JetStreamContext the per-cell publishers already hold,
+// DLQPublisher is the publish surface DeadLetter needs — the modern
+// [JetStream] publish primitive (satisfied by jetstream.JetStream), aliased
+// so DeadLetter's signature reads in DLQ terms. Kept minimal so wiring can
+// hand it the same JetStream handle the per-cell publishers already hold,
 // and tests can stub it.
-type DLQPublisher = LegacyJetStream
+type DLQPublisher = JetStream
 
 // SubjectToken sanitizes s into a single valid NATS subject token. NATS tokens
 // cannot contain spaces, dots, or wildcards, so every character outside
@@ -93,7 +93,7 @@ func DeadLetter(ctx context.Context, pub DLQPublisher, dlqSubject string, msg je
 
 	pubCtx, cancel := context.WithTimeout(ctx, dlqPublishTimeout)
 	defer cancel()
-	if _, err := pub.PublishMsg(out, nats.Context(pubCtx)); err != nil {
+	if _, err := pub.PublishMsg(pubCtx, out); err != nil {
 		return fmt.Errorf("dead-letter publish to %q: %w", dlqSubject, err)
 	}
 	return nil

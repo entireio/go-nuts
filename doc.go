@@ -13,16 +13,14 @@
 //
 // The subpackages carry the message-layer pieces those services shared
 // (COR-929, deepened in COR-984) — [natsmsg] (trace-context propagation over
-// message headers, the bounded deduped Publisher — modern, with LegacyPublisher
-// bridging the legacy nats.JetStreamContext API and a caller-selected Operation
-// span name — the KeepInProgress AckWait heartbeat, the DeadLetter dead-letter
-// capture, and the natsmsgtest.FakeMsg / FakeLegacyMsg test doubles),
+// message headers, the bounded deduped Publisher with a caller-selected
+// Operation span name, the KeepInProgress AckWait heartbeat, the DeadLetter
+// dead-letter capture, and the natsmsgtest.FakeMsg test double),
 // [jsconsumer] (the durable JetStream pull-consumer scaffold, one-shot via Start
 // or supervised via Run), and [backoff] (the NakWithDelay redelivery policy —
-// flat or growing — with Term-on-final-delivery, COR-762, driving both the
-// modern jetstream.Msg and the legacy *nats.Msg APIs). Both seams keep the
-// modern API as the destination and expose the legacy path as a transitional
-// bridge that deletes cleanly once no legacy caller remains. natsmsg and
+// flat or growing — with Term-on-final-delivery, COR-762). The legacy
+// nats.JetStreamContext publishing bridges were transitional and were removed
+// once the last caller migrated (COR-1004). natsmsg and
 // jsconsumer additionally depend on the OpenTelemetry API, and all three on
 // nats.go's jetstream package; importing only the root package links none of
 // that.

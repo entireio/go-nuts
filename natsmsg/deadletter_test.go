@@ -17,13 +17,15 @@ type fakeDLQPublisher struct {
 	err  error
 }
 
-func (f *fakeDLQPublisher) PublishMsg(m *nats.Msg, _ ...nats.PubOpt) (*nats.PubAck, error) {
+func (f *fakeDLQPublisher) PublishMsg(_ context.Context, m *nats.Msg, _ ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
 	f.msgs = append(f.msgs, m)
-	return &nats.PubAck{Stream: "repo_ops_dlq_v1", Sequence: 1}, nil
+	return &jetstream.PubAck{Stream: "repo_ops_dlq_v1", Sequence: 1}, nil
 }
+
+var _ natsmsg.DLQPublisher = (*fakeDLQPublisher)(nil)
 
 func TestSubjectToken(t *testing.T) {
 	cases := map[string]string{

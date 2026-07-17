@@ -5,13 +5,8 @@
 //
 // The policy owns disposition and delay calculation only, and nothing wider:
 // dead-letter capture, domain metrics/logging, and the decision of which
-// failures are transient stay with the caller. It drives both the modern
-// [jetstream.Msg] API (NakOrTerm, NumDelivered, IsFinalDelivery) and the legacy
-// *nats.Msg API (the NakOrTermLegacy / NumDeliveredLegacy / IsFinalDeliveryLegacy
-// counterparts, over the [LegacyMsg] interface). Both surfaces share one
-// implementation, so they behave identically; the legacy set is a transitional
-// bridge for consumers not yet on the modern API and can be removed once none
-// remain.
+// failures are transient stay with the caller. It drives the modern
+// [jetstream.Msg] API (NakOrTerm, NumDelivered, IsFinalDelivery).
 //
 // Delay calculation ([Policy.DelayFor]) is independent of message disposition:
 // it is a pure function of the delivery count, so a caller can pin or meter the
@@ -51,7 +46,6 @@ import (
 	"math"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -102,16 +96,7 @@ type Policy struct {
 	TermOnExhaustion bool
 }
 
-// LegacyMsg is the subset of the legacy *nats.Msg that the *Legacy redelivery
-// entry points drive — Nak-with-delay, Term, and the delivery metadata. *nats.Msg
-// satisfies it; a test can stub it.
-type LegacyMsg interface {
-	NakWithDelay(delay time.Duration, opts ...nats.AckOpt) error
-	Term(opts ...nats.AckOpt) error
-	Metadata() (*nats.MsgMetadata, error)
-}
-
-// NakOrTerm applies the policy to a transiently-failed modern [jetstream.Msg]
+// NakOrTerm applies the policy to a transiently-failed [jetstream.Msg]
 // delivery: NakWithDelay (see [Policy.DelayFor]) for redelivery, or — on the
 // final delivery with TermOnExhaustion set — Term. Without TermOnExhaustion the
 // final delivery still Naks; the broker drops the Nak at MaxDeliver and the
@@ -123,24 +108,13 @@ type LegacyMsg interface {
 // work-queue stream means the message lingers exactly as it would have without
 // the policy.
 func (p Policy) NakOrTerm(msg jetstream.Msg) (Outcome, error) {
-	return p.nakOrTerm(modernDisposer{msg})
-}
-
-// NakOrTermLegacy is [Policy.NakOrTerm] for a legacy *nats.Msg delivery,
-// behaving identically over the [LegacyMsg] API.
-func (p Policy) NakOrTermLegacy(msg LegacyMsg) (Outcome, error) {
-	return p.nakOrTerm(legacyDisposer{msg})
-}
-
-// nakOrTerm is the disposition shared by the modern and legacy entry points.
-func (p Policy) nakOrTerm(d disposer) (Outcome, error) {
-	if p.TermOnExhaustion && isFinalDelivery(d, p.MaxDeliver) {
-		if err := d.term(); err != nil {
+	if p.TermOnExhaustion && IsFinalDelivery(msg, p.MaxDeliver) {
+		if err := msg.Term(); err != nil {
 			return OutcomeTerm, fmt.Errorf("term on final delivery: %w", err)
 		}
 		return OutcomeTerm, nil
 	}
-	if err := d.nakWithDelay(p.DelayFor(deliveryCount(d))); err != nil {
+	if err := msg.NakWithDelay(p.DelayFor(NumDelivered(msg))); err != nil {
 		return OutcomeNak, fmt.Errorf("nak with delay: %w", err)
 	}
 	return OutcomeNak, nil
@@ -168,16 +142,14 @@ func (p Policy) DelayFor(numDelivered int) time.Duration {
 	return time.Duration(d)
 }
 
-// NumDelivered reports the JetStream delivery count of a modern [jetstream.Msg]
+// NumDelivered reports the JetStream delivery count of a [jetstream.Msg]
 // (1 on first delivery), or 0 if metadata is unavailable (e.g. a synthetic test
 // message).
 func NumDelivered(msg jetstream.Msg) int {
-	return deliveryCount(modernDisposer{msg})
-}
-
-// NumDeliveredLegacy is [NumDelivered] for a legacy *nats.Msg.
-func NumDeliveredLegacy(msg LegacyMsg) int {
-	return deliveryCount(legacyDisposer{msg})
+	if meta, err := msg.Metadata(); err == nil && meta != nil {
+		return int(meta.NumDelivered)
+	}
+	return 0
 }
 
 // IsFinalDelivery reports whether this is the last delivery before JetStream
@@ -189,73 +161,11 @@ func NumDeliveredLegacy(msg LegacyMsg) int {
 // Unavailable metadata also reads as non-final: the safe default is another
 // retry, not a Term.
 func IsFinalDelivery(msg jetstream.Msg, maxDeliver int) bool {
-	return isFinalDelivery(modernDisposer{msg}, maxDeliver)
-}
-
-// IsFinalDeliveryLegacy is [IsFinalDelivery] for a legacy *nats.Msg.
-func IsFinalDeliveryLegacy(msg LegacyMsg, maxDeliver int) bool {
-	return isFinalDelivery(legacyDisposer{msg}, maxDeliver)
-}
-
-// disposer is the message-disposition surface the policy drives, shared by the
-// modern jetstream.Msg and legacy *nats.Msg adapters so both entry points run
-// the identical logic.
-type disposer interface {
-	// deliveries reports the JetStream delivery count and whether the message
-	// carried metadata to read it from.
-	deliveries() (uint64, bool)
-	nakWithDelay(delay time.Duration) error
-	term() error
-}
-
-type modernDisposer struct{ msg jetstream.Msg }
-
-func (m modernDisposer) deliveries() (uint64, bool) {
-	if meta, err := m.msg.Metadata(); err == nil && meta != nil {
-		return meta.NumDelivered, true
-	}
-	return 0, false
-}
-
-//nolint:wrapcheck // thin adapter; nakOrTerm adds the "nak with delay" context
-func (m modernDisposer) nakWithDelay(delay time.Duration) error { return m.msg.NakWithDelay(delay) }
-
-//nolint:wrapcheck // thin adapter; nakOrTerm adds the "term on final delivery" context
-func (m modernDisposer) term() error { return m.msg.Term() }
-
-type legacyDisposer struct{ msg LegacyMsg }
-
-func (m legacyDisposer) deliveries() (uint64, bool) {
-	if meta, err := m.msg.Metadata(); err == nil && meta != nil {
-		return meta.NumDelivered, true
-	}
-	return 0, false
-}
-
-//nolint:wrapcheck // thin adapter; nakOrTerm adds the "nak with delay" context
-func (m legacyDisposer) nakWithDelay(delay time.Duration) error { return m.msg.NakWithDelay(delay) }
-
-//nolint:wrapcheck // thin adapter; nakOrTerm adds the "term on final delivery" context
-func (m legacyDisposer) term() error { return m.msg.Term() }
-
-// deliveryCount is the shared NumDelivered: the count, or 0 when metadata is
-// unavailable (which the delay calc reads as the first delivery).
-func deliveryCount(d disposer) int {
-	if n, ok := d.deliveries(); ok {
-		return int(n)
-	}
-	return 0
-}
-
-// isFinalDelivery is the shared IsFinalDelivery: NumDelivered has reached a
-// positive maxDeliver. A non-positive maxDeliver (unlimited) and unavailable
-// metadata both read as non-final.
-func isFinalDelivery(d disposer, maxDeliver int) bool {
 	if maxDeliver <= 0 {
 		return false
 	}
-	if n, ok := d.deliveries(); ok {
-		return n >= uint64(maxDeliver)
+	if meta, err := msg.Metadata(); err == nil && meta != nil {
+		return meta.NumDelivered >= uint64(maxDeliver)
 	}
 	return false
 }
