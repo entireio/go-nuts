@@ -16,13 +16,6 @@ import (
 
 const testDelay = 5 * time.Second
 
-// The legacy redelivery entry points accept anything satisfying LegacyMsg; a
-// concrete *nats.Msg and the scriptable test double both must.
-var (
-	_ LegacyMsg = (*nats.Msg)(nil)
-	_ LegacyMsg = (*natsmsgtest.FakeLegacyMsg)(nil)
-)
-
 func delivered(n uint64) *natsmsgtest.FakeMsg {
 	return &natsmsgtest.FakeMsg{Meta: &jetstream.MsgMetadata{NumDelivered: n}}
 }
@@ -247,13 +240,9 @@ func TestIsFinalDelivery(t *testing.T) {
 	}
 }
 
-func legacyDelivered(n uint64) *natsmsgtest.FakeLegacyMsg {
-	return &natsmsgtest.FakeLegacyMsg{Meta: &nats.MsgMetadata{NumDelivered: n}}
-}
-
-// dispositionMatrix is the shared behavioral contract both the modern and the
-// legacy entry points must satisfy: for a given policy and delivery count, the
-// same Outcome and — for a nak — the same single delay, or a term.
+// dispositionMatrix is the behavioral contract NakOrTerm must satisfy: for a
+// given policy and delivery count, the expected Outcome and — for a nak — the
+// single delay, or a term.
 var dispositionMatrix = []struct {
 	name         string
 	policy       Policy
@@ -321,108 +310,70 @@ var dispositionMatrix = []struct {
 	},
 }
 
-// TestNakOrTermParity drives the whole disposition matrix through BOTH the
-// modern jetstream.Msg entry point and the legacy *nats.Msg one, asserting each
-// hits the expected outcome AND that the two agree — the single behavioral
-// contract the shared core guarantees across the two message APIs.
-func TestNakOrTermParity(t *testing.T) {
+// TestNakOrTermDispositionMatrix drives the whole disposition matrix through
+// NakOrTerm, asserting each case hits the expected outcome — the behavioral
+// contract the policy guarantees.
+func TestNakOrTermDispositionMatrix(t *testing.T) {
 	for _, tc := range dispositionMatrix {
 		t.Run(tc.name, func(t *testing.T) {
-			modern := &natsmsgtest.FakeMsg{}
-			legacy := &natsmsgtest.FakeLegacyMsg{}
+			msg := &natsmsgtest.FakeMsg{}
 			if !tc.noMeta {
-				modern.Meta = &jetstream.MsgMetadata{NumDelivered: tc.delivered}
-				legacy.Meta = &nats.MsgMetadata{NumDelivered: tc.delivered}
+				msg.Meta = &jetstream.MsgMetadata{NumDelivered: tc.delivered}
 			}
 
-			mOut, mErr := tc.policy.NakOrTerm(modern)
-			lOut, lErr := tc.policy.NakOrTermLegacy(legacy)
-			if mErr != nil || lErr != nil {
-				t.Fatalf("NakOrTerm errors: modern=%v legacy=%v", mErr, lErr)
+			out, err := tc.policy.NakOrTerm(msg)
+			if err != nil {
+				t.Fatalf("NakOrTerm: %v", err)
 			}
-			if mOut != tc.wantOutcome || lOut != tc.wantOutcome {
-				t.Fatalf("outcome: modern=%q legacy=%q, want %q", mOut, lOut, tc.wantOutcome)
+			if out != tc.wantOutcome {
+				t.Fatalf("outcome = %q, want %q", out, tc.wantOutcome)
 			}
-			if modern.Termed != tc.wantTermed || legacy.Termed != tc.wantTermed {
-				t.Errorf("termed: modern=%v legacy=%v, want %v", modern.Termed, legacy.Termed, tc.wantTermed)
+			if msg.Termed != tc.wantTermed {
+				t.Errorf("termed = %v, want %v", msg.Termed, tc.wantTermed)
 			}
 			if tc.wantOutcome == OutcomeNak {
-				assertSingleNak(t, "modern", modern.NakDelays, tc.wantNakDelay)
-				assertSingleNak(t, "legacy", legacy.NakDelays, tc.wantNakDelay)
-				if modern.Termed || legacy.Termed {
+				if len(msg.NakDelays) != 1 || msg.NakDelays[0] != tc.wantNakDelay {
+					t.Errorf("NakDelays = %v, want one nak of %v", msg.NakDelays, tc.wantNakDelay)
+				}
+				if msg.Termed {
 					t.Error("naked path also termed")
 				}
-			} else if len(modern.NakDelays) != 0 || len(legacy.NakDelays) != 0 {
-				t.Errorf("term path also naked: modern=%v legacy=%v", modern.NakDelays, legacy.NakDelays)
+			} else if len(msg.NakDelays) != 0 {
+				t.Errorf("term path also naked: %v", msg.NakDelays)
 			}
 		})
 	}
 }
 
-func assertSingleNak(t *testing.T, which string, delays []time.Duration, want time.Duration) {
-	t.Helper()
-	if len(delays) != 1 || delays[0] != want {
-		t.Errorf("%s NakDelays = %v, want one nak of %v", which, delays, want)
-	}
-}
-
-// TestNakOrTermDispositionErrors pins the error-reporting contract across both
-// APIs: a failed Term/Nak is returned wrapped, tagged with the Outcome that was
-// attempted so the caller can still meter it.
+// TestNakOrTermDispositionErrors pins the error-reporting contract: a failed
+// Term/Nak is returned wrapped, tagged with the Outcome that was attempted so
+// the caller can still meter it.
 func TestNakOrTermDispositionErrors(t *testing.T) {
 	t.Run("term error on final delivery", func(t *testing.T) {
 		p := Policy{NakDelay: time.Second, MaxDeliver: 1, TermOnExhaustion: true}
 		boom := errors.New("term boom")
 
-		mOut, mErr := p.NakOrTerm(&natsmsgtest.FakeMsg{Meta: &jetstream.MsgMetadata{NumDelivered: 1}, TermErr: boom})
-		lOut, lErr := p.NakOrTermLegacy(&natsmsgtest.FakeLegacyMsg{Meta: &nats.MsgMetadata{NumDelivered: 1}, TermErr: boom})
-		if mOut != OutcomeTerm || lOut != OutcomeTerm {
-			t.Errorf("outcome: modern=%q legacy=%q, want term", mOut, lOut)
+		out, err := p.NakOrTerm(&natsmsgtest.FakeMsg{Meta: &jetstream.MsgMetadata{NumDelivered: 1}, TermErr: boom})
+		if out != OutcomeTerm {
+			t.Errorf("outcome = %q, want term", out)
 		}
-		if mErr == nil || !errors.Is(mErr, boom) || lErr == nil || !errors.Is(lErr, boom) {
-			t.Errorf("errors: modern=%v legacy=%v, want wrapped term boom", mErr, lErr)
+		if err == nil || !errors.Is(err, boom) {
+			t.Errorf("err = %v, want wrapped term boom", err)
 		}
 	})
 
 	t.Run("nak error redelivering", func(t *testing.T) {
 		p := Policy{NakDelay: time.Second, MaxDeliver: 5}
 		boom := errors.New("nak boom")
-		modern := &natsmsgtest.FakeMsg{Meta: &jetstream.MsgMetadata{NumDelivered: 2}, NakErr: boom}
-		legacy := &natsmsgtest.FakeLegacyMsg{Meta: &nats.MsgMetadata{NumDelivered: 2}, NakErr: boom}
 
-		mOut, mErr := p.NakOrTerm(modern)
-		lOut, lErr := p.NakOrTermLegacy(legacy)
-		if mOut != OutcomeNak || lOut != OutcomeNak {
-			t.Errorf("outcome: modern=%q legacy=%q, want nak", mOut, lOut)
+		out, err := p.NakOrTerm(&natsmsgtest.FakeMsg{Meta: &jetstream.MsgMetadata{NumDelivered: 2}, NakErr: boom})
+		if out != OutcomeNak {
+			t.Errorf("outcome = %q, want nak", out)
 		}
-		if mErr == nil || !errors.Is(mErr, boom) || lErr == nil || !errors.Is(lErr, boom) {
-			t.Errorf("errors: modern=%v legacy=%v, want wrapped nak boom", mErr, lErr)
+		if err == nil || !errors.Is(err, boom) {
+			t.Errorf("err = %v, want wrapped nak boom", err)
 		}
 	})
-}
-
-// TestNumDeliveredAndIsFinalParity pins that the modern and legacy read helpers
-// agree over the same delivery counts and MaxDeliver bounds.
-func TestNumDeliveredAndIsFinalParity(t *testing.T) {
-	for _, n := range []uint64{1, 4, 5, 6} {
-		if got := NumDeliveredLegacy(legacyDelivered(n)); got != int(n) {
-			t.Errorf("NumDeliveredLegacy(%d) = %d", n, got)
-		}
-		if NumDelivered(delivered(n)) != NumDeliveredLegacy(legacyDelivered(n)) {
-			t.Errorf("NumDelivered disagree at %d", n)
-		}
-	}
-	if got := NumDeliveredLegacy(&natsmsgtest.FakeLegacyMsg{MetaErr: errors.New("none")}); got != 0 {
-		t.Errorf("NumDeliveredLegacy without metadata = %d, want 0", got)
-	}
-	for _, tc := range []struct {
-		n   uint64
-		max int
-	}{{4, 5}, {5, 5}, {6, 5}, {1, 0}, {1, -1}} {
-		if IsFinalDelivery(delivered(tc.n), tc.max) != IsFinalDeliveryLegacy(legacyDelivered(tc.n), tc.max) {
-			t.Errorf("IsFinalDelivery disagree at delivered=%d max=%d", tc.n, tc.max)
-		}
-	}
 }
 
 // TestEnvelopeRepoops pins entiredb repoops exactly: 5s doubling capped at 30s,
@@ -494,12 +445,12 @@ type recordingDLQ struct {
 	err       error
 }
 
-func (r *recordingDLQ) PublishMsg(m *nats.Msg, _ ...nats.PubOpt) (*nats.PubAck, error) {
+func (r *recordingDLQ) PublishMsg(_ context.Context, m *nats.Msg, _ ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
 	if r.err != nil {
 		return nil, r.err
 	}
 	r.published = append(r.published, m)
-	return &nats.PubAck{Stream: "dlq", Sequence: uint64(len(r.published))}, nil
+	return &jetstream.PubAck{Stream: "dlq", Sequence: uint64(len(r.published))}, nil
 }
 
 // TestDeadLetterBeforeDisposition pins the documented capture-then-dispose

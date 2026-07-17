@@ -23,8 +23,7 @@ import (
 const testStream = "pub_v1"
 
 // newStreamConn boots an embedded JetStream server with a stream bound to pub.>
-// and returns a connection to it — the shared setup for both the modern
-// (jetstream.New) and legacy (nc.JetStream()) publish paths.
+// and returns a connection to it.
 func newStreamConn(t *testing.T) *nats.Conn {
 	t.Helper()
 	s, err := natsserver.NewServer(&natsserver.Options{
@@ -120,26 +119,9 @@ func (f *fakeModernJS) PublishMsg(_ context.Context, m *nats.Msg, _ ...jetstream
 	return f.ack, nil
 }
 
-// fakeLegacyJS is the LegacyJetStream counterpart of fakeModernJS.
-type fakeLegacyJS struct {
-	last  *nats.Msg
-	ack   *nats.PubAck
-	err   error
-	calls int
-}
-
-func (f *fakeLegacyJS) PublishMsg(m *nats.Msg, _ ...nats.PubOpt) (*nats.PubAck, error) {
-	f.calls++
-	f.last = m
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.ack, nil
-}
-
 var (
 	_ jetstream.JetStream = (*fakeModernJS)(nil)
-	_ LegacyJetStream     = (*fakeLegacyJS)(nil)
+	_ JetStream           = (*fakeModernJS)(nil)
 )
 
 // TestPublisherStampsHeadersAndAcks drives the whole publish prologue: the
@@ -240,68 +222,39 @@ func TestPublisherErrorsOnUnboundSubject(t *testing.T) {
 	}
 }
 
-// parityAttrs are the caller-owned domain span attributes both publishers must
-// forward onto the producer span they own (placement / job-identity style tags,
+// domainAttrs are the caller-owned domain span attributes the publisher must
+// forward onto the producer span it owns (placement / job-identity style tags,
 // the kind mirror-pipeline's natspub passes through).
-var parityAttrs = []attribute.KeyValue{
+var domainAttrs = []attribute.KeyValue{
 	attribute.String("entire.target_ulid", "ulid-1"),
 	attribute.Int64("entire.github_repo_id", 42),
 }
 
-// TestPublisherParity drives the identical publish through BOTH the modern
-// Publisher and the legacy LegacyPublisher against fake backends, asserting they
-// stamp the same headers, record the same producer span (caller-selected span
-// name + standard messaging attrs + forwarded domain attrs + PubAck telemetry),
-// and report the same ack — the single behavioral contract the shared core
-// guarantees.
-func TestPublisherParity(t *testing.T) {
-	for _, backend := range []string{"modern", "legacy"} {
-		t.Run(backend, func(t *testing.T) {
-			rec := withTracing(t)
-			prodCtx, tid, _ := remoteSpanCtx(t)
-			msg := &nats.Msg{Subject: "pub.repo", Data: []byte("payload")}
+// TestPublisherSpanContract drives one publish against a fake backend and
+// asserts the full behavioral contract of the publish prologue: the stamped
+// headers, the producer span (caller-selected span name + standard messaging
+// attrs + forwarded domain attrs + PubAck telemetry), and the reported ack.
+func TestPublisherSpanContract(t *testing.T) {
+	rec := withTracing(t)
+	prodCtx, tid, _ := remoteSpanCtx(t)
+	msg := &nats.Msg{Subject: "pub.repo", Data: []byte("payload")}
 
-			var (
-				last   *nats.Msg
-				stream string
-				seq    uint64
-				dup    bool
-				err    error
-			)
-			switch backend {
-			case "modern":
-				f := &fakeModernJS{ack: &jetstream.PubAck{Stream: testStream, Sequence: 7, Duplicate: true}}
-				var a *jetstream.PubAck
-				a, err = Publisher{JS: f, Operation: "repo.ops.publish"}.Publish(prodCtx, msg, "msg-1", parityAttrs...)
-				last = f.last
-				if err == nil {
-					stream, seq, dup = a.Stream, a.Sequence, a.Duplicate
-				}
-			case "legacy":
-				f := &fakeLegacyJS{ack: &nats.PubAck{Stream: testStream, Sequence: 7, Duplicate: true}}
-				var a *nats.PubAck
-				a, err = LegacyPublisher{JS: f, Operation: "repo.ops.publish"}.Publish(prodCtx, msg, "msg-1", parityAttrs...)
-				last = f.last
-				if err == nil {
-					stream, seq, dup = a.Stream, a.Sequence, a.Duplicate
-				}
-			}
-			if err != nil {
-				t.Fatalf("publish: %v", err)
-			}
-
-			if stream != testStream || seq != 7 || !dup {
-				t.Errorf("ack = %q/%d/%v, want pub_v1/7/true", stream, seq, dup)
-			}
-			if got := last.Header.Get(nats.MsgIdHdr); got != "msg-1" {
-				t.Errorf("published Nats-Msg-Id = %q, want msg-1", got)
-			}
-			if last.Header.Get("traceparent") == "" {
-				t.Error("no traceparent injected into the published message")
-			}
-			assertProducerSpan(t, rec, "repo.ops.publish", tid)
-		})
+	f := &fakeModernJS{ack: &jetstream.PubAck{Stream: testStream, Sequence: 7, Duplicate: true}}
+	a, err := Publisher{JS: f, Operation: "repo.ops.publish"}.Publish(prodCtx, msg, "msg-1", domainAttrs...)
+	if err != nil {
+		t.Fatalf("publish: %v", err)
 	}
+
+	if a.Stream != testStream || a.Sequence != 7 || !a.Duplicate {
+		t.Errorf("ack = %q/%d/%v, want pub_v1/7/true", a.Stream, a.Sequence, a.Duplicate)
+	}
+	if got := f.last.Header.Get(nats.MsgIdHdr); got != "msg-1" {
+		t.Errorf("published Nats-Msg-Id = %q, want msg-1", got)
+	}
+	if f.last.Header.Get("traceparent") == "" {
+		t.Error("no traceparent injected into the published message")
+	}
+	assertProducerSpan(t, rec, "repo.ops.publish", tid)
 }
 
 func assertProducerSpan(t *testing.T, rec *tracetest.SpanRecorder, wantName string, wantTrace trace.TraceID) {
@@ -373,87 +326,16 @@ func TestPublisherDefaultOperationName(t *testing.T) {
 	}
 }
 
-// TestPublisherRecordsError: both backends wrap a failed publish preserving the
-// underlying cause (so callers can classify it) and mark the span an error.
+// TestPublisherRecordsError: a failed publish is wrapped preserving the
+// underlying cause (so callers can classify it) and marks the span an error.
 func TestPublisherRecordsError(t *testing.T) {
-	for _, backend := range []string{"modern", "legacy"} {
-		t.Run(backend, func(t *testing.T) {
-			rec := withTracing(t)
-			var err error
-			switch backend {
-			case "modern":
-				_, err = (Publisher{JS: &fakeModernJS{err: errors.New("nats down")}}).Publish(context.Background(), &nats.Msg{Subject: "pub.repo"}, "m")
-			case "legacy":
-				_, err = (LegacyPublisher{JS: &fakeLegacyJS{err: errors.New("nats down")}}).Publish(context.Background(), &nats.Msg{Subject: "pub.repo"}, "m")
-			}
-			if err == nil || !strings.Contains(err.Error(), "natsmsg: publish pub.repo") || !strings.Contains(err.Error(), "nats down") {
-				t.Errorf("err = %v, want wrapped publish error preserving the cause", err)
-			}
-			spans := rec.Ended()
-			if len(spans) != 1 || spans[0].Status().Code != codes.Error {
-				t.Error("publish failure not recorded as a span error")
-			}
-		})
+	rec := withTracing(t)
+	_, err := (Publisher{JS: &fakeModernJS{err: errors.New("nats down")}}).Publish(context.Background(), &nats.Msg{Subject: "pub.repo"}, "m")
+	if err == nil || !strings.Contains(err.Error(), "natsmsg: publish pub.repo") || !strings.Contains(err.Error(), "nats down") {
+		t.Errorf("err = %v, want wrapped publish error preserving the cause", err)
 	}
-}
-
-// TestLegacyPublisherIntegration drives LegacyPublisher end-to-end against an
-// embedded broker over the legacy nats.JetStreamContext: the stored message must
-// carry the Nats-Msg-Id and injected trace context, and the ack must report the
-// landing stream.
-func TestLegacyPublisherIntegration(t *testing.T) {
-	nc := newStreamConn(t)
-	legacy, err := nc.JetStream()
-	if err != nil {
-		t.Fatalf("nc.JetStream: %v", err)
-	}
-	ctx, _, _ := remoteSpanCtx(t)
-
-	p := LegacyPublisher{JS: legacy, Operation: "repo.ops.publish"}
-	ack, err := p.Publish(ctx, &nats.Msg{Subject: "pub.repo", Data: []byte("payload")}, "leg-1")
-	if err != nil {
-		t.Fatalf("publish: %v", err)
-	}
-	if ack.Stream != testStream || ack.Duplicate {
-		t.Errorf("ack = %q dup=%v, want pub_v1 not-duplicate", ack.Stream, ack.Duplicate)
-	}
-
-	js, err := jetstream.New(nc)
-	if err != nil {
-		t.Fatalf("jetstream.New: %v", err)
-	}
-	stream, err := js.Stream(context.Background(), testStream)
-	if err != nil {
-		t.Fatalf("bind stream: %v", err)
-	}
-	stored, err := stream.GetMsg(context.Background(), ack.Sequence)
-	if err != nil {
-		t.Fatalf("get stored msg: %v", err)
-	}
-	if got := stored.Header.Get(nats.MsgIdHdr); got != "leg-1" {
-		t.Errorf("stored Nats-Msg-Id = %q, want leg-1", got)
-	}
-	if stored.Header.Get("traceparent") == "" {
-		t.Error("stored message has no traceparent; trace context was not injected on the legacy path")
-	}
-}
-
-// TestLegacyPublisherTimeoutBound: the legacy path bounds the PubAck wait by
-// Timeout too, so a publish to an unbound subject fails fast rather than
-// blocking on the caller's context.
-func TestLegacyPublisherTimeoutBound(t *testing.T) {
-	nc := newStreamConn(t)
-	legacy, err := nc.JetStream()
-	if err != nil {
-		t.Fatalf("nc.JetStream: %v", err)
-	}
-	p := LegacyPublisher{JS: legacy, Timeout: 500 * time.Millisecond}
-
-	start := time.Now()
-	if _, err := p.Publish(context.Background(), &nats.Msg{Subject: "unbound.subject", Data: []byte("x")}, "m"); err == nil {
-		t.Fatal("legacy publish to an unbound subject succeeded, want error")
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("legacy publish error took %v, want it bounded well under the default", elapsed)
+	spans := rec.Ended()
+	if len(spans) != 1 || spans[0].Status().Code != codes.Error {
+		t.Error("publish failure not recorded as a span error")
 	}
 }
