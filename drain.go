@@ -72,6 +72,25 @@ func IsTransientFetchErr(err error) bool {
 	return false
 }
 
+// IsTransientSubscribeErr reports whether a subscribe/create retry error is a
+// recoverable interruption. It is a superset of [IsTransientFetchErr]: a
+// retried subscribe also absorbs the stream not existing yet (rollout
+// ordering, where the consumer comes up before the service that ensures the
+// stream) and a JetStream API slow to answer the consumer-info/create request
+// (nats.ErrTimeout / context.DeadlineExceeded — deploy churn on this path,
+// unlike a fetch, where a timeout is an idle poll and a deadline can be a
+// wedged server).
+//
+// Keeping the set here rather than in each caller is the point: two services
+// already share these consumer loops, and the alert noise this package exists
+// to remove comes back the moment their classifications drift.
+func IsTransientSubscribeErr(err error) bool {
+	return IsTransientFetchErr(err) ||
+		errors.Is(err, nats.ErrStreamNotFound) ||
+		errors.Is(err, nats.ErrTimeout) ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
 // IsShutdownFetchErr reports whether a pull-consumer Fetch error is the benign
 // result of our own teardown: the connection was closed or drained underneath
 // the caller, with ctx already done. Those two errors are self-inflicted — the

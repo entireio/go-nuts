@@ -86,6 +86,36 @@ func TestIsTransientFetchErr(t *testing.T) {
 	}
 }
 
+func TestIsTransientSubscribeErr(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// Everything fetch-transient is subscribe-transient too.
+		{"connection closed", nats.ErrConnectionClosed, true},
+		{"no responders", nats.ErrNoResponders, true},
+
+		// The subscribe-path extras: rollout ordering and a slow JS API.
+		{"stream not found", nats.ErrStreamNotFound, true},
+		{"timeout", nats.ErrTimeout, true},
+		{"context deadline", context.DeadlineExceeded, true},
+		{"wrapped timeout", fmt.Errorf("subscribe: %w", nats.ErrTimeout), true},
+
+		// Still faults everywhere.
+		{"consumer deleted", nats.ErrConsumerDeleted, false},
+		{"unrelated", errors.New("boom"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsTransientSubscribeErr(tt.err); got != tt.want {
+				t.Errorf("IsTransientSubscribeErr(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 // The shutdown set is deliberately NARROWER than the transient set: only the
 // two self-inflicted teardown errors (closed, draining) may exit silently.
 // Pin that relationship — an earlier revision defined shutdown as "transient
