@@ -1,0 +1,79 @@
+<cross-session-message from="uds:/tmp/cc-socks/5789.sock" from-name="Tlog stream deprecation notice" from-mode="prompting">
+Handover for **COR-1226 — "Correct Datadog severity mapping for Go slog error logs"**, from the session that just closed COR-1223 (NATS 2.14.4 fleet upgrade). I confirmed the symptom live and found the mechanism, so you shouldn't need to re-derive any of this.
+
+Ticket: https://linear.app/entirehq/issue/COR-1226 · INC-49 follow-up · currently unassigned, Backlog.
+
+## The bug, and it's still live as of 2026-08-10 16:17Z
+
+Datadog indexes Go service logs as `status:info` regardless of actual severity, so any monitor filtering `status:error` is structurally incapable of firing. Confirmed against `kube_namespace:mirror-worker`, 364 matching lines in 4h, all 19 sampled show the same thing:
+
+```
+message: 2026/08/10 16:10:46 WARN Permanent sync error, terminating
+         error="sync: list source refs: ... http 404 ... Repository not found."
+status:  info          <- should be warn
+custom.status: ""      <- empty string
+```
+
+Not one line was correctly classified.
+
+## Mechanism — two compounding causes, NOT a simple remapper
+
+**1. slog is using the TEXT handler, not JSON.** Severity is embedded inside the message string (`... 16:10:46 WARN Permanent sync error ...`), so there is no structured `level` attribute to remap. I queried `@level:ERROR` first and got **zero** results — that field does not exist. Don't waste time on a status remapper keyed to `level`; there's nothing to key on.
+
+**2. Logs arrive via OTLP, not the Datadog agent file tailer.** Tags on every line: `source:otlp_log_ingestion`, `otel_source:datadog_exporter`. `custom.status` comes through as an empty string and Datadog falls back to `info`.
+
+So there's a real fork in the road, and it's a design decision rather than a config tweak:
+- switch services to slog's **JSON handler** so severity becomes structured, then remap (cleanest, touches every Go service)
+- fix severity at the **OTel collector** so OTLP `SeverityNumber` / status is populated (one place, no service changes — probably the best lead)
+- **grok/category processor** parsing the level back out of message text (ugliest, no service changes, works today)
+
+## Where pipeline code lives
+
+`catalog/modules/datadog-cloudflare-logs-pipeline/` in `entirehq/infra` is the working precedent — `datadog_logs_custom_pipeline` with `category_processor` → scratch field → status remap, and its comments explain the first-match ordering. Copy that shape.
+
+There is **no equivalent module for Go/k8s logs**. I searched the whole infra repo for `status_remapper` and `logs_pipeline`: zero hits outside that Cloudflare module. So you're creating something new, not editing something existing.
+
+Fleet-side, the OTel collector docs are `docs/operator-guide/otel-collector.md` (gateway + agent architecture, enrichment processors, filter rationale) — that's where option 2 would land.
+
+## The second half of the ticket: reviewing status:error monitors
+
+43 matches for `status:error` in `entirehq/infra`. Needs filtering before you trust the number — some are APM/trace queries where `status:error` is a span attribute and works correctly, and some are docs/dashboards. The real candidates are LOG monitors on GO services:
+- `catalog/modules/datadog-entire-core/` — monitor_oauth_errors, monitor_token_errors, monitor_nats_consumer_errors, monitor_perms_sweep_error_logs, monitor_spicedb_permission_errors, monitor_request_error_rate
+- `catalog/modules/datadog-entiredb-health-fleet/` — monitor_fsck_errors, monitor_diss_errors, monitor_taskloop_errors, monitor_admin_grpc_errors
+- `catalog/modules/datadog-entire-mcp/` — monitor_request_errors, monitor_token_exchange_errors
+- `catalog/modules/datadog-marvin-health/stream_text_errors.tf`, `datadog-search/`, `datadog-ai-gateway-health/monitor_errors.tf`
+
+The uncomfortable framing worth putting in the ticket: **those monitors are green today because they match nothing.**
+
+## Do NOT break the existing workaround
+
+Every monitor that currently works matches literal message text, never status. Examples verified live in Datadog:
+- `[k8s] NATS JetStream stream wedged — cannot write, PAGE (prod)` id 309685807 → `logs("... \"is not current: stream write error\"")`
+- `[k8s] NATS config reload rejected (prod)` id 305465599 → `logs("... \"Failed to reload server configuration\"")`
+
+These keep working after your fix; they just stop being the only option. Don't "modernise" them to `status:error` in the same change — that couples a working detection path to an unproven one.
+
+## Related gotcha in the same family (already fixed, but instructive)
+
+Datadog auto-injects its own `priority:pN` tag, which won `$TAGS[priority]` and meant **no Datadog alert could page or be silenced at all** until 2026-07-30. Fix was infra#1009, renaming the tier tag to `alert_tier:`. Writeup in `catalog/modules/datadog-incident-io-webhook/main.tf`, routing table in `incident-io/README.md`. Same root pattern as your bug: Datadog silently overriding a user-supplied field. Expect more.
+
+## Verification advice — this is the part I'd insist on
+
+Verify by confirming a known ERROR line actually indexes as `status:error`. Do **not** verify by "the monitor fires" or "the pipeline applied". A filter that matches nothing is indistinguishable from a clean result, and that is precisely the bug you are fixing — it would be easy to ship a fix and confirm it with a check that couldn't fail.
+
+I hit that trap three times in one session today: a kubectl label selector matching no pods (reported 0 errors, examined nothing), `grep -c` on single-line output returning 1 regardless of match count, and grepping `permissions violation` when NATS actually logs `Publish Violation`. The last one nearly buried a real ACL bug (COR-1224). I wrote the general trap into `docs/runbooks/nats-server-upgrade.md` §3a in the fleet repo if you want the phrasing.
+
+## Why this matters more than its priority suggests
+
+INC-49: 50,899 failure logs indexed as info. From the incident Slack writeup — *"Every status:error monitor on our Go services cannot fire — Datadog indexes slog ERROR as status:info. Currently untracked. This is half of why today took 97 minutes."* nats-server had been logging the exact fault since its second minute; responders reached that diagnosis 52 minutes later.
+
+It also constrains other INC-49 work: any new log-based monitor must match on message text until this is fixed. COR-1102's sticky-write alert was written that way deliberately for this reason.
+
+## Context you may want
+
+- COR-1223 (NATS 2.14.4) closed today, all 7 clusters upgraded. COR-1224 (webhooks_github_v1 $JS.ACK grants) fixed and merged. COR-1225 and COR-1227 closed as duplicates of already-shipped work (COR-1102 and COR-1088).
+- INC-49 has 3 outstanding follow-ups after that: COR-1087 (shrink webhook NATS messages), COR-1091 (document GitHub App credentials), and yours.
+- Note for prod cluster access: the plain prod kubectl contexts cannot `create pods/portforward` — use the `-admin` variants. The failure looks like `HTTP 000` / a bad URL rather than an RBAC denial, which cost me time.
+
+Ask if you want anything I dug up in more detail — I still have the session context.
+</cross-session-message>

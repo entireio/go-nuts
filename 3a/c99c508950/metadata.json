@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.8.43-nightly.202607240658.62648465f+dirty",
+  "checkpoint_id": "3ac99c508950",
+  "strategy": "manual-commit",
+  "branch": "nodo/transient-fetch-err-classification",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "drain.go",
+    "drain_test.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/3a/c99c508950/0/metadata.json",
+      "transcript": "/3a/c99c508950/0/full.jsonl",
+      "compact_transcript": "/3a/c99c508950/0/transcript.jsonl",
+      "content_hash": "/3a/c99c508950/0/content_hash.txt",
+      "prompt": "/3a/c99c508950/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 376,
+    "cache_creation_tokens": 368586,
+    "cache_read_tokens": 41268361,
+    "output_tokens": 142947,
+    "api_call_count": 172
+  }
+}
