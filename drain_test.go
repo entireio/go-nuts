@@ -28,6 +28,21 @@ func TestIsShutdownFetchErr(t *testing.T) {
 		{"unrelated error during shutdown", done, nats.ErrTimeout, false},
 		{"nil error during shutdown", done, nil, false},
 		{"closed while still running", live, nats.ErrConnectionClosed, false},
+
+		// The failures a rolling pod restart actually produces. Before these
+		// were recognised, a drain that ended in ErrNoResponders rather than
+		// ErrConnectionClosed was logged as a fault by every caller.
+		{"no responders during shutdown", done, nats.ErrNoResponders, true},
+		{"fetch disconnected during shutdown", done, nats.ErrFetchDisconnected, true},
+		{"leadership changed during shutdown", done, nats.ErrConsumerLeadershipChanged, true},
+		{"consumer deleted during shutdown", done, nats.ErrConsumerDeleted, true},
+		{"server disconnected during shutdown", done, nats.ErrDisconnected, true},
+		{"wrapped no responders during shutdown", done, fmt.Errorf("fetch: %w", nats.ErrNoResponders), true},
+
+		// Still running: recoverable, but not OUR teardown. Callers must keep
+		// looping rather than exit, so this stays false.
+		{"no responders while still running", live, nats.ErrNoResponders, false},
+		{"leadership changed while still running", live, nats.ErrConsumerLeadershipChanged, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -35,6 +50,56 @@ func TestIsShutdownFetchErr(t *testing.T) {
 				t.Errorf("IsShutdownFetchErr = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestIsTransientFetchErr(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"connection closed", nats.ErrConnectionClosed, true},
+		{"connection draining", nats.ErrConnectionDraining, true},
+		{"server disconnected", nats.ErrDisconnected, true},
+		{"no responders", nats.ErrNoResponders, true},
+		{"fetch disconnected", nats.ErrFetchDisconnected, true},
+		{"consumer leadership changed", nats.ErrConsumerLeadershipChanged, true},
+		{"consumer deleted", nats.ErrConsumerDeleted, true},
+		{"wrapped", fmt.Errorf("fetch: %w", nats.ErrFetchDisconnected), true},
+
+		// Excluded on purpose — see the doc comment. An idle poll is the
+		// steady state of a quiet consumer, and a deadline is too ambiguous to
+		// swallow: a slow server and a wedged one produce the same error.
+		{"idle poll timeout", nats.ErrTimeout, false},
+		{"context deadline", context.DeadlineExceeded, false},
+		{"unrelated", errors.New("boom"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsTransientFetchErr(tt.err); got != tt.want {
+				t.Errorf("IsTransientFetchErr(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// IsShutdownFetchErr is defined as "transient AND ctx done". Pin that
+// relationship so the two predicates cannot drift apart: widening the transient
+// set must widen the shutdown set with it, which is the bug that let a drain
+// ending in ErrNoResponders read as a fault.
+func TestShutdownFetchErrIsTransientPlusCtx(t *testing.T) {
+	done, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	for _, err := range transientFetchErrs {
+		if !IsShutdownFetchErr(done, err) {
+			t.Errorf("IsShutdownFetchErr(done, %v) = false, want true for every transient error", err)
+		}
+		if IsShutdownFetchErr(t.Context(), err) {
+			t.Errorf("IsShutdownFetchErr(live, %v) = true, want false while still running", err)
+		}
 	}
 }
 
