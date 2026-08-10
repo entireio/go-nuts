@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.8.43-nightly.202607240658.62648465f+dirty",
+  "checkpoint_id": "64053c53db8e",
+  "strategy": "manual-commit",
+  "branch": "nodo/cor-1228-classification-fixes",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "drain.go",
+    "drain_test.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/64/053c53db8e/0/metadata.json",
+      "transcript": "/64/053c53db8e/0/full.jsonl",
+      "compact_transcript": "/64/053c53db8e/0/transcript.jsonl",
+      "content_hash": "/64/053c53db8e/0/content_hash.txt",
+      "prompt": ""
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 76,
+    "cache_creation_tokens": 60241,
+    "cache_read_tokens": 16625208,
+    "output_tokens": 34491,
+    "api_call_count": 41
+  }
+}
