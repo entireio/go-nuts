@@ -15,23 +15,74 @@ import (
 // callers never inherit an ambiguous asynchronous drain.
 var ErrDrainTimeout = errors.New("nuts: NATS drain timed out before close")
 
+// transientFetchErrs are the pull-consumer failures a caller recovers from by
+// resubscribing: the link to the server went away, or the consumer moved. None
+// of them indicate a fault in the caller, and none require operator action —
+// the subscribe loop reconnects with backoff and carries on.
+//
+// The set is drawn from what a rolling restart actually produces. During one
+// mirror-pipeline deploy a single pod contributed 57 ErrNoResponders inside 83
+// milliseconds as its in-flight fetches failed together; a NATS server upgrade
+// produced the same shape via ErrFetchDisconnected and
+// ErrConsumerLeadershipChanged. Logged at error level these bursts cross a
+// cluster's error-log alert threshold on their own, which trains operators to
+// discount the one signal that should mean something (COR-1226 / COR-1228).
+var transientFetchErrs = []error{
+	nats.ErrConnectionClosed,
+	nats.ErrConnectionDraining,
+	nats.ErrDisconnected,
+	nats.ErrNoResponders,
+	nats.ErrFetchDisconnected,
+	nats.ErrConsumerLeadershipChanged,
+	nats.ErrConsumerDeleted,
+}
+
+// IsTransientFetchErr reports whether a pull-consumer Fetch or subscribe error
+// is a recoverable interruption — a dropped link, a drained connection, a
+// consumer that moved or was recreated — rather than a fault. It is
+// independent of shutdown: a NATS server rolling underneath a healthy caller
+// produces these while ctx is still live.
+//
+// Callers should log these below error level. The distinction that matters for
+// alerting is not "did a fetch fail" but "did it stop recovering", and a single
+// interrupted fetch cannot answer that.
+//
+// nats.ErrTimeout is deliberately absent: an idle poll reaching MaxWait is the
+// steady state of a quiet consumer, not an interruption, and callers already
+// treat it as a continue. context.DeadlineExceeded is absent too — it is
+// ambiguous enough (a slow server and a wedged one look alike) that swallowing
+// it would hide real stalls.
+func IsTransientFetchErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	for _, target := range transientFetchErrs {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsShutdownFetchErr reports whether a pull-consumer Fetch error is the benign
-// result of the connection being drained/closed during shutdown rather than a
-// real fault. It is only "clean" when ctx is already done — a mid-run
-// connection loss (ctx still live) is a genuine error worth logging.
+// result of our own teardown rather than a real fault: a transient interruption
+// (see [IsTransientFetchErr]) observed when ctx is already done. A mid-run
+// interruption with ctx still live is not "clean" — it is recoverable, which is
+// a different thing, and the caller should keep looping rather than return.
 //
 // Use it to gate the error log in a fetch loop:
 //
 //	msgs, err := sub.Fetch(1, nats.MaxWait(5*time.Second))
 //	if err != nil {
-//		if errors.Is(err, nats.ErrTimeout) || nuts.IsShutdownFetchErr(ctx, err) {
-//			// benign: idle poll, or a drain/close during shutdown
+//		switch {
+//		case errors.Is(err, nats.ErrTimeout):        // idle poll
+//		case nuts.IsShutdownFetchErr(ctx, err):      // our teardown; exit quietly
+//		case nuts.IsTransientFetchErr(err):          // link blipped; warn and retry
+//		default:                                     // genuine fault; error
 //		}
-//		...
 //	}
 func IsShutdownFetchErr(ctx context.Context, err error) bool {
-	return ctx.Err() != nil &&
-		(errors.Is(err, nats.ErrConnectionClosed) || errors.Is(err, nats.ErrConnectionDraining))
+	return ctx.Err() != nil && IsTransientFetchErr(err)
 }
 
 // Drain drains nc and waits (bounded by timeout) for it to flush pending
