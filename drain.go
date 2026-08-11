@@ -27,6 +27,13 @@ var ErrDrainTimeout = errors.New("nuts: NATS drain timed out before close")
 // ErrConsumerLeadershipChanged. Logged at error level these bursts cross a
 // cluster's error-log alert threshold on their own, which trains operators to
 // discount the one signal that should mean something (COR-1226 / COR-1228).
+//
+// nats.ErrConsumerDeleted is deliberately absent. Resubscribing does "recover"
+// from it — but by silently recreating the durable with the subscriber's
+// default deliver policy and no ack state, which replays the stream's retained
+// backlog into downstream systems. A durable that disappears mid-run is
+// operator action or a bug, never infrastructure churn, and the log that
+// surfaces it is the only evidence of the deletion.
 var transientFetchErrs = []error{
 	nats.ErrConnectionClosed,
 	nats.ErrConnectionDraining,
@@ -34,7 +41,6 @@ var transientFetchErrs = []error{
 	nats.ErrNoResponders,
 	nats.ErrFetchDisconnected,
 	nats.ErrConsumerLeadershipChanged,
-	nats.ErrConsumerDeleted,
 }
 
 // IsTransientFetchErr reports whether a pull-consumer Fetch or subscribe error
@@ -47,11 +53,13 @@ var transientFetchErrs = []error{
 // alerting is not "did a fetch fail" but "did it stop recovering", and a single
 // interrupted fetch cannot answer that.
 //
-// nats.ErrTimeout is deliberately absent: an idle poll reaching MaxWait is the
-// steady state of a quiet consumer, not an interruption, and callers already
-// treat it as a continue. context.DeadlineExceeded is absent too — it is
-// ambiguous enough (a slow server and a wedged one look alike) that swallowing
-// it would hide real stalls.
+// nats.ErrTimeout and context.DeadlineExceeded are deliberately absent, and
+// the reason is fetch-path-specific: an idle poll reaching MaxWait is the
+// steady state of a quiet consumer, and a fetch deadline can be a wedged
+// server as easily as a slow one. On a subscribe/create retry path the same
+// timeout usually IS deploy churn (a slow JetStream API during an upgrade),
+// but this predicate cannot see which path it is on — callers that retry
+// subscription setup must classify timeouts themselves.
 func IsTransientFetchErr(err error) bool {
 	if err == nil {
 		return false
@@ -64,25 +72,52 @@ func IsTransientFetchErr(err error) bool {
 	return false
 }
 
+// IsTransientSubscribeErr reports whether a subscribe/create retry error is a
+// recoverable interruption. It is a superset of [IsTransientFetchErr]: a
+// retried subscribe also absorbs the stream not existing yet (rollout
+// ordering, where the consumer comes up before the service that ensures the
+// stream) and a JetStream API slow to answer the consumer-info/create request
+// (nats.ErrTimeout / context.DeadlineExceeded — deploy churn on this path,
+// unlike a fetch, where a timeout is an idle poll and a deadline can be a
+// wedged server).
+//
+// Keeping the set here rather than in each caller is the point: two services
+// already share these consumer loops, and the alert noise this package exists
+// to remove comes back the moment their classifications drift.
+func IsTransientSubscribeErr(err error) bool {
+	return IsTransientFetchErr(err) ||
+		errors.Is(err, nats.ErrStreamNotFound) ||
+		errors.Is(err, nats.ErrTimeout) ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
 // IsShutdownFetchErr reports whether a pull-consumer Fetch error is the benign
-// result of our own teardown rather than a real fault: a transient interruption
-// (see [IsTransientFetchErr]) observed when ctx is already done. A mid-run
-// interruption with ctx still live is not "clean" — it is recoverable, which is
-// a different thing, and the caller should keep looping rather than return.
+// result of our own teardown: the connection was closed or drained underneath
+// the caller, with ctx already done. Those two errors are self-inflicted — the
+// shutdown path drains the connection on purpose — so exiting without a log is
+// honest.
+//
+// It is intentionally narrower than [IsTransientFetchErr]. The other
+// interruptions can coincide with shutdown while meaning something real: a
+// fetch that dies with ErrConsumerDeleted during a rolling deploy is the only
+// evidence somebody deleted the durable, and swallowing it because ctx
+// happened to be done leaves the redelivery storm after restart unexplained.
+// Callers should log those (IsTransientFetchErr picks the severity) rather
+// than exit silently.
 //
 // Use it to gate the error log in a fetch loop:
 //
 //	msgs, err := sub.Fetch(1, nats.MaxWait(5*time.Second))
 //	if err != nil {
 //		switch {
-//		case errors.Is(err, nats.ErrTimeout):        // idle poll
-//		case nuts.IsShutdownFetchErr(ctx, err):      // our teardown; exit quietly
-//		case nuts.IsTransientFetchErr(err):          // link blipped; warn and retry
-//		default:                                     // genuine fault; error
+//		case errors.Is(err, nats.ErrTimeout):   // idle poll; keep fetching
+//		case nuts.IsShutdownFetchErr(ctx, err): // our teardown; exit quietly
+//		default:                                // log it; IsTransientFetchErr picks the severity
 //		}
 //	}
 func IsShutdownFetchErr(ctx context.Context, err error) bool {
-	return ctx.Err() != nil && IsTransientFetchErr(err)
+	return ctx.Err() != nil &&
+		(errors.Is(err, nats.ErrConnectionClosed) || errors.Is(err, nats.ErrConnectionDraining))
 }
 
 // Drain drains nc and waits (bounded by timeout) for it to flush pending

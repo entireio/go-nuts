@@ -29,15 +29,15 @@ func TestIsShutdownFetchErr(t *testing.T) {
 		{"nil error during shutdown", done, nil, false},
 		{"closed while still running", live, nats.ErrConnectionClosed, false},
 
-		// The failures a rolling pod restart actually produces. Before these
-		// were recognised, a drain that ended in ErrNoResponders rather than
-		// ErrConnectionClosed was logged as a fault by every caller.
-		{"no responders during shutdown", done, nats.ErrNoResponders, true},
-		{"fetch disconnected during shutdown", done, nats.ErrFetchDisconnected, true},
-		{"leadership changed during shutdown", done, nats.ErrConsumerLeadershipChanged, true},
-		{"consumer deleted during shutdown", done, nats.ErrConsumerDeleted, true},
-		{"server disconnected during shutdown", done, nats.ErrDisconnected, true},
-		{"wrapped no responders during shutdown", done, fmt.Errorf("fetch: %w", nats.ErrNoResponders), true},
+		// Transient but not self-inflicted: these can coincide with shutdown
+		// while meaning something real (a durable deleted mid-deploy, JetStream
+		// losing quorum as we exit), so they must not be swallowed — callers
+		// log them and IsTransientFetchErr picks the severity.
+		{"no responders during shutdown", done, nats.ErrNoResponders, false},
+		{"fetch disconnected during shutdown", done, nats.ErrFetchDisconnected, false},
+		{"leadership changed during shutdown", done, nats.ErrConsumerLeadershipChanged, false},
+		{"consumer deleted during shutdown", done, nats.ErrConsumerDeleted, false},
+		{"server disconnected during shutdown", done, nats.ErrDisconnected, false},
 
 		// Still running: recoverable, but not OUR teardown. Callers must keep
 		// looping rather than exit, so this stays false.
@@ -65,12 +65,13 @@ func TestIsTransientFetchErr(t *testing.T) {
 		{"no responders", nats.ErrNoResponders, true},
 		{"fetch disconnected", nats.ErrFetchDisconnected, true},
 		{"consumer leadership changed", nats.ErrConsumerLeadershipChanged, true},
-		{"consumer deleted", nats.ErrConsumerDeleted, true},
 		{"wrapped", fmt.Errorf("fetch: %w", nats.ErrFetchDisconnected), true},
 
-		// Excluded on purpose — see the doc comment. An idle poll is the
-		// steady state of a quiet consumer, and a deadline is too ambiguous to
-		// swallow: a slow server and a wedged one produce the same error.
+		// Excluded on purpose — see the doc comment. A deleted durable is
+		// operator action whose only evidence is this log line; an idle poll is
+		// the steady state of a quiet consumer; a fetch deadline is too
+		// ambiguous to swallow (a slow server and a wedged one look alike).
+		{"consumer deleted", nats.ErrConsumerDeleted, false},
 		{"idle poll timeout", nats.ErrTimeout, false},
 		{"context deadline", context.DeadlineExceeded, false},
 		{"unrelated", errors.New("boom"), false},
@@ -85,17 +86,49 @@ func TestIsTransientFetchErr(t *testing.T) {
 	}
 }
 
-// IsShutdownFetchErr is defined as "transient AND ctx done". Pin that
-// relationship so the two predicates cannot drift apart: widening the transient
-// set must widen the shutdown set with it, which is the bug that let a drain
-// ending in ErrNoResponders read as a fault.
-func TestShutdownFetchErrIsTransientPlusCtx(t *testing.T) {
+func TestIsTransientSubscribeErr(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// Everything fetch-transient is subscribe-transient too.
+		{"connection closed", nats.ErrConnectionClosed, true},
+		{"no responders", nats.ErrNoResponders, true},
+
+		// The subscribe-path extras: rollout ordering and a slow JS API.
+		{"stream not found", nats.ErrStreamNotFound, true},
+		{"timeout", nats.ErrTimeout, true},
+		{"context deadline", context.DeadlineExceeded, true},
+		{"wrapped timeout", fmt.Errorf("subscribe: %w", nats.ErrTimeout), true},
+
+		// Still faults everywhere.
+		{"consumer deleted", nats.ErrConsumerDeleted, false},
+		{"unrelated", errors.New("boom"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsTransientSubscribeErr(tt.err); got != tt.want {
+				t.Errorf("IsTransientSubscribeErr(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// The shutdown set is deliberately NARROWER than the transient set: only the
+// two self-inflicted teardown errors (closed, draining) may exit silently.
+// Pin that relationship — an earlier revision defined shutdown as "transient
+// AND ctx done", which silently discarded the one log line proving a durable
+// was deleted mid-deploy.
+func TestShutdownFetchErrNarrowerThanTransient(t *testing.T) {
 	done, cancel := context.WithCancel(t.Context())
 	cancel()
 
 	for _, err := range transientFetchErrs {
-		if !IsShutdownFetchErr(done, err) {
-			t.Errorf("IsShutdownFetchErr(done, %v) = false, want true for every transient error", err)
+		selfInflicted := errors.Is(err, nats.ErrConnectionClosed) || errors.Is(err, nats.ErrConnectionDraining)
+		if got := IsShutdownFetchErr(done, err); got != selfInflicted {
+			t.Errorf("IsShutdownFetchErr(done, %v) = %v, want %v — only our own teardown exits silently", err, got, selfInflicted)
 		}
 		if IsShutdownFetchErr(t.Context(), err) {
 			t.Errorf("IsShutdownFetchErr(live, %v) = true, want false while still running", err)
