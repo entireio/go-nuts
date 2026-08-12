@@ -1,0 +1,30 @@
+{
+  "cli_version": "0.9.0",
+  "checkpoint_id": "a8ffe0335a27",
+  "strategy": "manual-commit",
+  "branch": "nodo/ent-1601-jsconsumer-retry-schedule",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "README.md",
+    "jsconsumer/jsconsumer.go",
+    "jsconsumer/retry.go",
+    "jsconsumer/retry_test.go",
+    "jsconsumer/zz_probe_test.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/a8/ffe0335a27/0/metadata.json",
+      "transcript": "/a8/ffe0335a27/0/full.jsonl",
+      "compact_transcript": "/a8/ffe0335a27/0/transcript.jsonl",
+      "content_hash": "/a8/ffe0335a27/0/content_hash.txt",
+      "prompt": "/a8/ffe0335a27/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 33,
+    "cache_creation_tokens": 115221,
+    "cache_read_tokens": 1475369,
+    "output_tokens": 15514,
+    "api_call_count": 17
+  }
+}
