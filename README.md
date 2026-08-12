@@ -132,10 +132,13 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
   against the durable's real server-side config. Compile it in rather
   than restating the arithmetic; duplicated timing maths is exactly how
   ENT-1535's consumer came to advertise 17h45m while really taking 34h22m.
-  Checks the cumulative ladder against `MaxTimeToDeadLetter` and the stream's
-  `maxAge`, `ackWait` against `backOff[0]`, rung count against `maxDeliver`,
-  the recovery envelope against the breaker threshold, and both ladders being
-  set at once. Zero fields are "unknown" and skip their checks, so a caller
+  Checks the cumulative ladder against `MaxTimeToDeadLetter`, `ackWait` against
+  `backOff[0]`, rung count against `maxDeliver`, the recovery envelope against
+  the breaker threshold, a breaker threshold the ladder can never reach, and
+  both ladders being set at once. It also checks the ladder against the
+  stream's `maxAge` — `Start` fills that in from live stream info, since a
+  ladder outliving retention means the message is discarded before it can be
+  captured. Zero fields are "unknown" and skip their checks, so a caller
   that knows only part of a config still gets everything that part supports.
   `Validate` returns every violation for a merge-time report; `Err` folds them
   into one error.

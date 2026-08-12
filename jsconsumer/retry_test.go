@@ -1679,3 +1679,96 @@ func TestSettleActuallyServesTheServerLadder(t *testing.T) {
 		t.Errorf("captured %d messages; a message riding the ladder must not reach the DLQ early", n)
 	}
 }
+
+// TestValidateLeavesUntouchedConsumersAlone is the regression for a validator
+// that grew teeth and bit consumers that had adopted nothing. A durable with
+// no Retry and no ladder has nothing to be coherent ABOUT, and MaxDeliver -1
+// is the module's own spelling of "unlimited" — it must not become a hard
+// startup failure because this package learned to check schedules.
+func TestValidateLeavesUntouchedConsumersAlone(t *testing.T) {
+	onMsg := func(jetstream.Msg) {}
+	base := Config{Stream: "s_v1", Durable: "d", Name: "legacy"}
+
+	for _, maxDeliver := range []int{-1, 0, 3} {
+		cfg := base
+		cfg.MaxDeliver = maxDeliver
+		if err := cfg.validate(nil, onMsg); err != nil && !strings.Contains(err.Error(), "nil nats conn") {
+			t.Errorf("validate(MaxDeliver %d, no Retry, no BackOff) = %v, want no schedule opinion", maxDeliver, err)
+		}
+	}
+
+	// Unlimited stays legal once a ladder IS declared: there is simply no
+	// terminal branch, so the duration checks have nothing to bound.
+	unlimited := base
+	unlimited.MaxDeliver, unlimited.AckWait = UnlimitedMaxDeliver, time.Minute
+	unlimited.BackOff = []time.Duration{time.Minute, 2 * time.Minute}
+	if err := unlimited.validate(nil, onMsg); err != nil && !strings.Contains(err.Error(), "nil nats conn") {
+		t.Errorf("validate(unlimited + ladder) = %v, want it accepted", err)
+	}
+
+	// But a value below the sentinel is still nonsense.
+	bad := unlimited
+	bad.MaxDeliver = -2
+	if err := bad.validate(nil, onMsg); err == nil || !strings.Contains(err.Error(), "MaxDeliver") {
+		t.Errorf("validate(MaxDeliver -2) = %v, want a MaxDeliver rejection", err)
+	}
+}
+
+// TestMaxDeliverMismatchReportsItself: the schedule check runs after the
+// cross-check, so a genuine mismatch says so instead of surfacing as generic
+// incoherence.
+func TestMaxDeliverMismatchReportsItself(t *testing.T) {
+	r, _ := newTestRetry(t, nil) // MaxDeliver 6
+	cfg := Config{
+		Stream: "repo_refs_v1", Durable: "d", Name: "c",
+		AckWait: 5 * time.Minute, MaxDeliver: 7, BackOff: testLadder(), Retry: r,
+	}
+	err := cfg.validate(nil, func(jetstream.Msg) {})
+	if err == nil || !strings.Contains(err.Error(), "they must match") {
+		t.Fatalf("validate(mismatch) = %v, want the specific cross-check message", err)
+	}
+	if strings.Contains(err.Error(), "incoherent retry schedule") {
+		t.Error("a MaxDeliver mismatch surfaced as generic schedule incoherence")
+	}
+}
+
+// TestStartChecksTheLadderAgainstStreamRetention: a ladder that outlives the
+// stream's max_age never reaches its own dead-letter branch — the stream
+// discards the message first, which is silent data loss wearing a retry
+// policy. Config.validate cannot see it (retention is server state), so Start
+// re-runs the schedule check with the real number.
+func TestStartChecksTheLadderAgainstStreamRetention(t *testing.T) {
+	nc, js := runTestEnv(t)
+	if _, err := js.CreateStream(t.Context(), jetstream.StreamConfig{
+		Name: "short_v1", Subjects: []string{"short.>"}, MaxAge: 10 * time.Minute,
+	}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	r, _ := newTestRetry(t, func(c *RetryConfig) { c.Monitor, c.Breaker = nil, BreakerObserve })
+	cfg := Config{
+		Stream: "short_v1", Durable: "d", Name: "c",
+		AckWait: 5 * time.Minute, MaxDeliver: 6, BackOff: testLadder(), Retry: r,
+	}
+	// The schedule is coherent on its own — 20m to dead-letter, no bound set.
+	if err := cfg.validate(nc, func(jetstream.Msg) {}); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	// Against a 10-minute stream it is not.
+	_, err := Start(t.Context(), nc, cfg, func(jetstream.Msg) {})
+	if err == nil || !strings.Contains(err.Error(), "StreamMaxAge") {
+		t.Fatalf("Start = %v, want the ladder rejected against 10m retention", err)
+	}
+
+	// Roomy retention, same consumer, accepted.
+	if _, err := js.CreateStream(t.Context(), jetstream.StreamConfig{
+		Name: "long_v1", Subjects: []string{"long.>"}, MaxAge: 6 * time.Hour,
+	}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	cfg.Stream = "long_v1"
+	run, err := Start(t.Context(), nc, cfg, func(jetstream.Msg) {})
+	if err != nil {
+		t.Fatalf("Start(roomy retention): %v", err)
+	}
+	run.Stop()
+}

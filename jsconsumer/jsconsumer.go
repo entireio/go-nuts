@@ -263,13 +263,6 @@ func (c Config) validate(nc *nats.Conn, onMsg func(jetstream.Msg)) error {
 	if c.InactiveThreshold < 0 {
 		return fmt.Errorf("jsconsumer(%s): InactiveThreshold must not be negative", c.Name)
 	}
-	// The whole retry schedule — the server's ladder plus whatever the Retry
-	// expects of it — is checked in one place, by the same function fleet CI
-	// runs over a rendered Consumer CR and a future bind-only mode will run
-	// against the durable's live config. See [Schedule].
-	if err := c.schedule().Err(); err != nil {
-		return fmt.Errorf("jsconsumer(%s): %w", c.Name, err)
-	}
 	if c.FloorMonitor != nil && c.Retry != nil && c.Retry.Monitor() != nil && c.FloorMonitor != c.Retry.Monitor() {
 		return fmt.Errorf("jsconsumer(%s): %w", c.Name, errMonitorConflict)
 	}
@@ -279,6 +272,22 @@ func (c Config) validate(nc *nats.Conn, onMsg func(jetstream.Msg)) error {
 		// terminal branch is the DLQ capture, so the disagreement is a lost
 		// message rather than a late one.
 		return fmt.Errorf("jsconsumer(%s): Retry MaxDeliver is %d but the consumer's is %d: they must match or the dead-letter branch misses the broker's final delivery", c.Name, c.Retry.MaxDeliver(), c.EffectiveMaxDeliver())
+	}
+	// The whole retry schedule — the server's ladder plus whatever the Retry
+	// expects of it — is checked in one place, by the same function fleet CI
+	// runs over a rendered Consumer CR and a future bind-only mode will run
+	// against the durable's live config. See [Schedule].
+	//
+	// Only for a consumer that opted into one of them. A durable that carries
+	// neither a Retry nor a ladder has nothing here to be coherent about, and
+	// must not acquire a new way to fail at startup because this package grew
+	// a validator. It runs AFTER the cross-check above so a genuine
+	// MaxDeliver mismatch reports as itself rather than as generic
+	// incoherence.
+	if c.Retry != nil || len(c.BackOff) > 0 {
+		if err := c.schedule().Err(); err != nil {
+			return fmt.Errorf("jsconsumer(%s): %w", c.Name, err)
+		}
 	}
 	if nc == nil {
 		return fmt.Errorf("jsconsumer(%s): nil nats conn", c.Name)
@@ -304,7 +313,7 @@ func (c Config) floorMonitor() *FloorMonitor {
 func (c Config) schedule() Schedule {
 	s := Schedule{
 		ServerBackOff: c.BackOff,
-		MaxDeliver:    c.EffectiveMaxDeliver(),
+		MaxDeliver:    max(c.EffectiveMaxDeliver(), 0), // unlimited reads as "no terminal branch"
 		AckWait:       c.EffectiveAckWait(),
 	}
 	if c.Retry != nil {
@@ -313,6 +322,35 @@ func (c Config) schedule() Schedule {
 		s.RecoverBy, s.FloorAge = exp.RecoverBy, exp.FloorAge
 	}
 	return s
+}
+
+// checkAgainstStream re-runs the schedule check with the stream's retention
+// filled in, which [Config.validate] cannot know: a ladder that outlives
+// max_age never reaches its own dead-letter branch, because the stream
+// discards the message first. That is silent data loss dressed as a retry
+// policy, and it is only visible with both halves in hand.
+//
+// Unreadable stream info is not fatal. The stream may legitimately not exist
+// yet — the declarative-provisioning race [Run] is built to ride out — and
+// consumer creation below reports that far better than a retention probe can.
+func (c Config) checkAgainstStream(ctx context.Context, js jetstream.JetStream) error {
+	if c.Retry == nil && len(c.BackOff) == 0 {
+		return nil
+	}
+	stream, err := js.Stream(ctx, c.Stream)
+	if err != nil {
+		return nil //nolint:nilerr // absent or unreadable stream is CreateOrUpdateConsumer's error to report, not this check's
+	}
+	info, err := stream.Info(ctx)
+	if err != nil || info == nil {
+		return nil //nolint:nilerr // see above
+	}
+	sched := c.schedule()
+	sched.StreamMaxAge = info.Config.MaxAge
+	if err := sched.Err(); err != nil {
+		return fmt.Errorf("jsconsumer(%s): %w", c.Name, err)
+	}
+	return nil
 }
 
 func (c Config) tracer() trace.Tracer {
@@ -395,6 +433,9 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 	js, err := jetstream.New(nc)
 	if err != nil {
 		return nil, fmt.Errorf("jsconsumer(%s): jetstream.New: %w", cfg.Name, err)
+	}
+	if err := cfg.checkAgainstStream(ctx, js); err != nil {
+		return nil, err
 	}
 	cons, err := js.CreateOrUpdateConsumer(ctx, cfg.Stream, jetstream.ConsumerConfig{
 		Durable:           cfg.Durable,

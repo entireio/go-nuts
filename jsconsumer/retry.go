@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -472,15 +473,20 @@ type RetryConfig struct {
 // a short ladder — [Schedule.TimeToDeadLetter] accounts for that, and it is
 // the number to reason about.
 //
-// Worth seeing plainly in these numbers: with a ladder this tight the breaker
-// has almost no room. RecoverBy 4 requires FloorAge above 15 minutes, and the
-// ladder dead-letters at 20 — so the breaker can only fire on the very
-// delivery exhaustion would have handled anyway, and accelerates nothing. The
-// schedule is valid and Start accepts it; the breaker simply is not earning
-// its keep here. That is not an accident of this example, it is the general
-// case for a bounded ladder, and it is the substance of why the breaker ships
-// observe-only and may be deleted outright. A consumer that keeps a long
-// ladder for other failure classes is where it would have room.
+// Worth seeing plainly in these numbers, because it decides whether the
+// observe soak is worth running on this consumer at all: with a ladder this
+// tight the breaker has no room. RecoverBy 4 requires FloorAge above 15
+// minutes and the ladder dead-letters at 20, so the only delivery on which the
+// breaker can trip is the one exhaustion would have handled anyway. The
+// schedule is valid and Start accepts it; the breaker simply accelerates
+// nothing here, and a soak would report trips that all coincide with
+// exhaustion — a number that looks like evidence and is not.
+//
+// That is the general case for a bounded ladder, not an accident of this
+// example, and it is the substance of why the breaker ships observe-only and
+// is a deletion candidate. The consumer worth soaking is one that keeps a long
+// ladder for failure classes that genuinely benefit from waiting — there the
+// gap between FloorAge and the ladder's end is the room the breaker works in.
 //
 // FloorAge is 20 minutes here rather than the 15-minute default for a reason
 // the checks will otherwise find for you: three 5-minute rungs put delivery 4
@@ -702,15 +708,23 @@ func (r *Retry) sweepFailuresLocked(now time.Time) {
 			delete(r.failing, seq)
 		}
 	}
-	for len(r.failing) > maxTrackedFailures*3/4 {
-		var oldestSeq uint64
-		var oldest time.Time
-		for seq, rec := range r.failing {
-			if oldest.IsZero() || rec.last.Before(oldest) {
-				oldestSeq, oldest = seq, rec.last
-			}
-		}
-		delete(r.failing, oldestSeq)
+	target := maxTrackedFailures * 3 / 4
+	if len(r.failing) <= target {
+		return
+	}
+	// Rescanning the map once per victim would be quadratic under this mutex,
+	// which every Settle call is waiting on. Order once instead.
+	type aged struct {
+		seq  uint64
+		last time.Time
+	}
+	all := make([]aged, 0, len(r.failing))
+	for seq, rec := range r.failing {
+		all = append(all, aged{seq, rec.last})
+	}
+	slices.SortFunc(all, func(a, b aged) int { return a.last.Compare(b.last) })
+	for _, a := range all[:len(all)-target] {
+		delete(r.failing, a.seq)
 	}
 }
 
@@ -744,7 +758,9 @@ func (r *Retry) sweepFailuresLocked(now time.Time) {
 //     the ack floor, so it is un-settled (exact, and free of any assumption
 //     about filters or gaps);
 //  3. this message has itself been failing at least as long as the stall —
-//     from its own delivery count against the ladder (message-local, exact).
+//     from the clock [Retry.noteFailure] keeps, MEASURED rather than inferred
+//     from a delivery count, and per-process so it resets on restart and is
+//     deliberately late rather than early.
 //
 // A message satisfying all three has burned FloorAge of retries, on its own,
 // while the consumer demonstrably made no progress. Whether or not it is the
@@ -801,6 +817,14 @@ func (r *Retry) shouldQuarantine(msg jetstream.Msg, delivered int, failingFor ti
 //
 // It also bounds the blast radius of a false positive to one message per
 // FloorAge, whatever the cause.
+//
+// The claim is spent when the condition is MET, not when the capture that
+// follows succeeds. A trip whose dead-letter publish fails therefore costs a
+// window even though nothing was quarantined — deliberate, because the
+// alternative is a broken DLQ letting the breaker re-trip against message
+// after message with nothing to show for it. The message is not lost: it stays
+// on the ladder and exhaustion still captures it. Spending the claim on the
+// attempt is also what keeps [BreakerObserve] an honest dry run of enforcing.
 func (r *Retry) spendQuarantineBudgetLocked(floor uint64, window time.Duration, now time.Time) bool {
 	switch {
 	case !r.haveQuarantined, floor != r.quarantinedFloor, now.Sub(r.quarantined) >= window:
@@ -874,23 +898,25 @@ func (r *Retry) Settle(ctx context.Context, msg jetstream.Msg, reason string) (S
 		FailingFor:     failingFor,
 		BreakerTripped: quarantine,
 	}
+	// Report an observed trip wherever it happens, not only where it changes
+	// the outcome. A trip that coincides with exhaustion still counts toward
+	// what enforcing would have done, and logging it only on the ladder
+	// branch would leave log-based counting quietly short of the metric.
+	if quarantine && r.cfg.Breaker != BreakerEnforce {
+		logger, name := r.log()
+		logger.WarnContext(ctx, name+": breaker would dead-letter this message (observe only)",
+			slog.String("reason", reason),
+			slog.Int("delivered", delivered),
+			slog.Duration("failing_for", s.FailingFor),
+			slog.Uint64("ack_floor", floor),
+			slog.Duration("floor_stalled_for", age))
+	}
 	switch {
 	case quarantine && r.cfg.Breaker == BreakerEnforce:
 		s.Cause = CauseFloorAge
 	case r.ladderSpent(delivered):
 		s.Cause = CauseExhausted
 	default:
-		// Includes the observe-only trip: the condition is on the Settlement
-		// and in the log, but the message keeps its remaining deliveries.
-		if quarantine {
-			logger, name := r.log()
-			logger.WarnContext(ctx, name+": breaker would dead-letter this message (observe only)",
-				slog.String("reason", reason),
-				slog.Int("delivered", delivered),
-				slog.Duration("failing_for", s.FailingFor),
-				slog.Uint64("ack_floor", floor),
-				slog.Duration("floor_stalled_for", age))
-		}
 		return r.awaitRedelivery(ctx, msg, s), nil
 	}
 	return r.terminate(ctx, msg, s, reason)

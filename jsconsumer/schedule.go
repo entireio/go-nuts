@@ -8,6 +8,11 @@ import (
 	"github.com/entireio/go-nuts/backoff"
 )
 
+// UnlimitedMaxDeliver mirrors [backoff.UnlimitedMaxDeliver] and
+// jetstream.ConsumerConfig.MaxDeliver: a non-positive cap means the broker
+// redelivers forever.
+const UnlimitedMaxDeliver = backoff.UnlimitedMaxDeliver
+
 // Schedule is a durable consumer's retry timing as plain values, and
 // [Schedule.Validate] is the single implementation of the arithmetic that
 // says whether it hangs together.
@@ -40,7 +45,9 @@ type Schedule struct {
 	ServerBackOff []time.Duration
 
 	// MaxDeliver is the consumer's delivery cap, AckWait its redelivery
-	// timeout. Zero means unknown.
+	// timeout. Zero means unknown; [UnlimitedMaxDeliver] (or any non-positive
+	// value) means the consumer never stops redelivering, which has no
+	// terminal branch and so no duration to bound.
 	MaxDeliver int
 	AckWait    time.Duration
 
@@ -172,8 +179,13 @@ func (s Schedule) Validate() []Violation {
 	if s.MaxTimeToDeadLetter < 0 {
 		add("MaxTimeToDeadLetter", "must not be negative, got %s", s.MaxTimeToDeadLetter)
 	}
-	if s.MaxDeliver < 0 {
-		add("MaxDeliver", "must not be negative, got %d", s.MaxDeliver)
+	// Non-positive means UNLIMITED redeliveries, matching
+	// jetstream.ConsumerConfig.MaxDeliver and backoff.UnlimitedMaxDeliver.
+	// Only a value below that sentinel is nonsense. An unlimited consumer has
+	// no terminal branch, so every duration check below is skipped rather
+	// than being computed against a delivery number that does not exist.
+	if s.MaxDeliver < UnlimitedMaxDeliver {
+		add("MaxDeliver", "must be -1 (unlimited) or positive, got %d", s.MaxDeliver)
 	}
 	if s.CaptureReserve < 0 {
 		add("CaptureReserve", "must not be negative, got %d", s.CaptureReserve)
