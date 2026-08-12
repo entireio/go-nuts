@@ -1,0 +1,82 @@
+which trails is it?
+
+---
+
+what's the status?
+
+---
+
+The direction is strong, but I’d treat this as a production-ready retry/DLQ core plus an experimental breaker—not one uniformly mature feature.
+
+### Architectural map
+
+| Layer | Responsibility |
+|---|---|
+| [`Config` / `Start` / `Run`](/Users/nodo/work/tasks/floor-age-circuit-breaker/go-nuts/jsconsumer/jsconsumer.go:70) | Consumer lifecycle and server configuration |
+| [`Schedule`](/Users/nodo/work/tasks/floor-age-circuit-breaker/go-nuts/jsconsumer/schedule.go:16) | Pure, reusable validation of the effective retry envelope |
+| [`Retry`](/Users/nodo/work/tasks/floor-age-circuit-breaker/go-nuts/jsconsumer/retry.go:282) | Message-local exhaustion, DLQ capture, and settlement |
+| [`FloorMonitor`](/Users/nodo/work/tasks/floor-age-circuit-breaker/go-nuts/jsconsumer/floor.go:49) | Consumer-global health observation |
+| [`natsmsg.DeadLetter`](/Users/nodo/work/tasks/floor-age-circuit-breaker/go-nuts/natsmsg/deadletter.go:64) | Durable copy before removing the original |
+| `backoff` | Legacy client-side scheduler retained for other callers |
+
+The most important architectural improvement is real: the server’s `BackOff` is now the only scheduler in the new path, while `Retry` leaves failed messages untouched until AckWait expires. `Schedule` is also a good seam—it turns operational intent such as “DLQ within 25 minutes” into enforceable configuration.
+
+### One concrete issue
+
+A final-delivery `DoubleAck` error is reported as definitively `OutcomeStranded` at [`retry.go:962`](/Users/nodo/work/tasks/floor-age-circuit-breaker/go-nuts/jsconsumer/retry.go:962). A synchronous acknowledgment timeout is actually ambiguous: the server may have accepted the ack while its confirmation was lost.
+
+Because `Settlement` drives alerts and runbooks, I would represent this as `OutcomeUncertain` or an explicit acknowledgment-confirmation state. The DLQ copy is safe, but the original is not provably stranded.
+
+### Broader concerns
+
+- `BreakerEnforce` remains public even though the documentation says it may be deleted after observation. Exporting it makes that experiment harder to remove. I would ship `FloorMonitor` and observe-mode telemetry, while holding enforcement behind a separate follow-up or non-production boundary.
+- CR ownership is still aspirational. [`Start` currently writes `BackOff`](/Users/nodo/work/tasks/floor-age-circuit-breaker/go-nuts/jsconsumer/jsconsumer.go:419), including clearing an existing ladder when nil. Until bind-only mode exists, the application remains the effective configuration owner.
+- “Single scheduler” is guaranteed only when adopters use `Retry.Settle`. The public `backoff.Policy` still allows handlers to combine `NakWithDelay` with `Config.BackOff`; that limitation should be described as an adoption contract rather than type-level impossibility.
+- There are no production callers in this repository. The actual contract is completed only by the entire-search adoption, fleet validation, and staging poison/DLQ exercise.
+
+My recommendation: merge the schedule validator, bounded exhaustion, capture-before-ack, and floor telemetry after fixing the uncertain-ack classification. Keep automatic breaker enforcement out of the supported production surface until the observe soak proves it earns its substantial state and reasoning complexity.
+
+Reviewed [draft PR #14](https://github.com/entireio/go-nuts/pull/14) at `d11ef0e` against `143ec67`. Fresh race tests, tests, vet, lint, build, tidy diff, and whitespace checks pass. GitHub currently reports no checks, and staging behavior was not verified. No files were changed. - thoughts?
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/44123.sock" from-name="Take over Claude Code session" from-mode="prompting">
+New pre-commit requirement from Andrea, tracked as COR-1257 (child of ENT-1601, blocks ENT-1535): an embedded real-broker integration suite, green before the commit go.
+
+Rationale you'll recognize: every major bug in this review cycle was a model error — the code implementing a wrong belief about JetStream (Term-settling, NumDelivered-on-AckWait-expiry, NAK-stretch, tail-repeat, pedantic ackWait) — and the unit suite runs against natsmsgtest's fake, which encodes the same model as the code, so it's green exactly when the model is wrong. The one pipeline step consulting reality has been Andrea's review. Make reality a gate instead.
+
+Scope (full list on COR-1257):
+- Run nats-server in-process in tests, pinned to the go.mod version.
+- Assert every semantic belief the library encodes: ack-floor behavior with an unacked head (floor stationary, later acks pass out of order); NumDelivered inflation on AckWait expiry with no handler involvement; tail-repeat = rungs served BEFORE delivery N incl. the boundary cases you already wrote against Schedule; capture-then-Ack settles and advances the floor; Term-on-limits behavior; pedantic rejections (ackWait ≠ backoff[0], maxDeliver ≤ len(backoff)).
+- A regression assertion for EACH P1 found in Andrea's review rounds — you have that list; please also send it back to me in your next report so I can append it to COR-1257 for the record.
+- Demote natsmsgtest to library-logic tests in the docs; the real-broker suite joins the merge gate (document how it runs in CI — build tag or separate package is your call).
+
+Commit posture: unchanged, and now explicitly gated — Andrea's go comes after this suite is green. Report shape/estimate first if you think this exceeds ~1-2 days, so Andrea can weigh the M1 timeline.
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/44123.sock" from-name="Take over Claude Code session" from-mode="prompting">
+Resolution of the earlier HOLD: Andrea started a fresh session (go-nuts-36) to build the COR-1257 embedded-broker suite — that work is theirs, not yours. Your scope is unchanged and complete: the restructured piece-1 + observe tree, green on the unit gate, uncommitted, awaiting Andrea's commit go (which now also waits on go-nuts-36's suite going green, per the ENT-1535 blocking relation).
+
+Two asks: (1) go-nuts-36 shares your working tree — it will ADD new files (integration package, go.mod entries) and must not touch yours; if you see your files change unexpectedly, flag Andrea immediately rather than fixing silently. (2) When go-nuts-36 asks, give it the list of P1 model-errors found across the review rounds so each becomes a regression assertion — you hold that history.
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/67964.sock" from-name="Implement JetStream semantic verification test suite" from-mode="prompting">
+COR-1257 suite is written and green: internal/brokersemantics, 21 tests, ~3s, no build tag (runs in `go test ./...`, so `mise run test:ci` gates it). It only imports committed symbols (backoff, jsconsumer, natsmsg), so it compiles on main and on your A1 branch alike — nothing for you to reconcile.
+
+Three of your P1 items measured differently than stated. Worth checking before floor.go/retry.go bake them in:
+
+1. "Term does not settle" does NOT reproduce — on either version. Embedded 2.14.3 AND embedded 2.14.2 (I ran a throwaway module against the cached 2.14.2): Term settles immediately, floor advances past it, NumAckPending→0, on limits/workqueue/interest alike. On workqueue+interest it also removes the message from the stream. So COR-944's note and ENT-1492's premise don't hold single-node at either version, and backoff's TermOnExhaustion doc ("Terming removes it cleanly") is correct as written.
+   The mechanism that DOES reproduce ENT-1492's symptom: Ack/Nak/Term/InProgress are fire-and-forget publishes to $JS.ACK.>. With an identity lacking $JS.ACK publish (the COR-1224 gap), msg.Ack() returns **nil**, the floor stays pinned, and the only trace is an async error on the connection handler. DoubleAck does report it — as context.DeadlineExceeded, NOT nats.ErrTimeout. If your breaker treats "we Acked" as "it settled", that's the hole.
+
+2. The NakWithDelay rule is sharper than "BackOff governs ack timeouts, not Nak". Measured to the millisecond: effective delay = requested d + (BackOff[min(rdc, len-1)] − BackOff[0]). Your 3s/3s/3s ladder can't see it because a flat ladder's stretch is zero. On [200ms, 1200ms], NakWithDelay(50ms) redelivered at 50ms, then 1050ms, then 1050ms. Server-side: processNak sets pending.Timestamp = now − AckWait + d, and checkPending measures that against the CURRENT rung. Consequence: on a growing ladder a client-side delay cannot express its own envelope — and this is what explains ENT-1535's "~78s apart against a 5m first rung" unverified note.
+
+3. Blocker identity: AckFloor.Stream+1 is wrong in a case narrower than "after a drain", and I couldn't reproduce floor-2-blocker-6. What I did reproduce, on a filtered consumer: with unmatched sequences below the blocker and nothing acked beneath them, the floor sits under those, so floor+1 names a message the consumer never receives (measured: floor 0 → floor+1 = 1, subject events.other, blocker at 4). Once a matching message below the blocker acks, the floor skips the unmatched ones and floor+1 does name the blocker — the identity flips based on an ack unrelated to the blocker. Separately, stream-side removal (retention/purge/rmm) drags the floor to the delivered HWM with no ack at all, after which floor+1 names an undelivered or nonexistent sequence. AckFloor.Consumer+1 confirmed useless: pinned to the blocker's first delivery (measured floor.Consumer+1 = 2 while the blocker was on consumer seq 8).
+
+Also confirmed as you said: MaxDeliver 0 → stored −1 (unlimited) and a −1 consumer runs fine; ackWait≠backOff[0] silently normalized on the ordinary path and rejected under pedantic (err 10157) — I assert both, driving pedantic via a raw $JS.API request since nats.go's jetstream package has no pedantic option; len(backOff) > maxDeliver rejected (10116), == accepted; backOff + maxDeliver=−1 accepted. Two more you may care about: an exhausted message pins the floor with NumAckPending **0** (so "Outstanding Acks: 0" doesn't mean nothing is outstanding), and a stream's ConsumerLimits silently fill a consumer's zero MaxAckPending/InactiveThreshold — jsconsumer leaves both zero, so on such a stream it inherits an InactiveThreshold it never asked for.
+
+Tests are named per belief with the reasoning in the doc comment, so grep for the name if you want the fixture. I have not committed — Andrea hasn't asked yet.
+</cross-session-message>
