@@ -1,0 +1,39 @@
+which trails is it?
+
+---
+
+what's the status?
+
+---
+
+The direction is strong, but I’d treat this as a production-ready retry/DLQ core plus an experimental breaker—not one uniformly mature feature.
+
+### Architectural map
+
+| Layer | Responsibility |
+|---|---|
+| [`Config` / `Start` / `Run`](/Users/nodo/work/tasks/floor-age-circuit-breaker/go-nuts/jsconsumer/jsconsumer.go:70) | Consumer lifecycle and server configuration |
+| [`Schedule`](/Users/nodo/work/tasks/floor-age-circuit-breaker/go-nuts/jsconsumer/schedule.go:16) | Pure, reusable validation of the effective retry envelope |
+| [`Retry`](/Users/nodo/work/tasks/floor-age-circuit-breaker/go-nuts/jsconsumer/retry.go:282) | Message-local exhaustion, DLQ capture, and settlement |
+| [`FloorMonitor`](/Users/nodo/work/tasks/floor-age-circuit-breaker/go-nuts/jsconsumer/floor.go:49) | Consumer-global health observation |
+| [`natsmsg.DeadLetter`](/Users/nodo/work/tasks/floor-age-circuit-breaker/go-nuts/natsmsg/deadletter.go:64) | Durable copy before removing the original |
+| `backoff` | Legacy client-side scheduler retained for other callers |
+
+The most important architectural improvement is real: the server’s `BackOff` is now the only scheduler in the new path, while `Retry` leaves failed messages untouched until AckWait expires. `Schedule` is also a good seam—it turns operational intent such as “DLQ within 25 minutes” into enforceable configuration.
+
+### One concrete issue
+
+A final-delivery `DoubleAck` error is reported as definitively `OutcomeStranded` at [`retry.go:962`](/Users/nodo/work/tasks/floor-age-circuit-breaker/go-nuts/jsconsumer/retry.go:962). A synchronous acknowledgment timeout is actually ambiguous: the server may have accepted the ack while its confirmation was lost.
+
+Because `Settlement` drives alerts and runbooks, I would represent this as `OutcomeUncertain` or an explicit acknowledgment-confirmation state. The DLQ copy is safe, but the original is not provably stranded.
+
+### Broader concerns
+
+- `BreakerEnforce` remains public even though the documentation says it may be deleted after observation. Exporting it makes that experiment harder to remove. I would ship `FloorMonitor` and observe-mode telemetry, while holding enforcement behind a separate follow-up or non-production boundary.
+- CR ownership is still aspirational. [`Start` currently writes `BackOff`](/Users/nodo/work/tasks/floor-age-circuit-breaker/go-nuts/jsconsumer/jsconsumer.go:419), including clearing an existing ladder when nil. Until bind-only mode exists, the application remains the effective configuration owner.
+- “Single scheduler” is guaranteed only when adopters use `Retry.Settle`. The public `backoff.Policy` still allows handlers to combine `NakWithDelay` with `Config.BackOff`; that limitation should be described as an adoption contract rather than type-level impossibility.
+- There are no production callers in this repository. The actual contract is completed only by the entire-search adoption, fleet validation, and staging poison/DLQ exercise.
+
+My recommendation: merge the schedule validator, bounded exhaustion, capture-before-ack, and floor telemetry after fixing the uncertain-ack classification. Keep automatic breaker enforcement out of the supported production surface until the observe soak proves it earns its substantial state and reasoning complexity.
+
+Reviewed [draft PR #14](https://github.com/entireio/go-nuts/pull/14) at `d11ef0e` against `143ec67`. Fresh race tests, tests, vet, lint, build, tidy diff, and whitespace checks pass. GitHub currently reports no checks, and staging behavior was not verified. No files were changed. - thoughts?
