@@ -3,7 +3,7 @@
   "checkpoint_id": "7bd63a2e2737",
   "strategy": "manual-commit",
   "branch": "nodo/ent-1601-jsconsumer-retry-schedule",
-  "checkpoints_count": 1,
+  "checkpoints_count": 4,
   "files_touched": [
     "jsconsumer/zz_probe_test.go"
   ],
@@ -14,13 +14,20 @@
       "compact_transcript": "/7b/d63a2e2737/0/transcript.jsonl",
       "content_hash": "/7b/d63a2e2737/0/content_hash.txt",
       "prompt": ""
+    },
+    {
+      "metadata": "/7b/d63a2e2737/1/metadata.json",
+      "transcript": "/7b/d63a2e2737/1/full.jsonl",
+      "compact_transcript": "/7b/d63a2e2737/1/transcript.jsonl",
+      "content_hash": "/7b/d63a2e2737/1/content_hash.txt",
+      "prompt": ""
     }
   ],
   "token_usage": {
-    "input_tokens": 16,
-    "cache_creation_tokens": 12377,
-    "cache_read_tokens": 1081467,
-    "output_tokens": 3839,
-    "api_call_count": 9
+    "input_tokens": 24,
+    "cache_creation_tokens": 16845,
+    "cache_read_tokens": 3385592,
+    "output_tokens": 6639,
+    "api_call_count": 13
   }
 }
