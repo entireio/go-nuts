@@ -164,7 +164,10 @@ func (m *FloorMonitor) Stalled() bool {
 // this stays true while a blocker waits out a ladder rung — it has been
 // delivered, so Delivered stays above the floor even though nothing is
 // ack-pending at that instant, which is why NumAckPending is the wrong gate
-// here.
+// here. Confirmed the other way round too: a message that has exhausted its
+// deliveries pins the floor with NumAckPending at ZERO, so "outstanding acks:
+// 0" does not mean nothing is outstanding, and a stall gate reading it would
+// miss precisely the stall this package exists for.
 func (m *FloorMonitor) observeFloor(floor, delivered uint64, at time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

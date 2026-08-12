@@ -180,7 +180,10 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
   redelivers on `AckWait`, so the effective schedule becomes AckWait repeated
   up to `MaxDeliver`.
 
-  Never a drop, and never a bare `Term`. A failed capture leaves the message
+  Never a drop, and never a bare `Term` — the objection to `Term` being the
+  missing record, not the settlement: measured against nats-server 2.14.3 it
+  settles cleanly on limits, workqueue and interest alike, it just leaves no
+  trace of what was discarded. A failed capture leaves the message
   for the server to redeliver, so it survives and the stall stays visible — and `CaptureReserve` holds
   back deliveries specifically to retry it. When even those are spent the
   message is reported as `OutcomeStranded`, not dressed up as a retry: at the

@@ -113,7 +113,7 @@ const (
 	// durable's ack floor and the floor had been stalled past FloorAge.
 	CauseFloorAge Cause = "floor_age"
 	// CauseExhausted is the ordinary terminal branch: the delivery cap was
-	// reached (ENT-1492's dead-letter-then-Ack, replacing the unsettled Term).
+	// reached (ENT-1492's dead-letter-then-Ack, replacing a bare Term).
 	CauseExhausted Cause = "max_deliver"
 	// CausePermanent is a caller-declared unprocessable message, dead-lettered
 	// by [Retry.DeadLetter] without consuming the ladder.
@@ -768,11 +768,17 @@ func (r *Retry) sweepFailuresLocked(now time.Time) {
 // blocker's identity, and JetStream's consumer info does not carry it. The
 // two candidate inferences both fail against a live server:
 //
-//   - AckFloor.Stream+1 is the blocker only when the floor was last computed
-//     by the server's pending scan. After the consumer fully drains, the floor
-//     jumps to the delivered high-water mark, and a poison message arriving
-//     behind non-matching subjects then sits well above floor+1 (measured:
-//     floor 2, blocker at stream 6). A filtered consumer hits this routinely.
+//   - AckFloor.Stream+1 names the blocker only sometimes, and what flips it is
+//     unrelated to the blocker. On a filtered consumer with unmatched
+//     sequences below the poison message and nothing acked beneath them, the
+//     floor sits under those unmatched sequences, so floor+1 names a message
+//     this consumer will never receive. Let any matching message below the
+//     blocker ack and the floor skips the unmatched run, and floor+1 starts
+//     naming the blocker correctly — the identity of "the blocker" turning on
+//     an ack that has nothing to do with it. Stream-side removal (retention,
+//     purge, a break-glass rmm) drags the floor to the delivered high-water
+//     mark with no ack at all, after which floor+1 names a sequence that was
+//     never delivered or no longer exists.
 //   - AckFloor.Consumer+1 is worse. The server only recomputes that floor when
 //     the message AT the floor is acked, so it pins to the blocker's FIRST
 //     delivery and goes stale the moment it is redelivered (measured: floor
@@ -1037,8 +1043,16 @@ func (r *Retry) terminate(ctx context.Context, msg jetstream.Msg, s Settlement, 
 // DeadLetter captures msg to the DLQ and Acks it immediately, for a failure
 // the handler knows no redelivery can fix — an unprocessable payload, a
 // reference that will never resolve. It is the non-lossy replacement for a
-// bare Term: same terminal effect on the consumer, but the raw message and
+// bare Term: the same terminal effect on the consumer, but the raw message and
 // its headers survive in the DLQ.
+//
+// The objection to Term is the missing record, not the settlement. Measured
+// against nats-server 2.14.3 single-node, Term settles cleanly on limits,
+// workqueue and interest retention alike — the ack floor advances past it and
+// NumAckPending returns to zero — so "Term leaves the message unsettled" is
+// not a belief this package should carry, whatever ENT-1492's write-up
+// implies. What Term does not do is leave any trace of what was discarded,
+// and that is the whole reason for capturing first.
 //
 // As in [Settle], a capture failure leaves the message for the server to
 // redeliver rather than dropping it, and returns the error.
@@ -1099,9 +1113,18 @@ func (r *Retry) capture(ctx context.Context, msg jetstream.Msg, cause Cause, rea
 // reaches the DLQ in milliseconds. Measured against a live server with a
 // 3s/3s/3s ladder: Nak() redelivers in 0s, no-ack in 3s.
 //
-// NakWithDelay would schedule correctly but only by naming a delay this
-// process would have to know — reintroducing the second schedule that
-// ENT-1535 is about. Doing nothing is what defers to the one ladder.
+// NakWithDelay does not rescue it either, and the reason is stronger than
+// "the client would have to know the delay". The server does not honour the
+// requested delay as given: processNak backdates the pending timestamp by
+// AckWait, and checkPending then measures it against the CURRENT rung, so the
+// effective wait is d + (BackOff[rung] - BackOff[0]). Measured on a
+// [200ms, 1200ms] ladder, NakWithDelay(50ms) redelivered at 50ms, then
+// 1050ms, then 1050ms. On a growing ladder a client simply cannot express its
+// own envelope — which is also the likeliest explanation for ENT-1535's
+// unverified "~78s apart against a 5m first rung" observation.
+//
+// So doing nothing is not merely the tidiest way to defer to the one ladder;
+// it is the only disposition whose timing is predictable.
 //
 // The cost is that the delivery stays ack-pending for the whole rung, so a
 // consumer with a long ladder and many concurrent failures needs MaxAckPending

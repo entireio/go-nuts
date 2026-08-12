@@ -662,9 +662,10 @@ func Process[E any](
 		}
 		if cfg.Retry != nil {
 			// Same terminal effect as the Term below, but the payload
-			// survives: a bare Term is the last drop-without-a-record surface
-			// in this scaffold, and a Retry is exactly the capture path that
-			// closes it.
+			// survives: a bare Term settles the message perfectly well, it
+			// just leaves no trace of what was discarded — the last
+			// drop-without-a-record surface in this scaffold, and a Retry is
+			// exactly the capture path that closes it.
 			if _, dlErr := cfg.Retry.DeadLetter(ctx, msg, "undecodable: "+err.Error()); dlErr != nil {
 				cfg.logger().WarnContext(ctx, cfg.Name+": dead-letter undecodable failed", slog.Any("error", dlErr))
 			}
