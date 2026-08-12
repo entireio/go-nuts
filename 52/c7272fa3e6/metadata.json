@@ -3,11 +3,16 @@
   "checkpoint_id": "52c7272fa3e6",
   "strategy": "manual-commit",
   "branch": "nodo/ent-1601-jsconsumer-retry-schedule",
-  "checkpoints_count": 6,
+  "checkpoints_count": 14,
   "files_touched": [
     "README.md",
     "doc.go",
+    "jsconsumer/floor.go",
     "jsconsumer/jsconsumer.go",
+    "jsconsumer/retry.go",
+    "jsconsumer/retry_test.go",
+    "jsconsumer/schedule.go",
+    "jsconsumer/schedule_test.go",
     "natsmsg/natsmsgtest/fakemsg.go"
   ],
   "sessions": [
@@ -17,13 +22,20 @@
       "compact_transcript": "/52/c7272fa3e6/0/transcript.jsonl",
       "content_hash": "/52/c7272fa3e6/0/content_hash.txt",
       "prompt": "/52/c7272fa3e6/0/prompt.txt"
+    },
+    {
+      "metadata": "/52/c7272fa3e6/1/metadata.json",
+      "transcript": "/52/c7272fa3e6/1/full.jsonl",
+      "compact_transcript": "/52/c7272fa3e6/1/transcript.jsonl",
+      "content_hash": "/52/c7272fa3e6/1/content_hash.txt",
+      "prompt": "/52/c7272fa3e6/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 602570,
-    "cache_creation_tokens": 0,
-    "cache_read_tokens": 9572608,
-    "output_tokens": 63979,
-    "api_call_count": 90
+    "input_tokens": 620159,
+    "cache_creation_tokens": 1551020,
+    "cache_read_tokens": 79878579,
+    "output_tokens": 354646,
+    "api_call_count": 326
   }
 }

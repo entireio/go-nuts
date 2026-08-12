@@ -1,0 +1,131 @@
+{
+  "cli_version": "0.9.0",
+  "checkpoint_id": "52c7272fa3e6",
+  "session_id": "fdaa4d69-95e1-4f90-a1a4-c28bb1a1c3ac",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-12T13:25:50.346597Z",
+  "branch": "nodo/ent-1601-jsconsumer-retry-schedule",
+  "checkpoints_count": 8,
+  "save_step_count": 8,
+  "files_touched": [
+    "README.md",
+    "doc.go",
+    "jsconsumer/floor.go",
+    "jsconsumer/jsconsumer.go",
+    "jsconsumer/retry.go",
+    "jsconsumer/retry_test.go",
+    "jsconsumer/schedule.go",
+    "jsconsumer/schedule_test.go",
+    "natsmsg/natsmsgtest/fakemsg.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-fable-5",
+  "turn_id": "dcee65015dec",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 17589,
+    "cache_creation_tokens": 1551020,
+    "cache_read_tokens": 70305971,
+    "output_tokens": 290667,
+    "api_call_count": 236
+  },
+  "session_metrics": {
+    "turn_count": 8
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-08-12T13:25:50.264208Z",
+    "agent_lines": 2608,
+    "agent_removed": 0,
+    "human_added": 550,
+    "human_modified": 385,
+    "human_removed": 0,
+    "total_committed": 3372,
+    "total_lines_changed": 3543,
+    "agent_percentage": 73.60993508326277,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1613,
+      "agent_lines_removed": 6
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 2241,
+      "agent_lines_removed": 6
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 2478,
+      "agent_lines_removed": 7
+    },
+    {
+      "checkpoint_number": 5,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 2921,
+      "agent_lines_removed": 7
+    },
+    {
+      "checkpoint_number": 6,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 2962,
+      "agent_lines_removed": 7
+    },
+    {
+      "checkpoint_number": 7,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 2989,
+      "agent_lines_removed": 7
+    },
+    {
+      "checkpoint_number": 8,
+      "user_lines_added": 171,
+      "user_lines_removed": 43,
+      "agent_lines_added": 3352,
+      "agent_lines_removed": 16,
+      "user_added_per_file": {
+        "jsconsumer/retry.go": 115,
+        "jsconsumer/retry_test.go": 56
+      },
+      "user_removed_per_file": {
+        "jsconsumer/retry.go": 43
+      }
+    },
+    {
+      "checkpoint_number": 9,
+      "user_lines_added": 382,
+      "user_lines_removed": 171,
+      "agent_lines_added": 3375,
+      "agent_lines_removed": 16,
+      "user_added_per_file": {
+        "jsconsumer/retry.go": 178,
+        "jsconsumer/retry_test.go": 115,
+        "jsconsumer/schedule.go": 11,
+        "jsconsumer/schedule_test.go": 78
+      },
+      "user_removed_per_file": {
+        "jsconsumer/retry.go": 93,
+        "jsconsumer/retry_test.go": 55,
+        "jsconsumer/schedule.go": 10,
+        "jsconsumer/schedule_test.go": 13
+      }
+    }
+  ]
+}

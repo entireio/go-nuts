@@ -1,0 +1,162 @@
+Read Linear ENT-1601 and ENT-1535 — especially the "Session-1 forensics results"
+comment (2026-08-12) on ENT-1535 — then implement the floor-age circuit breaker
+in go-nuts jsconsumer:
+
+- Trigger: floor-stationary age > threshold (default 15–20 min, configurable).
+  Measure floor-stationary time, NOT message stream-age.
+- Action: dead-letter (raw msg + headers) then Ack. Never drop, never bare Term.
+- Design constraint from the forensics: the library must own ONE retry mechanism.
+  The NakWithDelay-vs-consumer-BackOff interaction (server stretches NAK delays
+  by BackOff increments) made the configured ladder dead config — make that
+  state unrepresentable (reject configs that set both, or wire them together).
+- First adopter: entire-search search-indexer-refs (already on the post-#173
+  ~43min ladder; the breaker replaces its retry-cap workaround).
+- Acceptance (M1, Aug 22): synthetic poison event on repo_refs_v1 in staging
+  dead-letters via the library path in ≤30 min; ack floor never pins >30 min;
+  capture verified in repo_refs_dlq_v1 — note this is that DLQ's first real
+  exercise; treat it as part of the test.
+
+---
+
+1. [P1] Idle time incorrectly ages newly arrived work — jsconsumer/retry.go:419
+
+     The poll starts the stationary timer even when NumAckPending == 0. After a healthy consumer sits idle for 16 minutes, the next message at floor+1 is dead-lettered on its second attempt as though it had stalled for 16 minutes. This
+     also makes FloorStationaryFor and the warning log report healthy idle consumers as stalled.
+
+  2. [P1] The breaker cannot identify blockers for filtered consumers — jsconsumer/retry.go:476
+
+     Matching meta.Sequence.Stream == ackFloor.Stream+1 assumes stream sequences are dense. Filters make them sparse. JetStream provides consumer sequences specifically for this: compare meta.Sequence.Consumer with AckFloor.Consumer+1. A
+     reproduced floor at stream 100/consumer 1 followed by stream 200/consumer 2 remained on the retry ladder indefinitely instead of tripping the breaker.
+
+  3. [P1] Failed final DLQ capture is reported as retried, but no retry occurs — jsconsumer/retry.go:553
+
+     On the final delivery, a failed capture calls NakWithDelay and returns OutcomeRetried. MaxDeliver has already been reached, so NATS retires the delivery instead. Against the pinned NATS server, MaxDeliver: 2 produced exactly two
+     deliveries, then ack_pending=0; no third capture attempt occurred. The original remains uncaptured and requires manual recovery. DeadLetter has the same fallback at line 598.
+
+---
+
+another reviewer questioned the apporach: ```No—not as one combined abstraction. The direction is good, but the floor-age breaker is being placed at the wrong level.
+
+  What I would keep:
+
+  - Enforce exactly one retry scheduler.
+  - Centralize retry/exhaustion settlement.
+  - Capture to the DLQ before acknowledging.
+  - Validate MaxDeliver consistently.
+  - Preserve payload, headers, sequence, and reason.
+
+  What I would separate:
+
+  - Retry should make deterministic, message-local decisions from delivery metadata.
+  - Floor monitoring should observe consumer-wide health and emit telemetry.
+  - The adopter should decide whether a stalled consumer warrants quarantining a specific message.
+
+  The core mismatch is that retry state is message-local, while ack-floor state is consumer-global. A client-side snapshot cannot reliably prove which message caused the stall or how long it caused it—idle periods, filters, restarts,
+  replicas, and delivery caps all distort that inference. The three review findings are manifestations of this deeper mismatch rather than incidental coding errors.
+
+  I’d aim for this ownership:
+
+  jsconsumer       lifecycle and exclusive scheduler configuration
+  Retry            delay ladder and logical exhaustion
+  DeadLetter       durable, idempotent capture
+  FloorMonitor     advisory consumer-health signal
+  search-indexer   policy deciding when a blocker may be quarantined
+
+  The other architectural gap is terminal capture. A synchronous DLQ publish on the broker’s final delivery has no recovery path if that publish fails. A robust design needs either:
+
+  - A logical retry limit below the broker’s MaxDeliver, reserving deliveries for DLQ capture retries.
+  - An idempotent durable outbox/retry stream.
+  - An explicitly documented manual-recovery state—not OutcomeRetried.
+
+  My suggested rollout:
+
+  1. Land the single-scheduler enforcement and deterministic Retry/DLQ settlement.
+  2. Add floor monitoring separately, using consumer sequence and pending state.
+  3. Run it observe-only in search-indexer.
+  4. Add automatic quarantine there behind a flag once idle, filtered-stream, restart, replica, and DLQ-outage behavior is demonstrated.
+  5. Generalize it into go-nuts only after a second consumer proves the abstraction.
+
+  So: the incident diagnosis is sound, and centralizing retry mechanics is right. Making a 15-minute floor heuristic a generic library-owned automatic disposition is the part I would reconsider.````
+
+---
+
+1. [P1] Filtered consumers still cannot identify the blocker — jsconsumer/retry.go:405
+
+     It still compares stream sequence with floor+1. For a filtered consumer, consumer sequence 2 may correspond to stream sequence 200. My probe reproduced the breaker remaining inactive on the actual blocker. Store AckFloor.Consumer
+     and compare it with msg.Metadata().Sequence.Consumer; retain stream sequence only for telemetry.
+
+  2. [P2] Final-delivery Ack failure is still mislabeled as a retry — jsconsumer/retry.go:527
+
+     The capture reserve fixes failed publishing, but not failed acknowledgment after a successful capture. At MaxDeliver, Ack() failure returns OutcomeRetried, yet NATS permits no next delivery. The live probe produced two deliveries
+     and no third. This should report a stranded/uncertain settlement, or use bounded DoubleAck to confirm settlement.
+
+  3. [P2] Run does not join the monitor before recreating — jsconsumer/jsconsumer.go:508
+
+     When the consume loop closes naturally, Run cancels the attempt but does not call Stop or wait for pollDone. It can attach the shared monitor to a new consumer while the old poll is still exiting, allowing stale consumer information
+     to overwrite the new state. Join the old runner before the retry delay/recreation.
+
+  One rollout concern: BreakerObserveOnly is opt-in, while supplying RetryConfig.Monitor enables automatic DLQ+Ack by default. Since the docs call observe-only the rollout position, I’d prefer an explicit mode whose zero value is
+  disabled/observe-only, with automatic action requiring an affirmative value.
+
+  The original tree passes go test ./..., go test -race ./..., go vet ./..., lint, build, and git diff --check. Temporary probes reproduced findings 1 and 2 and were removed.
+
+  Overall verdict: the design direction is now sound; fix the sequence identity and final-Ack classification before shipping. The lifecycle join and safer rollout mode should also be addressed before enabling automatic quarantine.
+
+---
+
+• I re-reviewed the current diff (d29a0c… against 143ec67). The previous issues are fixed, but I found one new blocker.
+
+  - [P1] Delivery count is not elapsed failure time. jsconsumer/retry.go:407 assumes every redelivery followed the configured NakWithDelay ladder. JetStream also increments NumDelivered after AckWait expires—for example, when a handler
+    crashes before calling Settle. My integration probe produced four deliveries in 68 ms, but the code inferred FailingFor=3s and dead-lettered the fresh message during an older floor stall. This invalidates the “never early” safety
+    claim and could quarantine many recoverable messages. Enforcement needs a durable first-failure timestamp; otherwise this should remain observe-only or be explicitly delivery-count-based.
+
+  - [P2] Enforce mode can silently operate without a monitor. jsconsumer/retry.go:308 accepts BreakerEnforce with Monitor=nil, after which jsconsumer/retry.go:461 always returns false. A monitor supplied only through Config.FloorMonitor
+    still does not drive the retry breaker. Reject enforce-without-monitor and unknown BreakerMode values during validation.
+
+  The earlier idle-floor, filtered-sequence, final-ack, lifecycle, and rollout-safety findings are resolved.
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/44123.sock" from-name="Take over Claude Code session" from-mode="prompting">
+Correction accepted — recorded on both tickets: a reply on the ENT-1535 forensics thread marks the "dead-letter at attempt 4" formulation as design arithmetic only (with your NumDelivered-inflation rationale), and ENT-1601 now carries a "settled design decisions" comment covering measured-elapsed-time, RecoverBy, one-claim-per-stall-window, and the stallSignal split. Nothing else in the tickets states the equality as a runtime property.
+
+One edge to confirm before you wrap: CRASH-LOOPING POISON. If the poison message's handler panics and takes the process down (one of the very NumDelivered-inflation causes you cited), then "first failure this process observes" resets on every restart — a message that kills the pod every few seconds/minutes may never accumulate FloorAge in any single process lifetime, and the breaker never fires for exactly the nastiest poison class. Presumably the position is: that failure mode is loud (pod crash-loop alerting catches it) rather than silent, so it's an explicit non-goal of the breaker — but please confirm that's deliberate and document it as such (a sentence in the package doc + a line in the ENT-1601 acceptance notes is enough). If you think it needs handling instead, the options I see are corroborating with server-side state (ConsumerInfo ack-floor sampling persisted outside the process) or a crash-count heuristic — both add state and I'd lean "documented non-goal" unless you disagree. Your call; just make it explicit either way.
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/44123.sock" from-name="Take over Claude Code session" from-mode="prompting">
+Recorded on ENT-1601 essentially verbatim, with the two cases split as you framed them (Settle-gated contract property vs measured-clock trade-off) and the ShutdownGroup rationale for rejecting panic-recovery quoted. Agreed on all points — no further notes from this side. When you're ready for review, say so here (or Andrea will pick up the branch directly); remaining sequence after merge is the entire-search adoption PR, then A5 (poison conformance canary) asserts the ≤30 min SLA end-to-end in staging including the first real exercise of repo_refs_dlq_v1.
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/44123.sock" from-name="Take over Claude Code session" from-mode="prompting">
+Direction change, decided by Andrea in the orchestrator session after the review churn — this supersedes parts of my earlier notes.
+
+DIAGNOSIS (so the why is clear): repeated big-bug discoveries in review are a state-space signal, not a review-quality signal. The enforce path — acting on client-side inference about who blocks the floor — is where every major bug has been. Meanwhile production evidence favors the simple design: entire-search #173 (bounded ~43m ladder + exhaustion capture) has five clean days, zero attempts above 4. And the strongest breaker argument ("ladders lie") is weakened by this very work: schedules lied because app NakWithDelay fought config BackOff — your unified schedule fixes that at the root. The remaining advantage (mass-transient selectivity) matters mostly because DLQ replay is manual, which is being addressed separately (COR-1256 drill + follow-up automation).
+
+RESTRUCTURE the working tree into two pieces:
+
+PIECE 1 — ships now, carries M1: unified library-owned retry schedule + all construction validation (RecoverBy, largest-rung; ADD an optional max-cumulative-ladder bound so "total ladder ≤ X" is checkable config, since M1 will be met by bounded ladders) + exhaustion capture-then-Ack + FloorMonitor as TELEMETRY ONLY (metric + alert surface, no action). This is the uncontroversial 80% where no reviewer has found bugs.
+
+PIECE 2 — soaks: the breaker with BreakerObserve as the only supported mode for adopters. The enforce path stays in the code and keeps its tests, but is documented as experimental / not-for-production pending a multi-week observe soak of real trip counts. State explicitly in the doc that DELETION is an acceptable outcome if the soak shows bounded ladders suffice — it must not linger as dormant complexity by default.
+
+ADOPTION GUIDANCE changes accordingly: entire-search adoption = bounded ladder + observe mode. This supersedes my earlier "set Breaker: BreakerEnforce explicitly" handoff note (the zero-value-observes footgun warning is still worth keeping in docs).
+
+Keep all 62 tests. Update README/doc.go to reflect the split and the soak-then-decide plan. Commit/branch posture unchanged — you still need Andrea's go directly in your session; this message authorizes the restructure of the uncommitted tree, not commits. Tickets (ENT-1601/ENT-1535) are being updated to match from here. Flag anything in the current tree that resists this split cleanly before doing surgery.
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/44123.sock" from-name="Take over Claude Code session" from-mode="prompting">
+Andrea decided: (b) — the CR/server owns the redelivery ladder. One declarative source of truth; apps plain-Nak; Retry keeps capture-then-Ack, telemetry, and the observe soak client-side. Rationale on ENT-1601/COR-1254.
+
+Implications for your tree — use your judgment on which is less surgery, and flag before cutting:
+1. The client-ladder execution path (NakWithDelay scheduling) has ZERO adopters — Retry is brand new. Preferred: delete it now if the removal is clean, which shrinks exactly the surface review kept finding bugs in. If removal is invasive to the current shape, mark it deprecated-for-removal with (b) documented as the only supported mode for the Entire fleet — but deletion is the goal either way, so don't build anything more on it.
+2. Keep Schedule.Validate modeling BOTH modes (it must flag the mixed case as a violation forever — that's the ENT-1535 defect detector, and fleet CI will want it even for configs the library would never construct).
+3. Docs/adoption example: server-side BackOff + plain Nak. Interim path for entire-search (before its Consumer CR exists): the app still owns its consumer today, so it sets server BackOff via its own CreateOrUpdate + plain Nak + Retry for capture/telemetry/observe. When its CR lands under Track D it full-mirrors a server config that already matches — clean adoption, no second migration, then bind-only.
+4. Bind-only mode (future D0 work, not this PR): client-side expectations (RecoverBy, FloorAge, MaxTimeToDeadLetter as arithmetic over the ladder) validate against the durable's ACTUAL server ladder read at startup.
+
+Also: your FloorAge-20m example fix and the ENT-1535-config regression test are exactly right — the handoff notes on ENT-1601 already say ">15m", and I'm updating the adoption guidance there for server-side BackOff. Same commit posture: Andrea's go in your session for branch/commit.
+</cross-session-message>
