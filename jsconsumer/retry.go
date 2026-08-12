@@ -81,7 +81,28 @@ const (
 	// ack floor, and it needs an operator — the non-lossy break-glass in
 	// runbooks/nats-poison-ref-event.md. Alert on this; it is the one outcome
 	// no automation clears.
+	//
+	// Nothing reached the DLQ, so the stream copy is the only one left. That
+	// is what separates it from [OutcomeUncertain].
 	OutcomeStranded Outcome = "stranded"
+	// OutcomeUncertain means the message reached the DLQ but the
+	// acknowledgement that would release it could not be confirmed, on a
+	// delivery with none left behind it. The data is safe; what is unknown is
+	// whether the original settled.
+	//
+	// It is deliberately not reported as stranded, because a synchronous ack
+	// failure does not prove the ack failed: DoubleAck waits for the server's
+	// confirmation, and a lost or timed-out confirmation is indistinguishable
+	// from one the server never sent. The message may be settled and gone.
+	//
+	// That distinction is operational, not cosmetic. A responder who reads
+	// "stranded" reaches for the break-glass removal, and removing a stream
+	// message this consumer has in fact acked takes it away from every OTHER
+	// consumer of that stream. So: on Uncertain, CHECK before acting — has the
+	// ack floor advanced past this sequence? If it has, the ack landed and
+	// there is nothing to do. If it has not, treat it as stranded and follow
+	// that runbook.
+	OutcomeUncertain Outcome = "uncertain"
 )
 
 // Cause explains an [OutcomeDeadLettered] settlement; it is empty on a retry.
@@ -328,6 +349,16 @@ type RetryConfig struct {
 // whole thing may take, when a transient should have recovered — are checked
 // against the ladder the consumer actually runs, by [Config] at Start and by
 // [Schedule] wherever else the arithmetic is needed.
+//
+// The single-scheduler property is an adoption contract, not something the
+// type system enforces. RetryConfig has no ladder fields, so nothing
+// configured here can schedule redelivery — but a handler still holds the
+// jetstream.Msg and can call NakWithDelay itself, and [backoff.Policy] remains
+// exported for callers that predate this package. Either brings the second
+// scheduler back. A consumer adopting Retry should route every failed
+// delivery through [Retry.Settle] and reach for no other disposition;
+// [Schedule] will flag the combination if it is ever modelled, but nothing
+// stops it at runtime.
 //
 // # What the breaker measures
 //
@@ -875,9 +906,14 @@ func (r *Retry) spendQuarantineBudgetLocked(floor uint64, window time.Duration, 
 //     package cannot resolve on its own. It is reported as what it is rather
 //     than dressed up as a retry.
 //
-// An Ack that fails after a successful capture (settle:dlq_ack_failed) leaves
-// the original to redeliver and be captured again; a duplicate in the DLQ
-// beats a lost message, and the Settlement reports OutcomeRetried.
+// An Ack that fails after a successful capture leaves the original to
+// redeliver and be captured again; a duplicate in the DLQ beats a lost
+// message, and the Settlement reports OutcomeRetried. Strictly that outcome is
+// also unconfirmed — the ack may have landed, in which case no redelivery
+// comes — but both branches are benign and neither wants an operator, so it is
+// not worth a third state. On the FINAL delivery it is worth one, because
+// there the difference decides whether a human should act:
+// [OutcomeUncertain].
 func (r *Retry) Settle(ctx context.Context, msg jetstream.Msg, reason string) (Settlement, error) {
 	delivered := backoff.NumDelivered(msg)
 	now := r.clock()
@@ -961,19 +997,22 @@ func (r *Retry) terminate(ctx context.Context, msg jetstream.Msg, s Settlement, 
 	defer cancel()
 	if err := msg.DoubleAck(ackCtx); err != nil {
 		if spent {
-			// The copy is safe in the DLQ, but the original is unsettled and
-			// no further delivery is coming: it will pin the ack floor until
-			// the stream's retention expires it. Captured distinguishes this
-			// from a stranding with nothing captured — the data is recoverable,
-			// the consumer is not.
-			s.Outcome = OutcomeStranded
-			logger.ErrorContext(ctx, name+": message stranded; captured to the DLQ but the ack failed with no deliveries left",
+			// The copy is safe in the DLQ; whether the ORIGINAL settled is
+			// unknown. A failed DoubleAck means the confirmation did not come
+			// back, which is not the same as the ack not landing — so this is
+			// reported as uncertain rather than stranded, and the log says
+			// what to check. See [OutcomeUncertain] for why over-claiming
+			// here is worse than useless: it points a responder at a
+			// destructive remedy for a message that may already be settled.
+			s.Outcome = OutcomeUncertain
+			logger.ErrorContext(ctx, name+": settlement unconfirmed; captured to the DLQ but the ack was not acknowledged, with no deliveries left",
 				slog.Any("error", err),
 				slog.String("cause", string(s.Cause)),
 				slog.Int("delivered", s.Delivered),
-				slog.Uint64("ack_floor", s.Floor))
+				slog.Uint64("ack_floor", s.Floor),
+				slog.String("check", "has the ack floor advanced past this message? if so the ack landed and no action is needed"))
 			r.observe(ctx, msg, s)
-			return s, fmt.Errorf("settle:dlq_ack_failed: %w", err)
+			return s, fmt.Errorf("settle:dlq_ack_unconfirmed: %w", err)
 		}
 		// A delivery remains: the message redelivers and is captured again.
 		// A duplicate in the DLQ beats a pinned floor.

@@ -998,35 +998,6 @@ func TestSettleReportsAckFailureAfterCapture(t *testing.T) {
 	}
 }
 
-// TestSettleStrandsWhenTheFinalAckFails is the other half of the
-// classification: the capture succeeded, so the data is safe, but the ack
-// that would release the floor did not land and no further delivery is
-// coming. Reporting that as "retried" tells the adopter's metrics the
-// opposite of the truth — the broker permits no next delivery, so nothing
-// retries. Captured is what separates it from a stranding that saved nothing.
-func TestSettleStrandsWhenTheFinalAckFails(t *testing.T) {
-	r, pub := newTestRetry(t, nil)
-	msg := deliveredMsg(2774437, finalDelivery)
-	msg.AckErr = errors.New("connection closed")
-
-	s, err := r.Settle(t.Context(), msg, "still not ready")
-	if err == nil || !strings.Contains(err.Error(), "settle:dlq_ack_failed") {
-		t.Fatalf("Settle err = %v, want settle:dlq_ack_failed", err)
-	}
-	if s.Outcome != OutcomeStranded {
-		t.Fatalf("Outcome = %q, want %q — no delivery remains, so nothing will retry", s.Outcome, OutcomeStranded)
-	}
-	if !s.Captured {
-		t.Error("Captured false, want the DLQ copy reported as safe")
-	}
-	if len(pub.captured()) != 1 {
-		t.Errorf("captured %d messages, want the copy to have landed first", len(pub.captured()))
-	}
-	if msg.Termed || msg.Naks != 0 {
-		t.Error("stranded message disposed; want it left for the operator")
-	}
-}
-
 // TestTerminalAckIsConfirmed: the dead-letter path settles with DoubleAck, not
 // a fire-and-forget Ack. A lost plain Ack would leave the floor pinned with
 // nothing reporting it — the settlement has to be a fact, not a hope.
@@ -1771,4 +1742,43 @@ func TestStartChecksTheLadderAgainstStreamRetention(t *testing.T) {
 		t.Fatalf("Start(roomy retention): %v", err)
 	}
 	run.Stop()
+}
+
+// TestFinalAckFailureIsUncertainNotStranded: a failed DoubleAck does not prove
+// the ack failed. The confirmation may simply have been lost, in which case the
+// message settled and is gone. Reporting that as stranded points a responder at
+// break-glass removal — and removing a stream message this consumer already
+// acked takes it from every OTHER consumer of that stream, so the over-claim
+// has a destructive remedy attached to it.
+func TestFinalAckFailureIsUncertainNotStranded(t *testing.T) {
+	r, pub := newTestRetry(t, nil)
+	msg := deliveredMsg(2774437, finalDelivery)
+	msg.AckErr = errors.New("context deadline exceeded")
+
+	s, err := r.Settle(t.Context(), msg, "still not ready")
+	if err == nil || !strings.Contains(err.Error(), "settle:dlq_ack_unconfirmed") {
+		t.Fatalf("Settle err = %v, want settle:dlq_ack_unconfirmed", err)
+	}
+	if s.Outcome != OutcomeUncertain {
+		t.Fatalf("Outcome = %q, want %q — a lost confirmation is not a proven failure", s.Outcome, OutcomeUncertain)
+	}
+	if !s.Captured {
+		t.Error("Captured false, want the DLQ copy reported as safe")
+	}
+	if len(pub.captured()) != 1 {
+		t.Errorf("captured %d messages, want the copy to have landed first", len(pub.captured()))
+	}
+
+	// A capture that never happened IS provably stranded: nothing reached the
+	// DLQ, so the two states stay distinguishable.
+	r2, pub2 := newTestRetry(t, nil)
+	pub2.err = errors.New("dlq unavailable")
+	msg2 := deliveredMsg(2774437, finalDelivery)
+	s2, err := r2.Settle(t.Context(), msg2, "still not ready")
+	if err == nil || !strings.Contains(err.Error(), "settle:stranded") {
+		t.Fatalf("Settle err = %v, want settle:stranded", err)
+	}
+	if s2.Outcome != OutcomeStranded || s2.Captured {
+		t.Errorf("Settlement = %+v, want stranded with nothing captured", s2)
+	}
 }

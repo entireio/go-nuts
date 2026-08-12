@@ -158,8 +158,17 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
   that still reads as authoritative — a consumer advertising 17h45m while
   really taking 34h22m, with nothing saying so. Exactly one scheduler is what
   prevents that, and the one that composes with declarative fleet management is
-  the server's. `RetryConfig` has no ladder fields at all, so the combination
-  is unrepresentable rather than merely rejected.
+  the server's. `RetryConfig` has no ladder fields, so nothing you configure
+  *here* can produce a second scheduler.
+
+  That is narrower than it sounds, and worth stating as an adoption contract
+  rather than a guarantee: a handler still holds the `jetstream.Msg` and can
+  call `NakWithDelay` itself, and `backoff.Policy` is still exported for
+  callers that predate this package. Either recreates the exact defect
+  alongside a server ladder. What the library can promise is that `Settle` is
+  the whole disposition it owns, and that `Schedule` flags the combination
+  wherever a config is modelled — including configs the library would never
+  construct. Handlers that Nak on their own are outside that.
 
   Bound that ladder with `MaxTimeToDeadLetter` and it is the whole remedy: a
   poison message reaches capture-then-Ack inside the SLA with no inference
