@@ -1,0 +1,100 @@
+{
+  "cli_version": "0.9.0",
+  "checkpoint_id": "52c7272fa3e6",
+  "session_id": "019ff58a-fdf9-7530-a28a-98cd2bda5627",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-12T13:25:46.822594Z",
+  "branch": "nodo/ent-1601-jsconsumer-retry-schedule",
+  "checkpoints_count": 6,
+  "save_step_count": 6,
+  "files_touched": [
+    "README.md",
+    "doc.go",
+    "jsconsumer/jsconsumer.go",
+    "natsmsg/natsmsgtest/fakemsg.go"
+  ],
+  "agent": "Codex",
+  "model": "gpt-5.6-sol",
+  "turn_id": "b0414439436e",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 602570,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 9572608,
+    "output_tokens": 63979,
+    "api_call_count": 90
+  },
+  "session_metrics": {
+    "turn_count": 6
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-08-12T13:25:46.696534Z",
+    "agent_lines": 115,
+    "agent_removed": 10,
+    "human_added": 1846,
+    "human_modified": 6,
+    "human_removed": 0,
+    "total_committed": 1967,
+    "total_lines_changed": 1977,
+    "agent_percentage": 6.322711178553364,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 1613,
+      "user_lines_removed": 6,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        "README.md": 23,
+        "doc.go": 3,
+        "jsconsumer/jsconsumer.go": 93,
+        "jsconsumer/retry.go": 643,
+        "jsconsumer/retry_test.go": 848,
+        "natsmsg/natsmsgtest/fakemsg.go": 3
+      },
+      "user_removed_per_file": {
+        "README.md": 1,
+        "doc.go": 1,
+        "jsconsumer/jsconsumer.go": 2,
+        "natsmsg/natsmsgtest/fakemsg.go": 2
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1613,
+      "agent_lines_removed": 6
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 2241,
+      "agent_lines_removed": 6
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 2241,
+      "agent_lines_removed": 6
+    },
+    {
+      "checkpoint_number": 5,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 2478,
+      "agent_lines_removed": 7
+    },
+    {
+      "checkpoint_number": 6,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 2989,
+      "agent_lines_removed": 7
+    }
+  ]
+}
