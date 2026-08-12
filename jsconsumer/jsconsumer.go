@@ -17,9 +17,10 @@
 // scaffold's optional single retry mechanism: the redelivery ladder and the
 // dead-letter capture it terminates into (ENT-1535). A handler that
 // configures one calls [Retry.Settle] instead of picking a disposition
-// itself, and the package guarantees the consumer has exactly one redelivery
-// scheduler — a server-side Config.BackOff and a Retry are mutually
-// exclusive, because together neither is the real envelope.
+// itself. The consumer has exactly one redelivery scheduler and it is the
+// SERVER's: the durable's BackOff ladder, or its AckWait when no ladder is
+// set. Retry disposes of nothing on the retry path, so that schedule is the
+// one that runs — see [Retry] for why a plain Nak would skip it entirely.
 //
 // [FloorMonitor] is the separate, advisory half: it polls the durable's ack
 // floor and reports how long it has been stalled. Hand it to a Retry and it
@@ -124,20 +125,28 @@ type Config struct {
 	// against MaxDeliver — is checked at Start through [Schedule], the same
 	// function fleet CI runs over a rendered NACK Consumer CR.
 	//
-	// Required whenever Retry is set, and NOT because the field is decorative:
-	// Start always sends this value to CreateOrUpdateConsumer, so leaving it
-	// nil CLEARS whatever ladder the durable had. A consumer whose ladder is
-	// managed declaratively cannot simply omit it here — that erases the CR's
-	// ladder on every start. Declarative management needs a bind-only mode
-	// that skips consumer creation entirely, which does not exist yet; until
-	// it does, the app owns the ladder and states it here.
+	// Leaving it nil is a choice, not a default: the broker still redelivers,
+	// on AckWait, so the effective ladder becomes AckWait repeated up to
+	// MaxDeliver. [Schedule] models it that way and holds it to the same
+	// bounds, which is usually how an unset BackOff gets caught — an AckWait
+	// sized for one RPC makes a fast, tight retry loop, and one sized for a
+	// slow handler makes a very long one.
+	//
+	// Start always sends this value to CreateOrUpdateConsumer, so a nil also
+	// CLEARS any ladder already on the durable. A consumer whose ladder is
+	// managed declaratively therefore cannot just omit it here — that erases
+	// the managed ladder on every start. Declarative management needs a
+	// bind-only mode that skips consumer creation, which does not exist yet;
+	// until it does, the app states the ladder here.
 	BackOff []time.Duration
 
-	// Retry is the library-owned retry mechanism: one redelivery ladder,
-	// dead-letter capture, and — when its RetryConfig names a FloorMonitor —
-	// the floor-age circuit breaker. When set, [Start] clears any server-side
-	// BackOff left on the durable and [Process] dead-letters an undecodable
-	// payload instead of Terming it. Its MaxDeliver must equal
+	// Retry is where this consumer's retries END: dead-letter capture, then
+	// settle, plus — when its RetryConfig names a FloorMonitor — the
+	// experimental floor-age circuit breaker. It does NOT schedule
+	// redelivery; BackOff above does. When set, [Process] dead-letters an
+	// undecodable payload instead of Terming it, and the whole schedule
+	// (ladder, AckWait, MaxDeliver, and this Retry's expectations of them) is
+	// validated together at Start. Its MaxDeliver must equal
 	// EffectiveMaxDeliver().
 	//
 	// Handlers reach it through the closure they build, and call
@@ -395,11 +404,10 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 		FilterSubjects:    cfg.FilterSubjects,
 		InactiveThreshold: cfg.InactiveThreshold,
 		MaxAckPending:     cfg.MaxAckPending,
-		// Always sent, so an update carries it: with Config.Retry set this is
-		// nil by validation, which CLEARS a server ladder an earlier
-		// deployment left on the durable. Adopting Retry without that clear
-		// would leave the two schedulers composing exactly as ENT-1535 found
-		// them, with the library believing it owned redelivery.
+		// Always sent, so an update carries it — and so a nil CLEARS whatever
+		// ladder the durable had, leaving AckWait as the schedule. That is
+		// why a declaratively-managed ladder cannot simply be omitted here:
+		// see Config.BackOff.
 		BackOff: cfg.BackOff,
 	})
 	if err != nil {

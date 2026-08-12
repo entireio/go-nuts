@@ -86,22 +86,35 @@ func (s Schedule) Ladder() backoff.Policy {
 func (s Schedule) DeadLetterDelivery() int { return s.MaxDeliver - s.CaptureReserve }
 
 // RungBefore is the scheduled wait served before delivery number n (n >= 2),
-// from whichever ladder this schedule describes. JetStream repeats the LAST
-// server rung once the array runs out, so a short backoff list under a larger
-// maxDeliver is not a short ladder.
+// from whichever mechanism actually schedules this consumer's redeliveries, in
+// precedence order:
 //
-// Every timing check goes through here rather than reading the ladder fields
-// directly. Reading them directly is how the recovery-envelope and
-// largest-rung checks came to silently see zero for a server-side ladder and
-// pass configurations they exist to reject.
+//  1. ServerBackOff — the durable's ladder. JetStream repeats the LAST rung
+//     once the array runs out, so a short list under a larger maxDeliver is
+//     not a short ladder.
+//  2. NakDelay — a client-scheduled ladder, for modelling a legacy consumer
+//     that Naks with its own delays. Nothing in this package produces one.
+//  3. AckWait — NO ladder at all. This is not "no wait": with an empty
+//     BackOff the broker still redelivers, on the acknowledgement timeout, so
+//     the real ladder is AckWait repeated. Treating that case as zero made
+//     every duration check pass vacuously — an AckWait of 1h with MaxDeliver 6
+//     scored as an instant schedule while really taking four hours to reach
+//     the dead-letter branch.
+//
+// Every timing check goes through here rather than reading the fields
+// directly, because each time one didn't, it silently measured a ladder that
+// was not the one running.
 func (s Schedule) RungBefore(n int) time.Duration {
-	if n < 2 {
+	switch {
+	case n < 2:
 		return 0
-	}
-	if len(s.ServerBackOff) == 0 {
+	case len(s.ServerBackOff) > 0:
+		return s.ServerBackOff[min(n-2, len(s.ServerBackOff)-1)]
+	case s.NakDelay > 0:
 		return s.Ladder().DelayFor(n - 1)
+	default:
+		return s.AckWait
 	}
-	return s.ServerBackOff[min(n-2, len(s.ServerBackOff)-1)]
 }
 
 // CumulativeTo is the total scheduled wait a message has served by the time it

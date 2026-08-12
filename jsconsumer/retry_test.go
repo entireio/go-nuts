@@ -1220,6 +1220,30 @@ func TestConfigPairsTheServerLadderWithRetry(t *testing.T) {
 	}
 }
 
+// TestConfigValidatesAnOmittedLadder: the schedule check must not be
+// skippable by leaving BackOff out. Start writes a nil BackOff to the durable,
+// which clears any ladder and leaves AckWait as the schedule — so an omitted
+// ladder is a real, and often very long, one.
+func TestConfigValidatesAnOmittedLadder(t *testing.T) {
+	r, _ := newTestRetry(t, func(c *RetryConfig) {
+		c.Monitor, c.Breaker = nil, BreakerObserve
+		c.MaxTimeToDeadLetter = 25 * time.Minute
+	})
+	cfg := Config{
+		Stream: "repo_refs_v1", Durable: "d", Name: "c",
+		AckWait: time.Hour, MaxDeliver: 6, Retry: r, // no BackOff at all
+	}
+	err := cfg.validate(nil, func(jetstream.Msg) {})
+	if err == nil || !strings.Contains(err.Error(), "MaxTimeToDeadLetter") {
+		t.Fatalf("validate(no BackOff, 1h AckWait) = %v, want the four-hour effective ladder rejected", err)
+	}
+	// Sized sensibly, the same shape is legitimate and must pass.
+	cfg.AckWait = 5 * time.Minute
+	if err := cfg.validate(nil, func(jetstream.Msg) {}); err != nil && !strings.Contains(err.Error(), "nil nats conn") {
+		t.Fatalf("validate(no BackOff, 5m AckWait) = %v, want it accepted", err)
+	}
+}
+
 // TestConfigRejectsRetryMaxDeliverMismatch: with Retry the terminal branch is
 // the DLQ capture, so a policy that disagrees with the broker's cap is a lost
 // message rather than a late one.

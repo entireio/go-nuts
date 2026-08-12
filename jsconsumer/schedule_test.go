@@ -200,6 +200,46 @@ func TestScheduleRepeatsTheLastServerRung(t *testing.T) {
 	}
 }
 
+// TestScheduleTreatsAckWaitAsTheLadderWhenThereIsNone is the regression for
+// the vacuous-pass bug: with no BackOff the broker does not stop redelivering,
+// it redelivers on the acknowledgement timeout. Scoring that as a
+// zero-duration schedule made every duration check pass trivially for the one
+// configuration most likely to be written by accident — an omitted ladder.
+func TestScheduleTreatsAckWaitAsTheLadderWhenThereIsNone(t *testing.T) {
+	// The reviewer's example: an hour of AckWait, no ladder, a 25-minute bound.
+	// Really reaches the dead-letter branch after four hours.
+	s := Schedule{
+		AckWait: time.Hour, MaxDeliver: 6, CaptureReserve: 1,
+		MaxTimeToDeadLetter: 25 * time.Minute,
+	}
+	if got, want := s.TimeToDeadLetter(), 4*time.Hour; got != want {
+		t.Fatalf("TimeToDeadLetter = %s, want %s (AckWait repeated to delivery 5)", got, want)
+	}
+	if vs := s.Validate(); !hasField(vs, "MaxTimeToDeadLetter") {
+		t.Errorf("a four-hour effective ladder passed a 25m bound; got %v", fields(vs))
+	}
+
+	// The same fallback feeds the breaker checks, which would otherwise see a
+	// zero rung and never fire.
+	breaker := Schedule{
+		AckWait: 45 * time.Minute, MaxDeliver: 6, CaptureReserve: 1,
+		FloorAge: 20 * time.Minute, RecoverBy: 2,
+	}
+	if vs := breaker.Validate(); !hasField(vs, "FloorAge") {
+		t.Errorf("a 45m AckWait rung under a 20m threshold passed; got %v", fields(vs))
+	}
+
+	// A modestly sized AckWait is a perfectly good ladder and must still pass:
+	// the fix is to model the fallback, not to outlaw it.
+	fine := Schedule{
+		AckWait: 5 * time.Minute, MaxDeliver: 6, CaptureReserve: 1,
+		MaxTimeToDeadLetter: 25 * time.Minute,
+	}
+	if vs := fine.Validate(); len(vs) != 0 {
+		t.Errorf("a 20m AckWait-driven ladder reported %v", fields(vs))
+	}
+}
+
 // TestScheduleChecksServerLaddersToo is the P2 regression: RecoverBy and the
 // largest-rung check used to read the CLIENT ladder fields directly, which are
 // zero for a server-side ladder. Both silently saw 0 and passed configurations

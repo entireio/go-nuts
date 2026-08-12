@@ -127,9 +127,9 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
 - **`jsconsumer.Schedule`** — a consumer's retry timing as plain values, and
   `Validate` / `Err`: the single implementation of the arithmetic that says
   whether it hangs together. Pure — no NATS connection, no I/O, no clock — so
-  the same function runs at `NewRetry` construction, in a fleet CI lint over
-  rendered NACK Consumer CRs at merge time, and (when bind-only mode lands) at
-  startup against the durable's real server-side config. Compile it in rather
+  the same function runs at `Start`, in a fleet CI lint over rendered NACK
+  Consumer CRs at merge time, and (when bind-only mode lands) at startup
+  against the durable's real server-side config. Compile it in rather
   than restating the arithmetic; duplicated timing maths is exactly how
   ENT-1535's consumer came to advertise 17h45m while really taking 34h22m.
   Checks the cumulative ladder against `MaxTimeToDeadLetter` and the stream's
@@ -161,9 +161,12 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
   Bound that ladder with `MaxTimeToDeadLetter` and it is the whole remedy: a
   poison message reaches capture-then-Ack inside the SLA with no inference
   about which message is at fault. This is what a consumer should adopt today.
-  Note the server repeats the last `backOff` entry once the array runs out, so
-  a short list is not a short ladder — `Schedule.TimeToDeadLetter` accounts for
-  that.
+  Two things about that ladder that are easy to get wrong, and that `Schedule`
+  models so the bound is checked against what actually runs: the server repeats
+  the last `backOff` entry once the array runs out, so a short list is not a
+  short ladder; and an *absent* `backOff` is not an absent ladder — the broker
+  redelivers on `AckWait`, so the effective schedule becomes AckWait repeated
+  up to `MaxDeliver`.
 
   Never a drop, and never a bare `Term`. A failed capture Naks instead, so the
   message survives and the stall stays visible — and `CaptureReserve` holds
