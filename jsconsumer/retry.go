@@ -472,6 +472,16 @@ type RetryConfig struct {
 // a short ladder — [Schedule.TimeToDeadLetter] accounts for that, and it is
 // the number to reason about.
 //
+// Worth seeing plainly in these numbers: with a ladder this tight the breaker
+// has almost no room. RecoverBy 4 requires FloorAge above 15 minutes, and the
+// ladder dead-letters at 20 — so the breaker can only fire on the very
+// delivery exhaustion would have handled anyway, and accelerates nothing. The
+// schedule is valid and Start accepts it; the breaker simply is not earning
+// its keep here. That is not an accident of this example, it is the general
+// case for a bounded ladder, and it is the substance of why the breaker ships
+// observe-only and may be deleted outright. A consumer that keeps a long
+// ladder for other failure classes is where it would have room.
+//
 // FloorAge is 20 minutes here rather than the 15-minute default for a reason
 // the checks will otherwise find for you: three 5-minute rungs put delivery 4
 // at exactly 15 minutes, so a 15-minute threshold could quarantine a

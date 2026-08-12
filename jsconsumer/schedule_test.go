@@ -312,3 +312,39 @@ func TestScheduleServerLadderBoundaries(t *testing.T) {
 		})
 	}
 }
+
+// TestScheduleRejectsAThresholdTheLadderNeverReaches: a FloorAge longer than
+// the time a message can spend on the ladder is a breaker that can never fire.
+// Exhaustion dead-letters the message first, every time — so the monitor, the
+// mode, and every dashboard built on them describe a mechanism that is inert.
+// Configured-but-dead is the ENT-1535 failure in miniature.
+func TestScheduleRejectsAThresholdTheLadderNeverReaches(t *testing.T) {
+	// Four hours of threshold over a five-minute ladder.
+	dead := Schedule{
+		ServerBackOff: []time.Duration{time.Minute}, AckWait: time.Minute,
+		MaxDeliver: 6, CaptureReserve: 1, FloorAge: 4 * time.Hour,
+	}
+	if got := dead.TimeToDeadLetter(); got != 4*time.Minute {
+		t.Fatalf("TimeToDeadLetter = %s, want 4m0s", got)
+	}
+	vs := dead.Validate()
+	if !hasField(vs, "FloorAge") {
+		t.Fatalf("a threshold the ladder never reaches passed; got %v", fields(vs))
+	}
+	if err := dead.Err(); err == nil || !strings.Contains(err.Error(), "could never fire") {
+		t.Errorf("Err = %v, want it to say the breaker can never fire", err)
+	}
+
+	// The boundary is the dead-letter delivery itself, because Settle weighs
+	// quarantine before exhaustion — so a threshold exactly equal to the
+	// ladder's reach can still fire, and one nanosecond past it cannot.
+	reachable := dead
+	reachable.FloorAge = 4 * time.Minute
+	if vs := reachable.Validate(); hasField(vs, "FloorAge") {
+		t.Errorf("a threshold reachable on the dead-letter delivery was rejected; got %v", fields(vs))
+	}
+	reachable.FloorAge = 4*time.Minute + time.Nanosecond
+	if vs := reachable.Validate(); !hasField(vs, "FloorAge") {
+		t.Errorf("a threshold one nanosecond past reach was accepted; got %v", fields(vs))
+	}
+}

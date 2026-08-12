@@ -220,6 +220,22 @@ func (s Schedule) Validate() []Violation {
 				add("RecoverBy", "the ladder reaches delivery %d after %s, at or past FloorAge (%s): a transient still inside its recovery window could be dead-lettered — shorten the ladder, lower RecoverBy, or raise FloorAge", s.RecoverBy, cum, s.FloorAge)
 			}
 		}
+		// A threshold the ladder never reaches is a breaker that can never
+		// fire — configured, named in every doc and dashboard, and inert. The
+		// ENT-1535 disease in miniature, so it is a violation rather than a
+		// quiet no-op. The breaker's last chance is the dead-letter delivery
+		// itself, since Settle weighs quarantine before exhaustion.
+		//
+		// Note the weaker case this does NOT reject: a threshold above
+		// CumulativeTo(DeadLetterDelivery-1) leaves the breaker able to fire
+		// only on the very delivery exhaustion would have handled anyway, so
+		// it accelerates nothing. That is a judgement about whether the
+		// breaker earns its keep on a given ladder, not a broken config, and
+		// on a tight bounded ladder it is the normal outcome.
+		if ttl := s.TimeToDeadLetter(); ttl > 0 && s.FloorAge > ttl {
+			add("FloorAge", "%s is longer than the %s this ladder takes to dead-letter a message: the breaker could never fire — shorten FloorAge, lengthen the ladder, or drop the monitor",
+				s.FloorAge, ttl)
+		}
 		// A breaker only ever fires on a delivery, so a rung longer than the
 		// threshold leaves the floor pinned for that rung after it arms.
 		if rung := s.LongestRung(); rung > s.FloorAge {

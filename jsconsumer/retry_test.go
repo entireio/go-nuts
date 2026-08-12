@@ -1171,7 +1171,9 @@ func TestConfigRejectsConflictingFloorMonitors(t *testing.T) {
 		Stream:       "repo_refs_v1",
 		Durable:      "search-indexer-refs",
 		Name:         "search-indexer-refs",
-		MaxDeliver:   5,
+		AckWait:      5 * time.Minute,
+		MaxDeliver:   6,
+		BackOff:      testLadder(),
 		Retry:        r,
 		FloorMonitor: mustFloorMonitor(FloorMonitorConfig{}), // a different one
 	}
@@ -1253,7 +1255,9 @@ func TestConfigRejectsRetryMaxDeliverMismatch(t *testing.T) {
 		Stream:     "repo_refs_v1",
 		Durable:    "search-indexer-refs",
 		Name:       "search-indexer-refs",
+		AckWait:    5 * time.Minute,
 		MaxDeliver: 7,
+		BackOff:    testLadder(),
 		Retry:      r,
 	}
 	_, err := Start(t.Context(), nil, cfg, func(jetstream.Msg) {})
