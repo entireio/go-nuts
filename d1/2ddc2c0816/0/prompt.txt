@@ -1,0 +1,44 @@
+Review done. Tests pass, `-race` clean, `golangci-lint` reports 0 issues. Findings below, most serious first.
+
+## 1. Regression: `MaxDeliver: -1` (unlimited) now fails `Start`/`Run` for *every* consumer
+
+`Config.validate` runs the new schedule check unconditionally (`jsconsumer/jsconsumer.go:247`), and `Config.schedule()` passes `EffectiveMaxDeliver()` straight through (`jsconsumer.go:285`). For the explicitly-supported unlimited setting that value is `-1` — `validate` itself accepts it eleven lines earlier (`jsconsumer.go:232`), `EffectiveMaxDeliver` returns it verbatim (`jsconsumer.go:195`), and `jsconsumer_test.go:174` pins it as "unlimited -1 stays unlimited". `Schedule.Validate` then rejects it (`schedule.go:175`):
+
+```
+Config{Stream:"s", Durable:"d", Name:"legacy", MaxDeliver:-1}.validate(...)
+→ jsconsumer(legacy): jsconsumer: incoherent retry schedule: MaxDeliver: must not be negative, got -1
+```
+
+No `Retry`, no `BackOff` — an untouched existing consumer. `Run` returns validate errors before the retry loop (`jsconsumer.go:506`), so it's a permanent hard-fail at startup. It also contradicts the module's own convention, which the README restates: `backoff.UnlimitedMaxDeliver = -1`, non-positive means unlimited.
+
+Two fixes, and I'd do both: have `Schedule.Validate` treat `-1` as unlimited (`MaxDeliver < -1` for the negativity check) or have `Config.schedule()` normalise non-positive to `0` ("unknown"); and gate the whole check on `c.Retry != nil || c.BackOff != nil`, so a consumer that adopted neither gains no new failure mode.
+
+Related ordering nit: the schedule check runs *before* the `Retry.MaxDeliver` vs `EffectiveMaxDeliver` cross-check (`jsconsumer.go:254`), so a genuine mismatch surfaces as the generic "incoherent retry schedule" message instead of the specific one written for it.
+
+## 2. Nothing rejects a `FloorAge` at or past the ladder's end — a breaker that can never fire
+
+`NewRetry` has the count-based version of this check (`retry.go:537`: "the breaker could never fire before the ladder exhausted") but there's no time-based equivalent. Verified: `FloorAge: 4h` against a `[1m]` ladder with `MaxDeliver: 6` and `Breaker: BreakerEnforce` → `Schedule.Err()` returns `nil`, with `TimeToDeadLetter` at 4m. Exactly the "looks configured, quietly does nothing" shape this package's validation exists to catch.
+
+The `Retry` doc's own first-adopter wiring (`retry.go:414`) lands on the boundary — I ran it: `TimeToDeadLetter=20m0s, FloorAge=20m0s`. The breaker needs `failingFor >= 20m` while the ladder dead-letters at 20m, so it's structurally inert in the config the package advertises. Harmless in `BreakerObserve` (the supported posture), but the multi-week observe soak that `BreakerEnforce` is gated on would measure zero trips from it. Suggest a `FloorAge >= TimeToDeadLetter` violation, plus either a different `FloorAge` in the example or a line saying the breaker is inert there on purpose.
+
+## 3. One stale doc survived `6143624`
+
+`shouldQuarantine`'s condition 3 (`retry.go:736`) still describes the removed inference: *"from its own delivery count against the ladder (message-local, exact)"*. The code takes `failingFor` from `noteFailure`'s measured per-process clock, whose own doc (`retry.go:644`) says the ladder-sum inference "was wrong in the one direction that matters". `(exact)` is also backwards — that clock resets on restart and is deliberately late.
+
+## 4. `Schedule.StreamMaxAge` never runs inside the library
+
+The README advertises `Schedule` checking the ladder against the stream's `maxAge`, and the type does — but `Config` has no retention input and `Config.schedule()` never sets the field (`jsconsumer.go:283`), so it only ever fires in fleet CI. `Start` already holds a JetStream handle and could fetch `StreamInfo`. Either wire it or say the check is CI-only; as written the README overstates what `Start` catches.
+
+## 5. Minor
+
+- **A failed capture burns the quarantine budget** (`retry.go:769` records the claim before `terminate` runs). In enforce mode a trip whose capture fails with deliveries left won't re-trip for a full `FloorAge`. Exhaustion still catches it, and the `BreakerObserve` doc arguably implies this is intended — worth one sentence either way.
+- **`sweepFailuresLocked` is O(n²) under `r.mu`** (`retry.go:694`): when the TTL pass frees nothing, the eviction loop rescans the whole map per victim — ~1024 scans of ~4096 entries, blocking `Settle` for every other message. One pass plus a partial selection would be linear. Only reachable in the >4096-failure storm the constant documents as "you have bigger problems".
+- **Observe-mode log gap**: the "breaker would dead-letter (observe only)" line only fires in `Settle`'s `default` branch (`retry.go:873`), so a trip coinciding with `ladderSpent` sets `BreakerTripped` but logs nothing under that name. Fine for metrics, a hole for log-based counting.
+
+## What's good
+
+The load-bearing insight — that `BackOff` governs ack *timeouts*, so not disposing is the disposition and a plain `Nak` skips the ladder — is correct, measured, and now documented where someone about to "fix" it will read it. Replacing the delivery-count inference with a measured clock is the right call for the reason given. `RungBefore`'s AckWait fallback closes a genuine blind spot: an absent `BackOff` is not an absent ladder. The lifecycle work is careful — `pollDone` is joined on *both* `Run` exit paths (`jsconsumer.go:530`, `540`), and `maxPolls` turns a reattach bug that nothing else would catch into a test assertion.
+
+## One thing to fix on the branch
+
+My scratch probe file got swept into commit `6143624` by a concurrent session while I was verifying findings — sorry about that. It's already been removed in `e150438`, which is ahead of origin by one. So the branch carries two commits of noise from my review; worth squashing into `6143624` before this merges, if the branch is force-pushable.

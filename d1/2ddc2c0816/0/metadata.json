@@ -1,0 +1,53 @@
+{
+  "cli_version": "0.9.0",
+  "checkpoint_id": "d12ddc2c0816",
+  "session_id": "fdaa4d69-95e1-4f90-a1a4-c28bb1a1c3ac",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-12T14:42:41.536088Z",
+  "branch": "nodo/ent-1601-jsconsumer-retry-schedule",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "README.md",
+    "jsconsumer/jsconsumer.go",
+    "jsconsumer/retry.go",
+    "jsconsumer/retry_test.go",
+    "jsconsumer/schedule.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-fable-5",
+  "turn_id": "ba4dd51b217f",
+  "checkpoint_transcript_start": 1324,
+  "transcript_lines_at_start": 1324,
+  "compact_transcript_start": 332,
+  "token_usage": {
+    "input_tokens": 13,
+    "cache_creation_tokens": 15597,
+    "cache_read_tokens": 4216013,
+    "output_tokens": 13732,
+    "api_call_count": 7
+  },
+  "session_metrics": {
+    "turn_count": 14
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-08-12T14:42:41.432354Z",
+    "agent_lines": 220,
+    "agent_removed": 45,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 220,
+    "total_lines_changed": 265,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    }
+  ]
+}
