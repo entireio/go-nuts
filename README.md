@@ -168,11 +168,11 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
   redelivers on `AckWait`, so the effective schedule becomes AckWait repeated
   up to `MaxDeliver`.
 
-  Never a drop, and never a bare `Term`. A failed capture Naks instead, so the
-  message survives and the stall stays visible — and `CaptureReserve` holds
+  Never a drop, and never a bare `Term`. A failed capture leaves the message
+  for the server to redeliver, so it survives and the stall stays visible — and `CaptureReserve` holds
   back deliveries specifically to retry it. When even those are spent the
-  message is reported as `OutcomeStranded`, not dressed up as a retry: a Nak
-  at the broker's cap is dropped, so nothing will touch it again and it needs
+  message is reported as `OutcomeStranded`, not dressed up as a retry: at the
+  delivery cap nothing redelivers, so nothing will touch it again and it needs
   the break-glass runbook. Alert on that outcome.
 
   **Explicit non-goal:** a handler that *dies* on the poison message — panics,

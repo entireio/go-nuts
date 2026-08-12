@@ -67,15 +67,16 @@ var _ stallSignal = (*FloorMonitor)(nil)
 type Outcome string
 
 const (
-	// OutcomeRetried means the delivery was Nak'd for redelivery on the
-	// ladder.
+	// OutcomeRetried means the delivery was left for the server to redeliver
+	// on its ladder — see [Retry.awaitRedelivery], where doing nothing IS the
+	// disposition.
 	OutcomeRetried Outcome = "retried"
 	// OutcomeDeadLettered means the raw message and its headers were captured
 	// to the DLQ subject and the original Acked, releasing the ack floor.
 	OutcomeDeadLettered Outcome = "dead_lettered"
 	// OutcomeStranded means the capture failed with no deliveries left to
-	// retry it: the broker will drop a Nak at this point, so nothing in the
-	// system will touch this message again. It is unsettled, it is pinning the
+	// retry it: the delivery cap is reached, so the broker will not redeliver
+	// and nothing in the system will touch this message again. It is unsettled, it is pinning the
 	// ack floor, and it needs an operator — the non-lossy break-glass in
 	// runbooks/nats-poison-ref-event.md. Alert on this; it is the one outcome
 	// no automation clears.
@@ -189,9 +190,9 @@ type RetryConfig struct {
 	//
 	// The redelivery SCHEDULE is not here, and not this package's: the server
 	// owns it, through the consumer's own BackOff (Config.BackOff, or a NACK
-	// Consumer CR's backOff). A failed delivery is plain-Nak'd and the server
-	// decides when it comes back. What this type owns is where the retries
-	// END — capture to a DLQ, then settle — plus the expectations below, which
+	// Consumer CR's backOff). A failed delivery is left untouched so the
+	// server's ack timeout brings it back on that ladder. What this type owns
+	// is where the retries END — capture to a DLQ, then settle — plus the expectations below, which
 	// Config.validate checks against whatever ladder the server is actually
 	// running.
 	MaxDeliver int
@@ -250,8 +251,8 @@ type RetryConfig struct {
 	// for retrying a FAILED dead-letter capture. The ladder exhausts at
 	// Backoff.MaxDeliver-CaptureReserve, so the first capture attempt still
 	// has that many deliveries behind it; without a reserve, a capture that
-	// fails on the broker's final delivery has nowhere to go — the Nak is
-	// dropped, and the message is stranded for an operator (OutcomeStranded).
+	// fails on the broker's final delivery has nowhere to go — no redelivery
+	// follows, and the message is stranded for an operator (OutcomeStranded).
 	// Zero uses DefaultCaptureReserve; explicit 0 is spelled
 	// [NoCaptureReserve] and accepts that risk.
 	CaptureReserve int
@@ -437,7 +438,7 @@ type RetryConfig struct {
 //		Stream: "repo_refs_v1", Durable: "search-indexer-refs",
 //		Name: "search-indexer-refs", MaxDeliver: 6,
 //		AckWait: ladder[0], // the server applies rung 0 in place of AckWait
-//		BackOff: ladder,    // the one schedule; Retry plain-Naks into it
+//		BackOff: ladder,    // the one schedule; Retry defers to it
 //		Retry:   retry,
 //	}
 //
@@ -814,7 +815,8 @@ func (r *Retry) spendQuarantineBudgetLocked(floor uint64, window time.Duration, 
 //     the Settlement and the message stays on the ladder;
 //   - exhaustion — the ladder is spent (delivery MaxDeliver-CaptureReserve or
 //     later): capture to the DLQ and Ack (Cause CauseExhausted);
-//   - the ladder — NakWithDelay for redelivery (Outcome OutcomeRetried).
+//   - the ladder — leave the delivery untouched so the server redelivers it
+//     (Outcome OutcomeRetried).
 //
 // reason is recorded on the captured copy's Nats-Dlq-Reason header, prefixed
 // with the cause, so the DLQ says why a message is there and not just that it
@@ -826,12 +828,13 @@ func (r *Retry) spendQuarantineBudgetLocked(floor uint64, window time.Duration, 
 // says which of two very different things happened:
 //
 //   - Deliveries remain (CaptureReserve is doing its job): the original is
-//     Nak'd, the error returned is settle:dlq_publish_failed, and the
+//     left for the server to redeliver, the error returned is
+//     settle:dlq_publish_failed, and the
 //     Settlement reports OutcomeRetried with the Cause of the terminal branch
 //     that could not complete — so the caller's metrics show a DLQ path being
 //     reached and failing rather than one sitting idle. The next delivery
 //     retries the capture.
-//   - No deliveries remain: a Nak here is dropped by the broker, so nothing
+//   - No deliveries remain: the delivery cap is reached, so nothing
 //     will retry. The Settlement reports [OutcomeStranded] and the message is
 //     left unsettled, pinning the ack floor so the monitor fires — ENT-1492's
 //     deliberate posture for a degraded DLQ path, and the one state this
@@ -892,8 +895,8 @@ func (r *Retry) terminate(ctx context.Context, msg jetstream.Msg, s Settlement, 
 
 	if err := r.capture(ctx, msg, s.Cause, reason); err != nil {
 		if spent {
-			// Out of deliveries: a Nak is dropped by the broker, so saying
-			// "retried" would be a lie. Leave it unsettled and name the state.
+			// Out of deliveries: no redelivery follows, so saying "retried"
+			// would be a lie. Leave it unsettled and name the state.
 			s.Outcome = OutcomeStranded
 			logger.ErrorContext(ctx, name+": message stranded; dead-letter capture failed with no deliveries left",
 				slog.Any("error", err),
@@ -962,8 +965,8 @@ func (r *Retry) terminate(ctx context.Context, msg jetstream.Msg, s Settlement, 
 // bare Term: same terminal effect on the consumer, but the raw message and
 // its headers survive in the DLQ.
 //
-// As in [Settle], a capture failure Naks rather than dropping, and returns
-// the error.
+// As in [Settle], a capture failure leaves the message for the server to
+// redeliver rather than dropping it, and returns the error.
 //
 // This is also the seam for an adopter that wants the stall signal without
 // the library's automatic disposition: build a [FloorMonitor], leave

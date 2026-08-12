@@ -115,8 +115,9 @@ type Config struct {
 
 	// BackOff mirrors jetstream.ConsumerConfig.BackOff: the redelivery
 	// ladder, one delay per redelivery, applied in place of AckWait. The
-	// server owns redelivery — this is the one schedule, and [Retry] plain-Naks
-	// into it rather than running a competing one client-side. JetStream
+	// server owns redelivery — this is the one schedule, and [Retry] defers to
+	// it by leaving a failed delivery untouched rather than running a
+	// competing one client-side. JetStream
 	// repeats the last rung once the array runs out, so a short list under a
 	// larger MaxDeliver is not a short ladder.
 	//

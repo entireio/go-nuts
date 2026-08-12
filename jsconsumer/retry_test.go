@@ -1343,55 +1343,69 @@ func TestProcessDeadLettersUndecodable(t *testing.T) {
 	}
 }
 
-// TestStartClearsStaleServerBackOff is the ENT-1535 migration hazard, driven
-// end to end: search-indexer-refs already carries a six-rung server ladder on
-// its durable. Adopting a Retry has to WIPE it, or the server keeps stretching
-// the library's NakWithDelay by those increments and the real envelope is
-// again neither ladder.
-func TestStartClearsStaleServerBackOff(t *testing.T) {
+// TestStartWritesTheConfiguredLadder covers the interim adoption path and the
+// hazard that comes with it, against a real broker.
+//
+// search-indexer-refs already carries a stale six-rung ladder on its durable.
+// Start writes Config.BackOff over it, so adopting the library replaces the
+// old envelope with the declared one — that is how the migration lands
+// without a separate consumer-config change.
+//
+// The same mechanism is why an OMITTED BackOff is dangerous rather than
+// neutral: Start sends whatever is configured, so a nil wipes the durable's
+// ladder and leaves AckWait as the schedule. A declaratively-managed ladder
+// cannot simply be left out here until bind-only mode exists.
+func TestStartWritesTheConfiguredLadder(t *testing.T) {
 	nc, js := runTestEnv(t)
 	if _, err := js.CreateStream(t.Context(), jetstream.StreamConfig{
 		Name: "repo_refs_v1", Subjects: []string{"repo.refs.>"},
 	}); err != nil {
 		t.Fatalf("create stream: %v", err)
 	}
-
-	// The durable as it exists in prod today.
+	// The durable as an earlier deployment left it.
 	stale := []time.Duration{5 * time.Minute, 10 * time.Minute, 30 * time.Minute, time.Hour}
 	if _, err := js.CreateOrUpdateConsumer(t.Context(), "repo_refs_v1", jetstream.ConsumerConfig{
-		Durable:    "search_indexer_refs",
-		AckPolicy:  jetstream.AckExplicitPolicy,
-		AckWait:    5 * time.Minute,
-		MaxDeliver: 5,
-		BackOff:    stale,
+		Durable: "search_indexer_refs", AckPolicy: jetstream.AckExplicitPolicy,
+		AckWait: 5 * time.Minute, MaxDeliver: 5, BackOff: stale,
 	}); err != nil {
-		t.Fatalf("create consumer with a server ladder: %v", err)
+		t.Fatalf("create consumer with a stale ladder: %v", err)
 	}
 
-	r, _ := newTestRetry(t, nil)
-	run, err := Start(t.Context(), nc, Config{
-		Stream:     "repo_refs_v1",
-		Durable:    "search_indexer_refs",
-		Name:       "search-indexer-refs",
-		AckWait:    5 * time.Minute,
-		MaxDeliver: 6,
-		Retry:      r,
-	}, func(jetstream.Msg) {})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
+	serverBackOff := func(t *testing.T) []time.Duration {
+		t.Helper()
+		cons, err := js.Consumer(t.Context(), "repo_refs_v1", "search_indexer_refs")
+		if err != nil {
+			t.Fatalf("consumer: %v", err)
+		}
+		info, err := cons.Info(t.Context())
+		if err != nil {
+			t.Fatalf("consumer info: %v", err)
+		}
+		return info.Config.BackOff
 	}
-	defer run.Stop()
+	start := func(t *testing.T, backOff []time.Duration) {
+		t.Helper()
+		r, _ := newTestRetry(t, nil)
+		run, err := Start(t.Context(), nc, Config{
+			Stream: "repo_refs_v1", Durable: "search_indexer_refs",
+			Name: "search-indexer-refs", AckWait: 5 * time.Minute,
+			MaxDeliver: 6, BackOff: backOff, Retry: r,
+		}, func(jetstream.Msg) {})
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		t.Cleanup(run.Stop)
+	}
 
-	cons, err := js.Consumer(t.Context(), "repo_refs_v1", "search_indexer_refs")
-	if err != nil {
-		t.Fatalf("consumer: %v", err)
+	start(t, testLadder())
+	if got := serverBackOff(t); len(got) != len(testLadder()) || got[0] != 5*time.Minute {
+		t.Fatalf("server BackOff = %v, want the declared ladder written over the stale one", got)
 	}
-	info, err := cons.Info(t.Context())
-	if err != nil {
-		t.Fatalf("consumer info: %v", err)
-	}
-	if len(info.Config.BackOff) != 0 {
-		t.Fatalf("server BackOff = %v, want it cleared so the library owns redelivery alone", info.Config.BackOff)
+
+	// And the hazard: omitting it erases what is there.
+	start(t, nil)
+	if got := serverBackOff(t); len(got) != 0 {
+		t.Fatalf("server BackOff = %v, want a nil Config.BackOff to have cleared it", got)
 	}
 }
 
