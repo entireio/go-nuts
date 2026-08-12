@@ -1,0 +1,11 @@
+• Request changes on PR #14 (https://github.com/entireio/go-nuts/pull/14), pinned at 167ff48 against 143ec67.
+
+  - [P1] Plain Nak bypasses the server ladder — jsconsumer/retry.go:1017. NATS applies consumer BackOff only to acknowledgement timeouts; Nak() requests immediate redelivery unless a delay is supplied (NATS consumer docs
+    (https://docs.nats.io/nats-concepts/jetstream/consumers)). Consequently, the documented five-minute ladder is never served: transient failures can hot-loop through MaxDeliver and reach the DLQ almost immediately. The test uses a fake
+    message and only verifies that Nak() was called.
+
+  - [P2] CR-managed BackOff is cleared at startup — jsconsumer/jsconsumer.go:379. The documentation says CR-managed consumers should leave Config.BackOff nil, but Start still calls CreateOrUpdateConsumer with that nil value. The existing
+    jsconsumer/retry_test.go:1319 confirms this erases the durable’s ladder. That adoption path requires bind-only behavior first.
+
+  - [P2] Server ladders bypass two breaker validations — jsconsumer/schedule.go:177. The RecoverBy and largest-rung checks call s.Ladder(), which contains only client-side NakDelay fields. With the intended ServerBackOff configuration,
+    both calculations see zero, so an unsafe recovery envelope passes validation.
