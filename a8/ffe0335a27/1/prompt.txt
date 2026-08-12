@@ -1,0 +1,10 @@
+did you commit?
+
+---
+
+can you concisely summarize this change?
+
+---
+
+- [P2] Public docs still describe the removed disposition behavior — jsconsumer/retry.go:182. They say failed deliveries are plain-Nak’d, the wiring example says Retry plain-Naks, and jsconsumer/retry.go:805 says NakWithDelay/Nak is
+    used. The implementation correctly leaves messages untouched for AckWait expiry. jsconsumer/jsconsumer.go:94 and the stale migration test contain the same contradiction.
