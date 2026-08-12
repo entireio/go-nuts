@@ -141,9 +141,12 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
   into one error.
 - **`jsconsumer.Retry`** — where a consumer's retries *end*: dead-letter
   capture, then settle. It does **not** own the redelivery schedule. The server
-  does — through the durable's `BackOff` ladder, set via `Config.BackOff` today
-  and via a NACK Consumer CR once fleet management lands — and `Retry`
-  plain-Naks into it.
+  does — through the durable's `BackOff` ladder, set via `Config.BackOff` — and
+  on the retry path `Retry` disposes of **nothing**, letting AckWait expire so
+  the ladder redelivers. That detail is load-bearing: `BackOff` governs
+  acknowledgement *timeouts*, so a plain `Nak` asks for immediate redelivery
+  and skips the ladder entirely (measured against a live server: 0s versus the
+  configured rung). A consumer that Naks burns `MaxDeliver` in milliseconds.
 
   That split is the ENT-1535 finding, not a detail. A JetStream consumer has
   two possible redelivery schedulers, and setting both does not pick one: the

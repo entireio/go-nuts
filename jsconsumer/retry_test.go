@@ -272,8 +272,11 @@ func TestSettleRetriesOnTheLadder(t *testing.T) {
 	if s.Outcome != OutcomeRetried || s.Cause != "" {
 		t.Errorf("Settlement = %+v, want retried with no cause", s)
 	}
-	if msg.Naks != 1 || len(msg.NakDelays) != 0 {
-		t.Errorf("Naks = %d, NakDelays = %v; want one plain Nak and no client-side delay (the server owns the schedule)", msg.Naks, msg.NakDelays)
+	// Nothing is disposed: the server's ladder redelivers on AckWait expiry,
+	// and a Nak here would ask for immediate redelivery instead, skipping it.
+	if msg.Naks != 0 || len(msg.NakDelays) != 0 || msg.Acked || msg.Termed {
+		t.Errorf("message disposed (naks=%d/%d ack=%v term=%v); want it left for the ladder",
+			msg.Naks, len(msg.NakDelays), msg.Acked, msg.Termed)
 	}
 	if msg.Acked || msg.Termed {
 		t.Errorf("message acked=%v termed=%v on a retry, want neither", msg.Acked, msg.Termed)
@@ -835,8 +838,8 @@ func TestSettleNeverDropsOnCaptureFailure(t *testing.T) {
 	if msg.Acked || msg.Termed {
 		t.Fatalf("message acked=%v termed=%v after a failed capture, want it unsettled", msg.Acked, msg.Termed)
 	}
-	if msg.Naks != 1 {
-		t.Errorf("Naks = %d, want 1 (one ladder nak)", msg.Naks)
+	if msg.Naks != 0 || len(msg.NakDelays) != 0 {
+		t.Errorf("message naked (%d/%d); want it left for the ladder to redeliver", msg.Naks, len(msg.NakDelays))
 	}
 	if s.Outcome != OutcomeRetried || s.Cause != CauseFloorAge {
 		t.Errorf("Settlement = %+v, want retried but still attributed to floor_age", s)
@@ -891,8 +894,8 @@ func TestCaptureReserveRetriesAFailedCapture(t *testing.T) {
 	if s.Outcome != OutcomeRetried || s.Cause != CauseExhausted {
 		t.Fatalf("Settlement = %+v, want retried but attributed to max_deliver", s)
 	}
-	if msg.Naks != 1 {
-		t.Errorf("Naks = %d, want 1 (the reserved delivery to be used)", msg.Naks)
+	if msg.Naks != 0 || len(msg.NakDelays) != 0 {
+		t.Errorf("message naked (%d/%d); the reserved delivery arrives via the ladder", msg.Naks, len(msg.NakDelays))
 	}
 	if msg.Acked || msg.Termed {
 		t.Error("message disposed despite a failed capture")
@@ -1116,8 +1119,8 @@ func TestDeadLetterNeverDropsOnCaptureFailure(t *testing.T) {
 	if msg.Acked || msg.Termed {
 		t.Errorf("acked=%v termed=%v after a failed capture, want it unsettled", msg.Acked, msg.Termed)
 	}
-	if msg.Naks != 1 {
-		t.Errorf("Naks = %d, want 1 (one ladder nak)", msg.Naks)
+	if msg.Naks != 0 || len(msg.NakDelays) != 0 {
+		t.Errorf("message naked (%d/%d); want it left for the ladder to redeliver", msg.Naks, len(msg.NakDelays))
 	}
 }
 
@@ -1556,5 +1559,81 @@ func TestStartWithoutBreakerRunsNoPoll(t *testing.T) {
 	run.Stop()
 	if r.Monitor() != nil {
 		t.Error("Retry reports a monitor it was not given")
+	}
+}
+
+// TestSettleActuallyServesTheServerLadder is the test whose absence let a P1
+// through: everything else here drives a FakeMsg and can only assert which
+// disposition method was called, which says nothing about whether the server
+// then honours the configured ladder.
+//
+// It does not. A consumer's BackOff governs acknowledgement TIMEOUTS —
+// measured against a live server, a plain Nak redelivers in 0s while letting
+// AckWait expire redelivers on the rung. An earlier revision of Settle plain-
+// Nak'd on the retry path, so the documented ladder was never served and a
+// transient failure hot-looped through MaxDeliver into the DLQ in
+// milliseconds. This pins the real timing against a real broker.
+func TestSettleActuallyServesTheServerLadder(t *testing.T) {
+	nc, js := runTestEnv(t)
+	if _, err := js.CreateStream(t.Context(), jetstream.StreamConfig{
+		Name: "repo_refs_v1", Subjects: []string{"repo.refs.>"},
+	}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	const rung = 900 * time.Millisecond
+	ladder := []time.Duration{rung, rung, rung}
+
+	r, pub := newTestRetry(t, func(c *RetryConfig) {
+		c.MaxDeliver, c.Monitor, c.Breaker = 4, nil, BreakerObserve
+	})
+	var mu sync.Mutex
+	var at []time.Time
+	run, err := Start(t.Context(), nc, Config{
+		Stream: "repo_refs_v1", Durable: "ladder", Name: "ladder",
+		AckWait: rung, MaxDeliver: 4, BackOff: ladder, Retry: r,
+	}, func(m jetstream.Msg) {
+		mu.Lock()
+		at = append(at, time.Now())
+		n := len(at)
+		mu.Unlock()
+		if n >= 3 {
+			return // let the last ones settle normally
+		}
+		if _, err := r.Settle(t.Context(), m, "transient"); err != nil {
+			t.Errorf("Settle: %v", err)
+		}
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer run.Stop()
+
+	if _, err := js.Publish(t.Context(), "repo.refs.update", []byte("ref")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(at)
+		mu.Unlock()
+		if n >= 3 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(at) < 3 {
+		t.Fatalf("saw %d deliveries in 15s, want 3", len(at))
+	}
+	for i := 1; i < 3; i++ {
+		gap := at[i].Sub(at[i-1])
+		if gap < rung/2 {
+			t.Errorf("redelivery %d came after %s, want ~%s: the ladder is being skipped, not served", i+1, gap, rung)
+		}
+	}
+	if n := len(pub.captured()); n != 0 {
+		t.Errorf("captured %d messages; a message riding the ladder must not reach the DLQ early", n)
 	}
 }

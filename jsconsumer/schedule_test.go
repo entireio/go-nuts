@@ -200,6 +200,44 @@ func TestScheduleRepeatsTheLastServerRung(t *testing.T) {
 	}
 }
 
+// TestScheduleChecksServerLaddersToo is the P2 regression: RecoverBy and the
+// largest-rung check used to read the CLIENT ladder fields directly, which are
+// zero for a server-side ladder. Both silently saw 0 and passed configurations
+// they exist to reject — in the only mode the library now ships.
+func TestScheduleChecksServerLaddersToo(t *testing.T) {
+	// A 30-minute server rung under a 20-minute breaker threshold: a transient
+	// sitting out that rung at the floor could be dead-lettered.
+	longRung := Schedule{
+		ServerBackOff: []time.Duration{30 * time.Minute},
+		MaxDeliver:    6, CaptureReserve: 1, AckWait: 30 * time.Minute,
+		FloorAge: 20 * time.Minute, RecoverBy: 2,
+	}
+	if vs := longRung.Validate(); !hasField(vs, "FloorAge") {
+		t.Errorf("a 30m server rung under a 20m threshold passed; got %v", fields(vs))
+	}
+
+	// Recovery expected at delivery 4, which a 10-minute server ladder reaches
+	// at 30 minutes — past the threshold, so the breaker could preempt it.
+	lateRecovery := Schedule{
+		ServerBackOff: []time.Duration{10 * time.Minute},
+		MaxDeliver:    6, CaptureReserve: 1, AckWait: 10 * time.Minute,
+		FloorAge: 20 * time.Minute, RecoverBy: 4,
+	}
+	if vs := lateRecovery.Validate(); !hasField(vs, "RecoverBy") {
+		t.Errorf("a recovery envelope past the threshold passed on a server ladder; got %v", fields(vs))
+	}
+
+	// The same shape, sized correctly, still passes.
+	ok := Schedule{
+		ServerBackOff: []time.Duration{5 * time.Minute},
+		MaxDeliver:    6, CaptureReserve: 1, AckWait: 5 * time.Minute,
+		FloorAge: 20 * time.Minute, RecoverBy: 4, MaxTimeToDeadLetter: 25 * time.Minute,
+	}
+	if vs := ok.Validate(); len(vs) != 0 {
+		t.Errorf("a correctly sized server ladder reported %v", fields(vs))
+	}
+}
+
 // TestScheduleServerLadderBoundaries walks the edges of the repeat-tail rule,
 // where an off-by-one silently changes the number fleet CI gates on.
 func TestScheduleServerLadderBoundaries(t *testing.T) {

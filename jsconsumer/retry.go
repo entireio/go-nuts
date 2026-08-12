@@ -110,7 +110,8 @@ type Settlement struct {
 	// FailingFor is how long this message has been failing, MEASURED from the
 	// first failure this process observed — the message-local half of the
 	// breaker's condition. It is not inferred from the delivery count, which
-	// JetStream also increments on AckWait expiry (see Retry.noteFailure), and
+	// JetStream also increments on AckWait expiry — which is the NORMAL
+	// redelivery path here, not an anomaly (see Retry.noteFailure) — and
 	// it restarts on process restart.
 	FailingFor time.Duration
 	// BreakerTripped reports that the quarantine condition was met for this
@@ -299,9 +300,16 @@ type RetryConfig struct {
 // # Who owns the schedule
 //
 // The SERVER does. A durable's BackOff ladder — set through Config.BackOff
-// today, through a NACK Consumer CR once Track D lands — is the single source
-// of truth for when a failed delivery comes back, and this type plain-Naks
-// into it. It does not run a schedule of its own.
+// today, through a NACK Consumer CR once bind-only mode lands — is the single
+// source of truth for when a failed delivery comes back. This type does not
+// run a schedule of its own; on the retry path it disposes of NOTHING, and the
+// ladder redelivers when AckWait expires.
+//
+// That last part is the whole mechanism, and it is easy to get wrong: BackOff
+// governs acknowledgement TIMEOUTS. A plain Nak asks for immediate redelivery
+// and the ladder is never consulted — measured against a live server, 0s
+// versus the configured rung — so a handler that Naks burns MaxDeliver in
+// milliseconds and reaches the DLQ at once. See [Retry.awaitRedelivery].
 //
 // That is not a detail, it is the ENT-1535 finding. A JetStream consumer has
 // two possible redelivery schedulers, and setting both does not pick one: the
@@ -440,15 +448,19 @@ type RetryConfig struct {
 //		case errors.Is(err, errUnprocessable):
 //			_, _ = retry.DeadLetter(ctx, msg, err.Error()) // no redelivery can fix it
 //		default:
-//			_, _ = retry.Settle(ctx, msg, err.Error()) // Nak, or the DLQ
+//			// Leaves the message for the server's ladder, or dead-letters it
+//			// once that ladder is spent. Never Acks a failure, never Naks.
+//			_, _ = retry.Settle(ctx, msg, err.Error())
 //		}
 //	}
 //
-// Setting the ladder here is the interim step. The app owns its consumer
-// today, so it declares the ladder it wants and Start writes it. When the
-// durable moves to a Consumer CR under Track D, the CR mirrors a server config
-// that already matches, Config.BackOff goes away, and nothing else changes —
-// one migration, not two.
+// Setting the ladder here is not optional today, and the reason matters for
+// anyone planning the declarative migration: Start always writes Config.BackOff
+// to the durable, so omitting it ERASES the ladder rather than deferring to
+// whatever set it. A CR-managed consumer therefore needs a bind-only mode that
+// skips consumer creation — that does not exist yet. Until it does, the app
+// declares the ladder here, and a CR can be authored to mirror a server config
+// that already matches so the eventual switch is a no-op.
 //
 // The ladder is what carries that configuration: the DLQ is reached on
 // delivery 5 of 6 — four 5-minute rungs, ~20 minutes — with the sixth held
@@ -575,19 +587,6 @@ func (r *Retry) expectations() Schedule {
 		s.FloorAge = r.monitor.FloorAge()
 	}
 	return s
-}
-
-// cumulativeDelay is the total scheduled wait a message has served by the time
-// it is delivered for the nth time: the rungs 1..n-1. Used at construction to
-// check the ladder against the breaker threshold. It is NOT used at runtime to
-// judge a message — see [Retry.noteFailure] for why elapsed failure time is
-// measured rather than inferred from a delivery count.
-func cumulativeDelay(p backoff.Policy, n int) time.Duration {
-	var total time.Duration
-	for i := 1; i < n; i++ {
-		total += p.DelayFor(i)
-	}
-	return total
 }
 
 // MaxDeliver reports the delivery cap this mechanism is built for; [Config]
@@ -879,7 +878,7 @@ func (r *Retry) Settle(ctx context.Context, msg jetstream.Msg, reason string) (S
 				slog.Uint64("ack_floor", floor),
 				slog.Duration("floor_stalled_for", age))
 		}
-		return r.nak(ctx, msg, s)
+		return r.awaitRedelivery(ctx, msg, s), nil
 	}
 	return r.terminate(ctx, msg, s, reason)
 }
@@ -905,12 +904,12 @@ func (r *Retry) terminate(ctx context.Context, msg jetstream.Msg, s Settlement, 
 			r.observe(ctx, msg, s)
 			return s, fmt.Errorf("settle:stranded: %w", err)
 		}
-		// Deliveries remain — fall back to the ladder so the capture is
-		// retried. Preserve the cause: the terminal branch was reached and
-		// could not complete.
-		naked, nakErr := r.nak(ctx, msg, s)
-		naked.Cause = s.Cause
-		return naked, errors.Join(err, nakErr)
+		// Deliveries remain — leave it to the ladder so the capture is retried
+		// on the next delivery. Preserve the cause: the terminal branch was
+		// reached and could not complete.
+		waiting := r.awaitRedelivery(ctx, msg, s)
+		waiting.Cause = s.Cause
+		return waiting, err
 	}
 	s.Captured = true
 
@@ -1011,19 +1010,28 @@ func (r *Retry) capture(ctx context.Context, msg jetstream.Msg, cause Cause, rea
 	return nil
 }
 
-// nak schedules the next delivery on the ladder and completes s.
-func (r *Retry) nak(ctx context.Context, msg jetstream.Msg, s Settlement) (Settlement, error) {
+// awaitRedelivery leaves the delivery UNTOUCHED so the server's ladder brings
+// it back, and completes s.
+//
+// Not acking is the disposition here, and it is deliberate rather than an
+// omission. A consumer's BackOff ladder governs acknowledgement TIMEOUTS: let
+// AckWait expire and the server redelivers on the configured rung. A plain
+// Nak does the opposite — it asks for immediate redelivery and the ladder is
+// never consulted, so a transient failure hot-loops through MaxDeliver and
+// reaches the DLQ in milliseconds. Measured against a live server with a
+// 3s/3s/3s ladder: Nak() redelivers in 0s, no-ack in 3s.
+//
+// NakWithDelay would schedule correctly but only by naming a delay this
+// process would have to know — reintroducing the second schedule that
+// ENT-1535 is about. Doing nothing is what defers to the one ladder.
+//
+// The cost is that the delivery stays ack-pending for the whole rung, so a
+// consumer with a long ladder and many concurrent failures needs MaxAckPending
+// sized for it. That is inherent to a server-side ladder, not to this choice.
+func (r *Retry) awaitRedelivery(ctx context.Context, msg jetstream.Msg, s Settlement) Settlement {
 	s.Outcome = OutcomeRetried
-	// Plain Nak: the server owns the redelivery schedule (Config.BackOff, or
-	// the consumer's CR), so naming a delay here would be this process
-	// second-guessing the one source of truth — and the server would stretch
-	// it by the BackOff increments anyway, which is the ENT-1535 defect.
-	err := msg.Nak()
 	r.observe(ctx, msg, s)
-	if err != nil {
-		return s, fmt.Errorf("settle:nak_failed: %w", err)
-	}
-	return s, nil
+	return s
 }
 
 func (r *Retry) observe(ctx context.Context, msg jetstream.Msg, s Settlement) {

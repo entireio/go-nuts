@@ -124,10 +124,13 @@ type Config struct {
 	// against MaxDeliver — is checked at Start through [Schedule], the same
 	// function fleet CI runs over a rendered NACK Consumer CR.
 	//
-	// A consumer whose ladder is managed declaratively (Track D) leaves this
-	// nil once its CR exists, and Start stops rewriting the durable's config.
-	// Until then the app sets it here and the CR mirrors what is already
-	// running.
+	// Required whenever Retry is set, and NOT because the field is decorative:
+	// Start always sends this value to CreateOrUpdateConsumer, so leaving it
+	// nil CLEARS whatever ladder the durable had. A consumer whose ladder is
+	// managed declaratively cannot simply omit it here — that erases the CR's
+	// ladder on every start. Declarative management needs a bind-only mode
+	// that skips consumer creation entirely, which does not exist yet; until
+	// it does, the app owns the ladder and states it here.
 	BackOff []time.Duration
 
 	// Retry is the library-owned retry mechanism: one redelivery ladder,

@@ -85,22 +85,50 @@ func (s Schedule) Ladder() backoff.Policy {
 // the delivery cap less whatever is reserved for retrying a failed capture.
 func (s Schedule) DeadLetterDelivery() int { return s.MaxDeliver - s.CaptureReserve }
 
+// RungBefore is the scheduled wait served before delivery number n (n >= 2),
+// from whichever ladder this schedule describes. JetStream repeats the LAST
+// server rung once the array runs out, so a short backoff list under a larger
+// maxDeliver is not a short ladder.
+//
+// Every timing check goes through here rather than reading the ladder fields
+// directly. Reading them directly is how the recovery-envelope and
+// largest-rung checks came to silently see zero for a server-side ladder and
+// pass configurations they exist to reject.
+func (s Schedule) RungBefore(n int) time.Duration {
+	if n < 2 {
+		return 0
+	}
+	if len(s.ServerBackOff) == 0 {
+		return s.Ladder().DelayFor(n - 1)
+	}
+	return s.ServerBackOff[min(n-2, len(s.ServerBackOff)-1)]
+}
+
+// CumulativeTo is the total scheduled wait a message has served by the time it
+// is delivered for the nth time.
+func (s Schedule) CumulativeTo(n int) time.Duration {
+	var total time.Duration
+	for i := 2; i <= n; i++ {
+		total += s.RungBefore(i)
+	}
+	return total
+}
+
+// LongestRung is the largest wait this schedule ever serves before the
+// terminal branch.
+func (s Schedule) LongestRung() time.Duration {
+	var longest time.Duration
+	for i := 2; i <= s.DeadLetterDelivery(); i++ {
+		longest = max(longest, s.RungBefore(i))
+	}
+	return longest
+}
+
 // TimeToDeadLetter is the cumulative scheduled wait before the terminal branch
 // runs — the number a stall SLA is actually about. It counts scheduled waits
 // only; handler time and a lost delivery's AckWait sit on top.
 func (s Schedule) TimeToDeadLetter() time.Duration {
-	if len(s.ServerBackOff) == 0 {
-		return cumulativeDelay(s.Ladder(), s.DeadLetterDelivery())
-	}
-	// JetStream repeats the LAST rung once the array runs out, so a short
-	// backoff list under a larger maxDeliver is not a short ladder — summing
-	// only the listed rungs would under-count the real time to the terminal
-	// branch, and pass a CR that actually breaches its bound.
-	var total time.Duration
-	for i := 1; i < s.DeadLetterDelivery(); i++ {
-		total += s.ServerBackOff[min(i-1, len(s.ServerBackOff)-1)]
-	}
-	return total
+	return s.CumulativeTo(s.DeadLetterDelivery())
 }
 
 // Validate reports every way the schedule does not hang together, most
@@ -175,13 +203,13 @@ func (s Schedule) Validate() []Violation {
 		// to the expected recovery reaches the threshold, the breaker can
 		// quarantine a transient that was still going to succeed.
 		if s.RecoverBy > 0 && s.RecoverBy <= s.DeadLetterDelivery() {
-			if cum := cumulativeDelay(s.Ladder(), s.RecoverBy); cum >= s.FloorAge {
+			if cum := s.CumulativeTo(s.RecoverBy); cum >= s.FloorAge {
 				add("RecoverBy", "the ladder reaches delivery %d after %s, at or past FloorAge (%s): a transient still inside its recovery window could be dead-lettered — shorten the ladder, lower RecoverBy, or raise FloorAge", s.RecoverBy, cum, s.FloorAge)
 			}
 		}
 		// A breaker only ever fires on a delivery, so a rung longer than the
 		// threshold leaves the floor pinned for that rung after it arms.
-		if rung := s.Ladder().DelayFor(s.MaxDeliver); rung > s.FloorAge {
+		if rung := s.LongestRung(); rung > s.FloorAge {
 			add("FloorAge", "the largest ladder rung (%s) exceeds FloorAge (%s): the breaker acts on a delivery, so the floor would stay pinned for up to FloorAge+%s", rung, s.FloorAge, rung)
 		}
 	}
