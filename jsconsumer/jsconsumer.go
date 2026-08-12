@@ -13,6 +13,20 @@
 // message's terminal disposition (Ack/Nak/Term); Process never touches a
 // message that decoded.
 //
+// The one exception to "disposition stays with the handler" is [Retry], the
+// scaffold's optional single retry mechanism: the redelivery ladder and the
+// dead-letter capture it terminates into (ENT-1535). A handler that
+// configures one calls [Retry.Settle] instead of picking a disposition
+// itself, and the package guarantees the consumer has exactly one redelivery
+// scheduler — a server-side Config.BackOff and a Retry are mutually
+// exclusive, because together neither is the real envelope.
+//
+// [FloorMonitor] is the separate, advisory half: it polls the durable's ack
+// floor and reports how long it has been stalled. Hand it to a Retry and it
+// becomes the floor-age circuit breaker, dead-lettering the message pinning a
+// stalled floor; use it alone and it is just the health signal, leaving the
+// quarantine decision to the adopter.
+//
 // Lifted from entire-api's internal/jsconsumer (COR-929), folding in the
 // module's shutdown classification ([nuts.IsShutdownFetchErr] gates the
 // consume-error log so a drain during rollout isn't reported as a fault,
@@ -97,6 +111,46 @@ type Config struct {
 	// the cluster. Measured in internal/brokersemantics
 	// (TestStreamConsumerLimitsAreInheritedBySilentConsumers).
 	MaxAckPending int
+
+	// BackOff mirrors jetstream.ConsumerConfig.BackOff: the redelivery
+	// ladder, one delay per redelivery, applied in place of AckWait. The
+	// server owns redelivery — this is the one schedule, and [Retry] plain-Naks
+	// into it rather than running a competing one client-side. JetStream
+	// repeats the last rung once the array runs out, so a short list under a
+	// larger MaxDeliver is not a short ladder.
+	//
+	// Setting it alongside Retry is the intended combination. Its coherence —
+	// total time to the dead-letter branch, agreement with AckWait, rung count
+	// against MaxDeliver — is checked at Start through [Schedule], the same
+	// function fleet CI runs over a rendered NACK Consumer CR.
+	//
+	// A consumer whose ladder is managed declaratively (Track D) leaves this
+	// nil once its CR exists, and Start stops rewriting the durable's config.
+	// Until then the app sets it here and the CR mirrors what is already
+	// running.
+	BackOff []time.Duration
+
+	// Retry is the library-owned retry mechanism: one redelivery ladder,
+	// dead-letter capture, and — when its RetryConfig names a FloorMonitor —
+	// the floor-age circuit breaker. When set, [Start] clears any server-side
+	// BackOff left on the durable and [Process] dead-letters an undecodable
+	// payload instead of Terming it. Its MaxDeliver must equal
+	// EffectiveMaxDeliver().
+	//
+	// Handlers reach it through the closure they build, and call
+	// [Retry.Settle] as their one disposition for a failed delivery. Nil
+	// leaves disposition entirely to the handler, as before.
+	Retry *Retry
+
+	// FloorMonitor runs the durable's ack-floor health signal: [Start] polls
+	// it and [Runner.Stop] joins that poll. Set it to publish the stall as a
+	// gauge, or to drive a quarantine rule of your own, without adopting the
+	// library's automatic breaker.
+	//
+	// Leave it nil when Retry already carries the monitor — Start uses that
+	// one. Naming two different monitors is a Start error: one durable has one
+	// ack floor, and one poll loop should read it.
+	FloorMonitor *FloorMonitor
 
 	// Tracer opens the per-message consumer span; nil uses the global OTel
 	// tracer provider.
@@ -196,10 +250,56 @@ func (c Config) validate(nc *nats.Conn, onMsg func(jetstream.Msg)) error {
 	if c.InactiveThreshold < 0 {
 		return fmt.Errorf("jsconsumer(%s): InactiveThreshold must not be negative", c.Name)
 	}
+	// The whole retry schedule — the server's ladder plus whatever the Retry
+	// expects of it — is checked in one place, by the same function fleet CI
+	// runs over a rendered Consumer CR and a future bind-only mode will run
+	// against the durable's live config. See [Schedule].
+	if err := c.schedule().Err(); err != nil {
+		return fmt.Errorf("jsconsumer(%s): %w", c.Name, err)
+	}
+	if c.FloorMonitor != nil && c.Retry != nil && c.Retry.Monitor() != nil && c.FloorMonitor != c.Retry.Monitor() {
+		return fmt.Errorf("jsconsumer(%s): %w", c.Name, errMonitorConflict)
+	}
+	if c.Retry != nil && c.Retry.MaxDeliver() != c.EffectiveMaxDeliver() {
+		// A policy that disagrees with the broker either never reaches its
+		// terminal branch or reaches it early (COR-762) — and with Retry the
+		// terminal branch is the DLQ capture, so the disagreement is a lost
+		// message rather than a late one.
+		return fmt.Errorf("jsconsumer(%s): Retry MaxDeliver is %d but the consumer's is %d: they must match or the dead-letter branch misses the broker's final delivery", c.Name, c.Retry.MaxDeliver(), c.EffectiveMaxDeliver())
+	}
 	if nc == nil {
 		return fmt.Errorf("jsconsumer(%s): nil nats conn", c.Name)
 	}
 	return nil
+}
+
+// floorMonitor is the single monitor this consumer polls: the one named on
+// the Config, or the one its Retry carries. validate has already rejected two
+// different ones.
+func (c Config) floorMonitor() *FloorMonitor {
+	if c.FloorMonitor != nil {
+		return c.FloorMonitor
+	}
+	if c.Retry != nil {
+		return c.Retry.Monitor()
+	}
+	return nil
+}
+
+// schedule is this consumer's retry timing as plain values: the server ladder
+// it runs, and the client-side expectations its Retry holds about that ladder.
+func (c Config) schedule() Schedule {
+	s := Schedule{
+		ServerBackOff: c.BackOff,
+		MaxDeliver:    c.EffectiveMaxDeliver(),
+		AckWait:       c.EffectiveAckWait(),
+	}
+	if c.Retry != nil {
+		exp := c.Retry.expectations()
+		s.CaptureReserve, s.MaxTimeToDeadLetter = exp.CaptureReserve, exp.MaxTimeToDeadLetter
+		s.RecoverBy, s.FloorAge = exp.RecoverBy, exp.FloorAge
+	}
+	return s
 }
 
 func (c Config) tracer() trace.Tracer {
@@ -241,7 +341,11 @@ type Runner struct {
 	// intentionally internal: callers synchronize on Stop, while tests pin that
 	// an explicit Stop does not retain a goroutine until the parent context ends.
 	watcherDone <-chan struct{}
-	stop        sync.Once
+	// pollDone closes when the Config.Retry ack-floor poll exits; nil when no
+	// breaker is armed. Stop joins it, so the connection the poll reads
+	// through is safe to drain the moment Stop returns.
+	pollDone <-chan struct{}
+	stop     sync.Once
 }
 
 // Stop halts the consume loop and blocks until it has fully wound down —
@@ -257,6 +361,9 @@ func (r *Runner) Stop() {
 	}
 	r.stop.Do(r.cc.Stop)
 	<-r.closed
+	if r.pollDone != nil {
+		<-r.pollDone
+	}
 }
 
 // Start creates/updates the durable consumer on nc and begins delivering
@@ -285,6 +392,12 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 		FilterSubjects:    cfg.FilterSubjects,
 		InactiveThreshold: cfg.InactiveThreshold,
 		MaxAckPending:     cfg.MaxAckPending,
+		// Always sent, so an update carries it: with Config.Retry set this is
+		// nil by validation, which CLEARS a server ladder an earlier
+		// deployment left on the durable. Adopting Retry without that clear
+		// would leave the two schedulers composing exactly as ENT-1535 found
+		// them, with the library believing it owned redelivery.
+		BackOff: cfg.BackOff,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("jsconsumer(%s): create consumer %s/%s: %w", cfg.Name, cfg.Stream, cfg.Durable, err)
@@ -307,6 +420,18 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 	}
 	watcherDone := make(chan struct{})
 	r := &Runner{cc: cc, closed: cc.Closed(), watcherDone: watcherDone}
+	if cfg.Retry != nil {
+		cfg.Retry.attach(cfg.Name, cfg.logger())
+	}
+	if mon := cfg.floorMonitor(); mon != nil {
+		mon.attach(cons, cfg.Name, cfg.logger())
+		pollDone := make(chan struct{})
+		r.pollDone = pollDone
+		go func() {
+			defer close(pollDone)
+			mon.pollFloor(ctx, r.closed)
+		}()
+	}
 	go func() {
 		defer close(watcherDone)
 		select {
@@ -416,6 +541,13 @@ func Run(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.Ms
 				cancelAttempt()
 				return nil
 			case <-r.closed:
+				// Join before recreating, not just cancel: the attempt's
+				// ack-floor poll may still be in an in-flight consumer-info
+				// request against the OLD consumer, and the next Start attaches
+				// the same monitor to a new one. Without the join that reply
+				// can land after the reattach and overwrite fresh state with
+				// stale. Stop is cheap here — the loop has already closed.
+				r.Stop()
 				cancelAttempt()
 				if ctx.Err() != nil {
 					return nil //nolint:nilerr // the loop closing during shutdown is the expected wind-down, not a fault
@@ -466,10 +598,24 @@ func Process[E any](
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "decode")
-		cfg.logger().WarnContext(ctx, cfg.Name+": decode "+cfg.Stream+"; term",
+		disposition := "term"
+		if cfg.Retry != nil {
+			disposition = "dead-letter"
+		}
+		cfg.logger().WarnContext(ctx, cfg.Name+": decode "+cfg.Stream+"; "+disposition,
 			slog.Any("error", err), slog.String("subject", msg.Subject()))
 		if onUndecodable != nil {
 			onUndecodable(ctx)
+		}
+		if cfg.Retry != nil {
+			// Same terminal effect as the Term below, but the payload
+			// survives: a bare Term is the last drop-without-a-record surface
+			// in this scaffold, and a Retry is exactly the capture path that
+			// closes it.
+			if _, dlErr := cfg.Retry.DeadLetter(ctx, msg, "undecodable: "+err.Error()); dlErr != nil {
+				cfg.logger().WarnContext(ctx, cfg.Name+": dead-letter undecodable failed", slog.Any("error", dlErr))
+			}
+			return
 		}
 		if termErr := msg.Term(); termErr != nil {
 			cfg.logger().WarnContext(ctx, cfg.Name+": term failed", slog.Any("error", termErr))
