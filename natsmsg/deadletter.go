@@ -26,6 +26,38 @@ const (
 	DLQStreamSeqHeader = "Nats-Dlq-Stream-Seq"
 )
 
+// dlqStrippedHeaders are the JetStream publish-control headers removed when
+// copying an original into the DLQ. They are instructions to the BROKER about
+// the publish, not metadata about the payload, and every one of them is
+// evaluated against the stream being published TO — so carried onto the DLQ
+// they are asserted about the wrong stream.
+//
+// This is not hypothetical tidiness. An original published with
+// Nats-Expected-Stream naming its own stream fails the capture publish with
+// err 10060 on EVERY attempt, so the message rides the whole ladder and ends
+// as a strand with the floor still pinned — one producer class defeating the
+// "never drop, never strand silently" guarantee, and defeating the breaker
+// identically since it too terminates through this capture. Nats-Rollup is
+// worse than a failed publish: honoured on the DLQ it would purge the very
+// subject the DLQ exists to retain.
+//
+// Nats-Msg-Id is deliberately NOT in this list. It is the publisher's dedupe
+// key rather than an assertion about stream state, and keeping it is what makes
+// a re-capture idempotent: when the DLQ publish succeeds but the original's Ack
+// does not, the message redelivers and is captured a second time (the
+// settle:dlq_ack_failed path in jsconsumer.Retry, which prefers a duplicate in
+// the DLQ over a pinned floor). Inside the DLQ stream's duplicate window that
+// second publish collapses onto the first, so the deliberate duplicate does not
+// become two copies for a replay tool to reconcile.
+var dlqStrippedHeaders = []string{
+	jetstream.ExpectedStreamHeader,
+	jetstream.ExpectedLastSeqHeader,
+	jetstream.ExpectedLastSubjSeqHeader,
+	jetstream.ExpectedLastSubjSeqSubjHeader,
+	jetstream.ExpectedLastMsgIDHeader,
+	jetstream.MsgRollup,
+}
+
 // DLQPublisher is the publish surface DeadLetter needs — the modern
 // [JetStream] publish primitive (satisfied by jetstream.JetStream), aliased
 // so DeadLetter's signature reads in DLQ terms. Kept minimal so wiring can
@@ -63,7 +95,9 @@ func SubjectToken(s string) string {
 
 // DeadLetter republishes a poison message to dlqSubject, preserving its payload
 // and headers and adding Nats-Dlq-* provenance (reason, origin subject,
-// delivery count, stream sequence).
+// delivery count, stream sequence). JetStream publish-control headers are the
+// one exception to "preserving headers" and are stripped — see
+// dlqStrippedHeaders.
 //
 // It is the capture step a consumer runs before giving up on a message it can
 // never process. DeadLetter copies the poison to a durable DLQ subject so it can
@@ -81,6 +115,13 @@ func DeadLetter(ctx context.Context, pub DLQPublisher, dlqSubject string, msg je
 	hdr := nats.Header{}
 	for k, v := range msg.Headers() {
 		hdr[k] = append([]string(nil), v...)
+	}
+	// Drop the broker directives before they are re-asserted against the DLQ
+	// stream. Deleting after the copy rather than filtering inside it keeps the
+	// stripped set readable in one place; see dlqStrippedHeaders for why each
+	// one has to go and why Nats-Msg-Id stays.
+	for _, h := range dlqStrippedHeaders {
+		hdr.Del(h)
 	}
 	hdr.Set(DLQReasonHeader, reason)
 	hdr.Set(DLQOriginHeader, msg.Subject())
