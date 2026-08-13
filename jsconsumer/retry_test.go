@@ -1012,6 +1012,96 @@ func TestTerminalAckIsConfirmed(t *testing.T) {
 	}
 }
 
+// ctxRespectingDLQ fails a publish on a cancelled context, the way a real
+// JetStream publish does. The ordinary fakeDLQ ignores ctx entirely, so a
+// cancellation test written against it would pass just as happily on code that
+// captures on the handler's cancelled context — the fake would never notice.
+type ctxRespectingDLQ struct {
+	fakeDLQ
+	sawDone []bool // one entry per publish: whether its ctx was cancellable at all
+}
+
+func (f *ctxRespectingDLQ) PublishMsg(ctx context.Context, m *nats.Msg, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+	f.mu.Lock()
+	f.sawDone = append(f.sawDone, ctx.Done() != nil)
+	f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return f.fakeDLQ.PublishMsg(ctx, m, opts...)
+}
+
+// ctxRecordingMsg reports the context its DoubleAck was given. FakeMsg accepts
+// and discards it, so the ack half of the terminate path needs this to be
+// observable at all.
+type ctxRecordingMsg struct {
+	*natsmsgtest.FakeMsg
+	ackCtxErr  error
+	ackCtxDone bool
+}
+
+func (m *ctxRecordingMsg) DoubleAck(ctx context.Context) error {
+	m.ackCtxErr, m.ackCtxDone = ctx.Err(), ctx.Done() != nil
+	return m.FakeMsg.DoubleAck(ctx)
+}
+
+// TestTerminateSurvivesAShutdownCancelledContext: a shutdown racing the FINAL
+// delivery must not manufacture a strand.
+//
+// The documented ordering cancels the loops' context, joins them, and only then
+// drains the connections (nuts.ShutdownGroup), so for the whole join window the
+// handler ctx is done while the connection still works. Capturing on that ctx
+// failed on ctx.Err() alone and reported OutcomeStranded — the one outcome that
+// means "a human must run the break-glass runbook" — for a message the broker
+// would have accepted. The terminal path therefore runs on a context derived
+// with WithoutCancel, still bounded by its own timeouts.
+func TestTerminateSurvivesAShutdownCancelledContext(t *testing.T) {
+	pub := &ctxRespectingDLQ{}
+	r, err := NewRetry(testRetryConfig(pub))
+	if err != nil {
+		t.Fatalf("NewRetry: %v", err)
+	}
+	msg := &ctxRecordingMsg{FakeMsg: deliveredMsg(2774437, finalDelivery)}
+
+	// Exactly the state Shutdown leaves behind during the join window: context
+	// cancelled, connection still up.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	s, err := r.Settle(ctx, msg, "still not ready")
+	if err != nil {
+		t.Fatalf("Settle on a cancelled context: %v (want the capture to proceed)", err)
+	}
+	if s.Outcome != OutcomeDeadLettered {
+		t.Errorf("Outcome = %q, want %q — a cancelled handler context must not invent a strand",
+			s.Outcome, OutcomeDeadLettered)
+	}
+	if !s.Captured {
+		t.Error("not captured; the DLQ copy is the whole point of the terminal path")
+	}
+	if got := len(pub.captured()); got != 1 {
+		t.Errorf("captured %d messages, want 1", got)
+	}
+	if msg.DoubleAcks != 1 {
+		t.Errorf("DoubleAcks = %d, want 1 — the floor is only released by a confirmed ack", msg.DoubleAcks)
+	}
+	if msg.ackCtxErr != nil {
+		t.Errorf("DoubleAck ctx.Err() = %v, want nil", msg.ackCtxErr)
+	}
+
+	// Both halves keep a Done channel, because each still applies its own
+	// timeout — detaching cancellation must not mean detaching the bound.
+	if !msg.ackCtxDone {
+		t.Error("DoubleAck ctx has no deadline; dlqAckTimeout is no longer bounding it")
+	}
+	pub.mu.Lock()
+	sawDone := append([]bool(nil), pub.sawDone...)
+	pub.mu.Unlock()
+	if len(sawDone) != 1 || !sawDone[0] {
+		t.Errorf("capture ctx cancellable = %v, want exactly one bounded publish", sawDone)
+	}
+}
+
 // TestSettleNeverTerms pins the invariant across every path: this package's
 // terminal branch is dead-letter-then-Ack, and a bare Term — which does not
 // settle a message and leaves no record of it — never happens.

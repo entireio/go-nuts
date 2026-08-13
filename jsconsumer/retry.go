@@ -971,7 +971,31 @@ func (r *Retry) terminate(ctx context.Context, msg jetstream.Msg, s Settlement, 
 	logger, name := r.log()
 	spent := s.Delivered > 0 && s.Delivered >= r.cfg.MaxDeliver
 
-	if err := r.capture(ctx, msg, s.Cause, reason); err != nil {
+	// Capture and settle on a context that shutdown cannot cancel. The module's
+	// shutdown ordering cancels the loops' context, joins them, and only THEN
+	// drains the connections (nuts.ShutdownGroup, COR-923) — so throughout the
+	// join window this ctx is already done while the connection is still fully
+	// usable. On the handler ctx a rollout landing on the FINAL delivery fails
+	// the capture on ctx.Err() alone and reports OutcomeStranded: a strand
+	// manufactured by timing, on a message that was perfectly capturable with
+	// the broker right there. The same cancellation on the DoubleAck would
+	// report OutcomeUncertain and point a responder at a message that only
+	// needed one more round-trip.
+	//
+	// Detaching cancellation cannot hang the drain, because neither operation
+	// was relying on ctx for its bound: the capture publish and the DoubleAck
+	// each apply their own (dlqPublishTimeout, dlqAckTimeout). WithoutCancel
+	// drops the parent's deadline along with its cancellation, which is why
+	// those explicit bounds are what matters. This narrows the window rather
+	// than closing it absolutely — a terminate outlasting nuts.DefaultJoinTimeout
+	// still has the connection drained under it — but it removes the case that
+	// failed immediately and by construction.
+	//
+	// Values are preserved, so the span and trace context the handler was given
+	// still carry into the capture.
+	settleCtx := context.WithoutCancel(ctx)
+
+	if err := r.capture(settleCtx, msg, s.Cause, reason); err != nil {
 		if spent {
 			// Out of deliveries: no redelivery follows, so saying "retried"
 			// would be a lie. Leave it unsettled and name the state.
@@ -999,7 +1023,7 @@ func (r *Retry) terminate(ctx context.Context, msg jetstream.Msg, s Settlement, 
 	// confirmation is what makes the settlement a fact rather than a hope, and
 	// it costs one round-trip on a path that only runs when a message is being
 	// given up on.
-	ackCtx, cancel := context.WithTimeout(ctx, dlqAckTimeout)
+	ackCtx, cancel := context.WithTimeout(settleCtx, dlqAckTimeout)
 	defer cancel()
 	if err := msg.DoubleAck(ackCtx); err != nil {
 		if spent {
