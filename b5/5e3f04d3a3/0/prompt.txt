@@ -1,0 +1,18 @@
+• Request changes on local head d2d7515.
+
+  - [P1] DLQ copies still retain counter and atomic-batch control headers. The denylist in natsmsg/deadletter.go:75 omits Nats-Incr, Nats-Counter-Sources, and Nats-Batch-{Id,Sequence,Commit}. With pinned NATS 2.14.3:
+      - Nats-Incr is rejected by an ordinary non-counter DLQ (/Users/nodo/go/pkg/mod/github.com/nats-io/nats-server/v2@v2.14.3/server/stream.go:6310).
+      - Nats-Batch-Id is rejected when atomic publishing is disabled (/Users/nodo/go/pkg/mod/github.com/nats-io/nats-server/v2@v2.14.3/server/jetstream_batching_test.go:63).
+
+    Consequently, terminal capture of such messages can repeatedly fail and strand the original. Strip the complete server-side directive set—including Nats-Schedule-Rollup—and add broker-backed regressions.
+
+  The previous AckFloor guidance and dedupe collision findings are fixed locally. TTL and exported schedule headers are now stripped, but that fix is incomplete as described above.
+
+  Validation passed:
+
+  - Focused tests
+  - Full go test -race ./...
+  - golangci-lint
+  - git diff --check
+
+  GitHub PR #14 still points to 79427bc; these two fix commits are local and unpushed. GitHub currently reports no checks.
