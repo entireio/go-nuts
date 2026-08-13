@@ -61,6 +61,11 @@ var publishDirectives = map[string]string{
 	natsserver.JSScheduleRollup:          "sub",
 }
 
+// testDomain is the JetStream domain the domain-aware tests configure. A domain
+// reaches message metadata only via the V2 ack subject — see
+// TestMsgMetadataDomainNeedsTheV2AckSubject.
+const testDomain = "hub"
+
 // publishAPIErr publishes msg and returns the JetStream API error it was refused
 // with, or nil if it was accepted.
 func publishAPIErr(t *testing.T, js jetstream.JetStream, msg *nats.Msg) *jetstream.APIError {
@@ -466,6 +471,201 @@ func TestReCaptureKeepsTheFirstHopProvenance(t *testing.T) {
 	}
 	if got := hop2.Header.Get(natsmsg.DLQHopsHeader); got != "2" {
 		t.Errorf("hop count = %q, want 2 after capturing a DLQ record", got)
+	}
+}
+
+// TestMsgMetadataDomainNeedsTheV2AckSubject records where an origin domain can come
+// from at all, because natsmsg's provenance has a field for it and the answer is
+// narrower than "configure a domain".
+//
+// The domain reaches a client only as a token of the $JS.ACK reply subject, and on
+// 2.14.3 the server emits the domain-bearing V2 form only when the js_ack_fc_v2
+// feature flag is on — it is OFF by default. So a deployment can run with
+// JetStreamDomain set and still hand every consumer a domainless
+// MsgMetadata.Domain. Two consequences worth having written down: an absent
+// Nats-Dlq-Origin-Domain on a captured record is the NORMAL case rather than a bug,
+// and turning the flag on later must not make a later hop start claiming its domain
+// as an older record's origin — which is what
+// TestReCaptureAcrossDomainsKeepsTheDomainlessOrigin pins.
+func TestMsgMetadataDomainNeedsTheV2AckSubject(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		v2Ack bool
+		want  string
+	}{
+		"default ack format": {false, ""},
+		"v2 ack format":      {true, testDomain},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			srv := startServer(t, func(o *natsserver.Options) {
+				o.JetStreamDomain = testDomain
+				if tc.v2Ack {
+					o.FeatureFlags = map[string]bool{natsserver.FeatureFlagJsAckFormatV2: true}
+				}
+			})
+			nc, _ := connect(t, srv)
+			js, err := jetstream.NewWithDomain(nc, testDomain)
+			if err != nil {
+				t.Fatalf("jetstream.NewWithDomain: %v", err)
+			}
+			newStream(t, js, jetstream.StreamConfig{Name: "events", Subjects: []string{"events.>"}})
+			cons := newConsumer(t, js, "events", jetstream.ConsumerConfig{
+				Durable:       "domain_reader",
+				AckPolicy:     jetstream.AckExplicitPolicy,
+				AckWait:       time.Minute,
+				FilterSubject: "events.repo",
+			})
+			publish(t, js, "events.repo", "payload")
+
+			msgs := fetchAll(t, cons, 1)
+			if len(msgs) != 1 {
+				t.Fatalf("fetched %d messages, want 1", len(msgs))
+			}
+			meta, err := msgs[0].Metadata()
+			if err != nil {
+				t.Fatalf("metadata: %v", err)
+			}
+			if meta.Domain != tc.want {
+				t.Errorf("MsgMetadata.Domain = %q with JetStreamDomain set, want %q", meta.Domain, tc.want)
+			}
+		})
+	}
+}
+
+// TestReCaptureAcrossDomainsKeepsTheDomainlessOrigin is the cross-domain case,
+// measured on two real brokers because it needs two: a message whose origin was
+// recorded OUTSIDE a JetStream domain, re-captured INSIDE one.
+//
+// A domainless deployment records no origin domain — there is none. Reading that
+// absence as "not recorded yet" let the second hop supply its OWN domain as the
+// message's origin, which is provenance that is silently wrong rather than missing.
+// An explicit origin-recorded marker is what closes it: the block is written once,
+// whole, and afterwards only carried, absences included.
+func TestReCaptureAcrossDomainsKeepsTheDomainlessOrigin(t *testing.T) {
+	t.Parallel()
+
+	// Hop 1: a deployment with no JetStream domain at all.
+	_, plainJS := env(t)
+	newStream(t, plainJS, jetstream.StreamConfig{Name: "events_dlq_nodomain", Subjects: []string{"dlq.nodomain.>"}})
+	cons := newConsumer(t, plainJS, "events", jetstream.ConsumerConfig{
+		Durable:       "nodomain_capturer",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       time.Minute,
+		FilterSubject: "events.repo",
+	})
+	orig := nats.NewMsg("events.repo")
+	orig.Data = []byte(`{"repo":"01KWHDFJ0C"}`)
+	orig.Header.Set(jetstream.MsgIDHeader, "producer/01KWHDFJ0C")
+	if _, err := plainJS.PublishMsg(t.Context(), orig); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	msgs := fetchAll(t, cons, 1)
+	if len(msgs) != 1 {
+		t.Fatalf("fetched %d messages, want 1", len(msgs))
+	}
+	if meta, err := msgs[0].Metadata(); err != nil {
+		t.Fatalf("metadata: %v", err)
+	} else if meta.Domain != "" {
+		t.Fatalf("hop 1 ran in domain %q, want none — this case is about a domainless origin", meta.Domain)
+	}
+	if err := natsmsg.DeadLetter(t.Context(), plainJS, "dlq.nodomain.bad_body", msgs[0], "bad_body"); err != nil {
+		t.Fatalf("DeadLetter (hop 1): %v", err)
+	}
+
+	plainDLQ, err := plainJS.Stream(t.Context(), "events_dlq_nodomain")
+	if err != nil {
+		t.Fatalf("hop-1 dlq stream: %v", err)
+	}
+	hop1, err := plainDLQ.GetMsg(t.Context(), 1)
+	if err != nil {
+		t.Fatalf("read hop-1 record: %v", err)
+	}
+	if v := hop1.Header.Get(natsmsg.DLQOriginRecordedHeader); v == "" {
+		t.Fatal("hop-1 record is not marked origin-recorded; the marker is what makes the absence below meaningful")
+	}
+	if v := hop1.Header.Get(natsmsg.DLQOriginDomainHeader); v != "" {
+		t.Fatalf("hop-1 record has origin domain %q, want none", v)
+	}
+
+	// Hop 2: a deployment WITH a domain, holding the record hop 1 produced. Moving
+	// it by republishing its payload and headers is what a mirror or a replay tool
+	// shipping records between deployments amounts to.
+	// Two server settings are needed, and the second is not obvious: the domain
+	// only reaches message metadata when the server emits the V2 ack subject, which
+	// on 2.14.3 is behind the js_ack_fc_v2 feature flag and OFF by default
+	// (server.FeatureFlagJsAckFormatV2). The v1 subject has no domain token at all,
+	// so on a default deployment MsgMetadata.Domain is empty even with
+	// JetStreamDomain set — measured by TestMsgMetadataDomainNeedsTheV2AckSubject.
+	domainSrv := startServer(t, func(o *natsserver.Options) {
+		o.JetStreamDomain = testDomain
+		o.FeatureFlags = map[string]bool{natsserver.FeatureFlagJsAckFormatV2: true}
+	})
+	domainNC, _ := connect(t, domainSrv)
+	// The domain reaches message metadata only when the CLIENT addresses JetStream
+	// through the domain's API prefix — a plain jetstream.New on a domain-enabled
+	// server still gets domainless ack subjects, which the guard below catches.
+	domainJS, err := jetstream.NewWithDomain(domainNC, testDomain)
+	if err != nil {
+		t.Fatalf("jetstream.NewWithDomain: %v", err)
+	}
+	newStream(t, domainJS, jetstream.StreamConfig{Name: "dlq_in", Subjects: []string{"dlq.nodomain.>"}})
+	newStream(t, domainJS, jetstream.StreamConfig{Name: "dlq_out", Subjects: []string{"dlq2.>"}})
+
+	moved := nats.NewMsg("dlq.nodomain.bad_body")
+	moved.Data = hop1.Data
+	moved.Header = hop1.Header
+	if _, err := domainJS.PublishMsg(t.Context(), moved); err != nil {
+		t.Fatalf("move the record into the domained deployment: %v", err)
+	}
+	domainCons := newConsumer(t, domainJS, "dlq_in", jetstream.ConsumerConfig{
+		Durable:       "replay_gave_up",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       time.Minute,
+		FilterSubject: "dlq.nodomain.>",
+	})
+	records := fetchAll(t, domainCons, 1)
+	if len(records) != 1 {
+		t.Fatalf("fetched %d records in the domained deployment, want 1", len(records))
+	}
+	meta, err := records[0].Metadata()
+	if err != nil {
+		t.Fatalf("metadata: %v", err)
+	}
+	if meta.Domain != testDomain {
+		t.Fatalf("hop 2 ran in domain %q, want %s — without a domain here the test proves nothing", meta.Domain, testDomain)
+	}
+	if err := natsmsg.DeadLetter(t.Context(), domainJS, "dlq2.gave_up", records[0], "gave up replaying"); err != nil {
+		t.Fatalf("DeadLetter (hop 2): %v", err)
+	}
+
+	out, err := domainJS.Stream(t.Context(), "dlq_out")
+	if err != nil {
+		t.Fatalf("hop-2 dlq stream: %v", err)
+	}
+	hop2, err := out.GetMsg(t.Context(), 1)
+	if err != nil {
+		t.Fatalf("read hop-2 record: %v", err)
+	}
+
+	if v := hop2.Header.Get(natsmsg.DLQOriginDomainHeader); v != "" {
+		t.Errorf("%s = %q after re-capture inside domain %q, want it still absent — the "+
+			"message did not originate in that domain", natsmsg.DLQOriginDomainHeader, v, meta.Domain)
+	}
+	// The rest of the origin block is the first hop's, unchanged.
+	for h, want := range map[string]string{
+		natsmsg.DLQOriginHeader:       "events.repo",
+		natsmsg.DLQOriginStreamHeader: "events",
+		natsmsg.DLQStreamSeqHeader:    hop1.Header.Get(natsmsg.DLQStreamSeqHeader),
+		natsmsg.DLQOriginMsgIDHeader:  "producer/01KWHDFJ0C",
+	} {
+		if got := hop2.Header.Get(h); got != want {
+			t.Errorf("%s = %q, want %q", h, got, want)
+		}
+	}
+	if got := hop2.Header.Get(natsmsg.DLQHopsHeader); got != "2" {
+		t.Errorf("hop count = %q, want 2", got)
 	}
 }
 

@@ -65,6 +65,22 @@ const (
 	// a replay tool needs to restore it upstream. It cannot stay under its own name
 	// — see [DeadLetter] on the header policy.
 	DLQOriginMsgIDHeader = "Nats-Dlq-Origin-Msg-Id"
+	// DLQOriginRecordedHeader marks the origin block as filled in, and is what makes
+	// write-once mean write-once.
+	//
+	// Field-by-field absence cannot carry that fact, because absence is ambiguous:
+	// a message captured outside a JetStream domain has no origin domain to record,
+	// and one captured with no metadata at all has no origin stream, sequence or
+	// store time either. Reading those absences as "not yet recorded" let a LATER
+	// hop fill them in from itself — writing its own domain, or the DLQ stream it
+	// read the record from, as the message's origin. Silently wrong provenance,
+	// which is worse than none.
+	//
+	// So the block is written exactly once, as a block. When this marker is present
+	// every origin field is carried through as-is and none is derived, whatever is
+	// or is not there: an absent field means the hop that recorded the origin had
+	// nothing to record for it, and no later hop is entitled to a better answer.
+	DLQOriginRecordedHeader = "Nats-Dlq-Origin-Recorded"
 
 	// DLQHeaderPrefix is the namespace this package writes provenance into. It is
 	// NOT a retention rule: an inbound header merely because it carries this prefix
@@ -87,6 +103,7 @@ const (
 // list does buy is that the SHAPE is fixed: only these keys exist, only the per-hop
 // ones are freshly authored, and an unknown Nats-Dlq- header never appears.
 var dlqCarriedProvenance = []string{
+	DLQOriginRecordedHeader,
 	DLQOriginHeader,
 	DLQStreamSeqHeader,
 	DLQOriginStreamHeader,
@@ -286,37 +303,50 @@ func DeadLetter(ctx context.Context, pub DLQPublisher, dlqSubject string, msg je
 		}
 		hdr[k] = append([]string(nil), v...)
 	}
-	// Carry the origin headers an earlier hop already wrote. The filter above
-	// dropped them with the rest of the namespace, so this puts back exactly the
-	// closed set in dlqCarriedProvenance and nothing else.
-	for _, h := range dlqCarriedProvenance {
-		if v := src.Get(h); v != "" {
-			hdr.Set(h, v)
+	meta, metaErr := msg.Metadata()
+	if metaErr != nil {
+		meta = nil
+	}
+
+	// The origin block is written once, as a block, and afterwards only carried.
+	// Deciding that from [DLQOriginRecordedHeader] rather than from whether each
+	// field looks empty is what keeps a later hop from answering a question an
+	// earlier one already answered with "nothing" — see that header.
+	if src.Get(DLQOriginRecordedHeader) != "" {
+		// The namespace filter dropped these with the rest of Nats-; put back
+		// exactly the closed set and nothing else, absences included.
+		for _, h := range dlqCarriedProvenance {
+			if v := src.Get(h); v != "" {
+				hdr.Set(h, v)
+			}
+		}
+	} else {
+		hdr.Set(DLQOriginRecordedHeader, "1")
+		record := func(h, v string) {
+			if v != "" {
+				hdr.Set(h, v)
+			}
+		}
+		record(DLQOriginHeader, msg.Subject())
+		record(DLQOriginMsgIDHeader, src.Get(jetstream.MsgIDHeader))
+		if meta != nil {
+			record(DLQStreamSeqHeader, strconv.FormatUint(meta.Sequence.Stream, 10))
+			record(DLQOriginStreamHeader, meta.Stream)
+			// Empty outside a JetStream domain, and left absent when it is: the
+			// marker above already says the block was recorded, so absent reads as
+			// "no domain" rather than "ask the next hop".
+			record(DLQOriginDomainHeader, meta.Domain)
+			if !meta.Timestamp.IsZero() {
+				record(DLQOriginTimestampHeader, meta.Timestamp.UTC().Format(time.RFC3339Nano))
+			}
 		}
 	}
-	// Fill in the origin headers still absent — the write-once rule. setOrigin is
-	// what makes a re-capture non-destructive: on the second capture of a message
-	// every one of these is already present and none is touched.
-	setOrigin := func(h, v string) {
-		if v != "" && hdr.Get(h) == "" {
-			hdr.Set(h, v)
-		}
-	}
-	setOrigin(DLQOriginHeader, msg.Subject())
-	setOrigin(DLQOriginMsgIDHeader, src.Get(jetstream.MsgIDHeader))
 
 	// Per-hop: always this capture's own.
 	hdr.Set(DLQReasonHeader, reason)
 	hdr.Set(DLQHopsHeader, strconv.Itoa(dlqHops(src)+1))
-
-	if meta, err := msg.Metadata(); err == nil && meta != nil {
+	if meta != nil {
 		hdr.Set(DLQDeliveredHeader, strconv.FormatUint(meta.NumDelivered, 10))
-		setOrigin(DLQStreamSeqHeader, strconv.FormatUint(meta.Sequence.Stream, 10))
-		setOrigin(DLQOriginStreamHeader, meta.Stream)
-		setOrigin(DLQOriginDomainHeader, meta.Domain)
-		if !meta.Timestamp.IsZero() {
-			setOrigin(DLQOriginTimestampHeader, meta.Timestamp.UTC().Format(time.RFC3339Nano))
-		}
 	}
 
 	out := &nats.Msg{Subject: dlqSubject, Data: msg.Data(), Header: hdr}

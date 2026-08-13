@@ -468,6 +468,7 @@ func TestDeadLetterRecordsTheStoredMessageIdentity(t *testing.T) {
 func TestDeadLetterWritesOriginProvenanceOnce(t *testing.T) {
 	// A DLQ record as the previous hop wrote it, now being captured again.
 	first := nats.Header{}
+	first.Set(natsmsg.DLQOriginRecordedHeader, "1")
 	first.Set(natsmsg.DLQOriginHeader, "repo.ops.v1.us.acme.teardown")
 	first.Set(natsmsg.DLQOriginStreamHeader, "repo_ops_v1")
 	first.Set(natsmsg.DLQStreamSeqHeader, "41")
@@ -536,6 +537,98 @@ func TestDeadLetterWritesOriginProvenanceOnce(t *testing.T) {
 	}
 }
 
+// TestDeadLetterDoesNotBackfillAnOriginThatWasRecordedAsAbsent is the regression for
+// write-once's blind spot: an origin field can be legitimately EMPTY, and reading
+// that as "not recorded yet" let a later hop answer for the first one.
+//
+// Two fields are legitimately absent. A message captured outside a JetStream domain
+// has no origin domain; one captured with no metadata at all has no origin stream,
+// sequence or store time. Field-by-field absence therefore cannot mean "uninitialized"
+// — so an explicit marker carries that fact and the block is written once, whole.
+// Without it the record ends up asserting the LATER hop's domain, or the DLQ stream
+// it was read from, as where the message came from: provenance that is silently
+// wrong, which is worse than provenance that is missing.
+func TestDeadLetterDoesNotBackfillAnOriginThatWasRecordedAsAbsent(t *testing.T) {
+	t.Run("origin recorded outside a domain, re-captured inside one", func(t *testing.T) {
+		// Exactly what a first capture writes in a domainless deployment: the block
+		// marked recorded, with no origin domain in it.
+		rec := nats.Header{}
+		rec.Set(natsmsg.DLQOriginRecordedHeader, "1")
+		rec.Set(natsmsg.DLQOriginHeader, "repo.ops.v1.us.acme.teardown")
+		rec.Set(natsmsg.DLQOriginStreamHeader, "repo_ops_v1")
+		rec.Set(natsmsg.DLQStreamSeqHeader, "41")
+		rec.Set(natsmsg.DLQOriginTimestampHeader, storedAt.Format(time.RFC3339Nano))
+
+		// The re-capture happens inside a domain, so this hop's metadata has one.
+		msg := &natsmsgtest.FakeMsg{
+			SubjectVal: "repo.ops.dlq.v1.bad_body",
+			DataVal:    []byte(`{}`),
+			HeadersVal: rec,
+			Meta: &jetstream.MsgMetadata{
+				NumDelivered: 1, Stream: "repo_ops_dlq_v1", Domain: "leaf",
+				Sequence: jetstream.SequencePair{Stream: 7}, Timestamp: storedAt.Add(time.Hour),
+			},
+		}
+
+		pub := &fakeDLQPublisher{}
+		if err := natsmsg.DeadLetter(context.Background(), pub, "repo.ops.dlq.v2.gave_up", msg, "gave up"); err != nil {
+			t.Fatalf("DeadLetter: %v", err)
+		}
+		got := pub.msgs[0].Header
+
+		if v := got.Get(natsmsg.DLQOriginDomainHeader); v != "" {
+			t.Errorf("%s = %q, want it still absent — the origin was recorded without a "+
+				"domain, and this hop's domain is not the message's origin", natsmsg.DLQOriginDomainHeader, v)
+		}
+		// And the fields that WERE recorded are untouched.
+		if v := got.Get(natsmsg.DLQOriginStreamHeader); v != "repo_ops_v1" {
+			t.Errorf("%s = %q, want repo_ops_v1", natsmsg.DLQOriginStreamHeader, v)
+		}
+	})
+
+	t.Run("origin recorded without metadata, re-captured with it", func(t *testing.T) {
+		// What a first capture of a synthetic message writes: marked recorded, with
+		// no stream, sequence or store time — there was none to record.
+		rec := nats.Header{}
+		rec.Set(natsmsg.DLQOriginRecordedHeader, "1")
+		rec.Set(natsmsg.DLQOriginHeader, "repo.ops.v1.synthetic")
+		rec.Set(natsmsg.DLQOriginMsgIDHeader, "producer-key")
+
+		msg := &natsmsgtest.FakeMsg{
+			SubjectVal: "repo.ops.dlq.v1.bad_body",
+			DataVal:    []byte(`{}`),
+			HeadersVal: rec,
+			Meta: &jetstream.MsgMetadata{
+				NumDelivered: 2, Stream: "repo_ops_dlq_v1", Domain: "hub",
+				Sequence: jetstream.SequencePair{Stream: 12}, Timestamp: storedAt,
+			},
+		}
+
+		pub := &fakeDLQPublisher{}
+		if err := natsmsg.DeadLetter(context.Background(), pub, "repo.ops.dlq.v2.gave_up", msg, "gave up"); err != nil {
+			t.Fatalf("DeadLetter: %v", err)
+		}
+		got := pub.msgs[0].Header
+
+		for _, h := range []string{
+			natsmsg.DLQOriginStreamHeader, natsmsg.DLQStreamSeqHeader,
+			natsmsg.DLQOriginDomainHeader, natsmsg.DLQOriginTimestampHeader,
+		} {
+			if v := got.Get(h); v != "" {
+				t.Errorf("%s = %q, want it still absent — filling it in from this hop would "+
+					"name the DLQ as the message's origin", h, v)
+			}
+		}
+		if v := got.Get(natsmsg.DLQOriginHeader); v != "repo.ops.v1.synthetic" {
+			t.Errorf("%s = %q, want the first hop's subject", natsmsg.DLQOriginHeader, v)
+		}
+		// Per-hop fields still describe this capture.
+		if v := got.Get(natsmsg.DLQDeliveredHeader); v != "2" {
+			t.Errorf("%s = %q, want 2", natsmsg.DLQDeliveredHeader, v)
+		}
+	})
+}
+
 // TestDeadLetterWithoutMetadataStillRecordsWhatItKnows: a synthetic message carries
 // no stream identity, so the stored-message fields are absent rather than guessed.
 // Origin subject and the publisher's key come off the message itself and are still
@@ -561,6 +654,9 @@ func TestDeadLetterWithoutMetadataStillRecordsWhatItKnows(t *testing.T) {
 		natsmsg.DLQOriginMsgIDHeader: "producer-key",
 		natsmsg.DLQReasonHeader:      "bad_body",
 		natsmsg.DLQHopsHeader:        "1",
+		// Marked recorded even though most of the block is empty: that is the
+		// point — a later hop must not read these absences as its cue.
+		natsmsg.DLQOriginRecordedHeader: "1",
 	} {
 		if got.Get(h) != want {
 			t.Errorf("%s = %q, want %q", h, got.Get(h), want)
