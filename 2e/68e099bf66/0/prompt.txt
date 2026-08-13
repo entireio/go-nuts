@@ -1,0 +1,13 @@
+<cross-session-message from="uds:/tmp/cc-socks/35134.sock" from-name="Take over Claude Code session" from-mode="prompting">
+Direction change from Andrea, superseding the dedupe-key iteration — STOP composing identity keys (no domain+timestamp+incarnation scheme). The review loop on capture identity is closing by collapsing the requirement, not by refining the key:
+
+1. NO CAPTURE-TIME DEDUPE. Strip Nats-Msg-Id from the DLQ copy entirely; publish without any dedupe identity. Rationale (decided): the dedupe existed only to make re-capture-after-failed-Ack idempotent inside the duplicate window, but every synthesized identity has a collision class (Msg-Id: stream-wide dedupe across distinct origins; <stream>/<seq>: sequence reset on stream recreation; the next scheme would fall to the next broker behavior). The invariant is "capture must NEVER silently lose a record" — duplicates are visible, harmless, and already consistent with JetStream's at-least-once semantics everywhere; suppression is invisible and defeats the mechanism's whole purpose. Same choose-the-safe-error-direction principle as the breaker clock (late, never early → here: duplicate, never suppressed). An occasional double DLQ record in the failed-Ack window is the accepted cost; replay-time tooling/humans dedupe by origin metadata with full context if they ever care. Document this as deliberate where the Msg-Id retention used to be documented.
+
+2. WRITE-ONCE PROVENANCE (the P2): origin provenance headers (first-hop publisher identity, origin stream/seq/timestamp) are set ONLY if absent — never overwritten on re-capture. Per-hop information, if kept, is appended/counted separately. Do not blanket-retain producer-supplied Nats-Dlq-* prefixed headers — retain only provenance the library itself authored.
+
+3. BROKER REGRESSIONS to pin the class shut: (a) the reviewer's source-recreation case — delete/recreate the source stream, capture from both incarnations, both records exist in the DLQ; (b) the general invariant — any two captures, same or different origin, always yield one visible DLQ record EACH (exactly-N under no-dedupe); (c) re-capture after failed Ack preserves the first-hop provenance unchanged.
+
+4. PR HYGIENE: push in sync with review rounds — PR #14 pointed at 79427bc while local ran three ahead, so "request changes on head X" and the PR disagreed about X. Ordinary pushes, keep the PR head current per round.
+
+Full gate as usual afterwards. If anything in the current tree fights the no-dedupe simplification (e.g. tests that assert dedupe behavior), flag before surgery rather than after.
+</cross-session-message>
