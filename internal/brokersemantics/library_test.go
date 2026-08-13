@@ -146,19 +146,36 @@ func TestTermOnExhaustionFiresOnTheBrokersFinalDelivery(t *testing.T) {
 	}
 }
 
-// TestKeepInProgressExtendsAckWaitThenLetsTheBrokerReclaim pins both halves of the
+// TestKeepInProgressExtendsAckWaitThenTheCapReclaimsIt pins both halves of the
 // heartbeat's contract against the broker that enforces it.
 //
-// natsmsg.KeepInProgress promises that a long handler is not redelivered underneath
-// itself, and — deliberately — that the extension is capped so a WEDGED handler
-// still loses its delivery. Only a real broker can show either: the fake counts
-// InProgress calls, and a counter cannot prove the redelivery timer moved.
+// natsmsg.KeepInProgress promises that a long handler is not redelivered
+// underneath itself, and — deliberately — that the extension is CAPPED, so a
+// wedged handler (hung I/O with no deadline) still loses its delivery to a
+// healthy replica instead of pinning it forever. Only a real broker can show
+// either: the fake counts InProgress calls, and a counter cannot prove the
+// server's redelivery timer moved.
 //
-// The handler here holds the message well past AckWait while heartbeating, then
-// stops heartbeating without disposing of it — the shape of a handler whose work
-// wedged after the cap. The message must survive the first phase undelivered
-// elsewhere, and be redelivered in the second.
-func TestKeepInProgressExtendsAckWaitThenLetsTheBrokerReclaim(t *testing.T) {
+// Nothing here calls the returned stop. That is the point: stopping the heartbeat
+// by hand tests the caller's own cleanup, and a test that does so stays green even
+// if the cap is deleted outright — the redelivery it observes would be explained
+// by the stop. The heartbeat is left running against a message the handler never
+// disposes of, which is exactly the wedged shape, so the ONLY thing that can
+// release the delivery is the cap firing on its own.
+//
+// The handler starts the heartbeat and returns immediately rather than blocking:
+// nats.go dispatches consume callbacks serially, so a handler that slept would
+// block the very redelivery this test waits for. The extension does not depend on
+// the handler still running — InProgress moves the server's timer, not a
+// client-side lease.
+//
+// Timing, from natsmsg's own constants: ticks fire at AckWait/3 and stop after
+// keepInProgressMaxTicks (15), so the extension ends at 5×AckWait and the broker
+// reclaims one AckWait later, at ~6×AckWait. The cap is unexported, so the test
+// states the arithmetic instead of importing it, and asserts a band wide enough to
+// survive tick jitter yet far too tight for an uncapped heartbeat (which would
+// never redeliver at all) or a materially different cap.
+func TestKeepInProgressExtendsAckWaitThenTheCapReclaimsIt(t *testing.T) {
 	t.Parallel()
 	_, js := env(t)
 	cons := newConsumer(t, js, "events", jetstream.ConsumerConfig{
@@ -170,42 +187,48 @@ func TestKeepInProgressExtendsAckWaitThenLetsTheBrokerReclaim(t *testing.T) {
 	})
 	publish(t, js, "events.repo", "slow work")
 
-	// heldFor spans three AckWaits, so an un-extended delivery would have been
-	// redelivered twice over by the time the handler returns.
-	const heldFor = 3 * shortAckWait
-	firstDone := make(chan struct{})
+	const (
+		// 15 ticks at AckWait/3.
+		capReachedAt = 5 * shortAckWait
+		// One more AckWait after the last extension.
+		reclaimedAt = capReachedAt + shortAckWait
+		// Comfortably inside the cap, comfortably past a bare AckWait.
+		duringExtension = 3 * shortAckWait
+	)
 	var handlerRuns atomic.Int64
 	r := consume(t, cons, func(m jetstream.Msg) {
 		if handlerRuns.Add(1) > 1 {
 			return // the redelivery; leave it alone
 		}
-		stop := natsmsg.KeepInProgress(m.InProgress, shortAckWait)
-		time.Sleep(heldFor)
-		// While the heartbeat runs the broker must not have redelivered.
-		if ci := info(t, cons); ci.NumRedelivered != 0 {
-			t.Errorf("NumRedelivered = %d while the heartbeat was extending AckWait, want 0", ci.NumRedelivered)
-		}
-		if runs := handlerRuns.Load(); runs != 1 {
-			t.Errorf("handler ran %d times during the heartbeat, want 1", runs)
-		}
-		stop() // heartbeat over; nothing acked — the wedged-handler shape
-		close(firstDone)
+		// No stop, ever: the heartbeat must expire on its own cap. It ends itself
+		// after 15 ticks even if this test fails early.
+		_ = natsmsg.KeepInProgress(m.InProgress, shortAckWait)
 	})
+	first := r.waitForN(t, 1)
 
-	select {
-	case <-firstDone:
-	case <-time.After(waitTimeout):
-		t.Fatal("the first delivery's handler never completed")
+	// Phase 1 — the extension holds. Well past AckWait, still one delivery.
+	time.Sleep(duringExtension)
+	if got := r.snapshot(); len(got) != 1 {
+		t.Fatalf("saw %v after %v of heartbeating, want the single first delivery: the extension is not holding",
+			got, duringExtension)
 	}
-	// With the heartbeat stopped, the broker reclaims the delivery on the next
-	// AckWait expiry: the failsafe the cap exists to preserve.
+	if ci := info(t, cons); ci.NumRedelivered != 0 {
+		t.Errorf("NumRedelivered = %d while the heartbeat was extending AckWait, want 0", ci.NumRedelivered)
+	}
+
+	// Phase 2 — the cap releases it, with no help from the test.
 	got := r.waitForN(t, 2)
 	if got[1].numDelivered != 2 {
 		t.Errorf("second delivery reported NumDelivered=%d, want 2", got[1].numDelivered)
 	}
-	if held := got[1].at.Sub(got[0].at); held < heldFor {
-		t.Errorf("redelivery came %v after the first delivery, want at least the %v the heartbeat held it",
-			held.Round(time.Millisecond), heldFor)
+	held := got[1].at.Sub(first[0].at)
+	if held < capReachedAt-gapEarlySlack {
+		t.Errorf("redelivery came %v after the first delivery, want at least the %v the cap should have held it "+
+			"(a shorter hold means the heartbeat stopped early)", held.Round(time.Millisecond), capReachedAt)
+	}
+	if high := reclaimedAt + 2*shortAckWait + gapLateSlack; held > high {
+		t.Errorf("redelivery came %v after the first delivery, want ~%v (cap at %v plus one AckWait); "+
+			"a longer hold means the extension outlived its cap", held.Round(time.Millisecond), reclaimedAt, capReachedAt)
 	}
 }
 

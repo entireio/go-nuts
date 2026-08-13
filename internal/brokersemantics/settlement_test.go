@@ -3,6 +3,7 @@ package brokersemantics
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -208,55 +209,115 @@ func TestAckWithoutPublishPermissionSilentlySucceeds(t *testing.T) {
 	nc, asyncErrs := connect(t, s, nats.UserInfo("indexer", "pw"))
 	js := jsHandle(t, nc)
 	newStream(t, js, jetstream.StreamConfig{Name: "events", Subjects: []string{"events.>"}})
-	cons := newConsumer(t, js, "events", jetstream.ConsumerConfig{
-		Durable:   "denied",
-		AckPolicy: jetstream.AckExplicitPolicy,
-		AckWait:   time.Minute,
-	})
-	publish(t, js, "events.repo", "first", "second")
 
-	msgs := fetchAll(t, cons, 1)
-	if len(msgs) != 1 {
-		t.Fatalf("fetched %d messages, want 1", len(msgs))
-	}
-	if err := msgs[0].Ack(); err != nil {
-		t.Fatalf("Ack returned %v; this test's premise is that it returns nil even when denied", err)
-	}
-	time.Sleep(settleWait)
+	// Every disposition the contract promises, not just Ack: backoff.NakOrTerm
+	// issues NakWithDelay and Term, so if either ever started reporting the
+	// rejection (a client or server change) the documented semantic would be
+	// wrong and an Ack-only fixture would stay green. Each runs on its own
+	// durable and its own message, so one silent failure cannot mask another.
+	for _, tc := range []struct {
+		name    string
+		durable string
+		subject string
+		dispose func(jetstream.Msg) error
+	}{
+		{"Ack", "denied_ack", "events.ack", func(m jetstream.Msg) error { return m.Ack() }},
+		{"Nak", "denied_nak", "events.nak", func(m jetstream.Msg) error { return m.Nak() }},
+		{"NakWithDelay", "denied_nakdelay", "events.nakdelay", func(m jetstream.Msg) error {
+			return m.NakWithDelay(time.Millisecond)
+		}},
+		{"Term", "denied_term", "events.term", func(m jetstream.Msg) error { return m.Term() }},
+		{"InProgress", "denied_inprogress", "events.inprogress", func(m jetstream.Msg) error {
+			return m.InProgress()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cons := newConsumer(t, js, "events", jetstream.ConsumerConfig{
+				Durable:       tc.durable,
+				AckPolicy:     jetstream.AckExplicitPolicy,
+				AckWait:       time.Minute, // no redelivery may confound the reading
+				FilterSubject: tc.subject,
+			})
+			publish(t, js, tc.subject, "poison")
+			msgs := fetchAll(t, cons, 1)
+			if len(msgs) != 1 {
+				t.Fatalf("fetched %d messages, want 1", len(msgs))
+			}
 
-	ci := info(t, cons)
-	if ci.AckFloor.Stream != 0 {
-		t.Errorf("ack floor advanced to %d despite the denied ack, want 0", ci.AckFloor.Stream)
-	}
-	if ci.NumAckPending != 1 {
-		t.Errorf("NumAckPending = %d, want 1: the delivery is still outstanding after the silent Ack", ci.NumAckPending)
-	}
-	// The rejection is observable only here — not on the Ack call.
-	var sawViolation bool
-	for _, err := range asyncErrs() {
-		if errors.Is(err, nats.ErrPermissionViolation) {
-			sawViolation = true
-		}
-	}
-	if !sawViolation {
-		t.Errorf("no permissions violation on the async error handler; saw %v", asyncErrs())
+			if err := tc.dispose(msgs[0]); err != nil {
+				t.Fatalf("%s returned %v; the documented contract is that it returns nil even when the server rejects it",
+					tc.name, err)
+			}
+			time.Sleep(settleWait)
+
+			ci := info(t, cons)
+			if ci.AckFloor.Stream != 0 {
+				t.Errorf("ack floor advanced to %d after a denied %s, want 0", ci.AckFloor.Stream, tc.name)
+			}
+			if ci.NumAckPending != 1 {
+				t.Errorf("NumAckPending = %d after a denied %s, want 1: the delivery is still outstanding", ci.NumAckPending, tc.name)
+			}
+			// The rejection is observable only here — never on the call itself.
+			// Matched by this durable's own $JS.ACK subject rather than by a
+			// count, so a sibling subtest's violation cannot satisfy this one.
+			waitForPermissionViolation(t, asyncErrs, tc.durable)
+		})
 	}
 
 	// DoubleAck is the surface that does report it: it waits for the server's
 	// confirmation, which never comes. Note the error is the context's, not
 	// nats.ErrTimeout — a caller classifying only nats sentinels will miss it.
-	second := fetchAll(t, cons, 1)
-	if len(second) != 1 {
-		t.Fatalf("fetched %d messages on the second pull, want 1", len(second))
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
-	err := second[0].DoubleAck(ctx)
-	if err == nil {
-		t.Fatal("DoubleAck succeeded without $JS.ACK publish permission, want an error")
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("DoubleAck error = %v (%T), want a context deadline; callers matching only nats sentinels miss it", err, err)
+	t.Run("DoubleAck reports it, as a context deadline", func(t *testing.T) {
+		t.Parallel()
+		cons := newConsumer(t, js, "events", jetstream.ConsumerConfig{
+			Durable:       "denied_doubleack",
+			AckPolicy:     jetstream.AckExplicitPolicy,
+			AckWait:       time.Minute,
+			FilterSubject: "events.doubleack",
+		})
+		publish(t, js, "events.doubleack", "poison")
+		msgs := fetchAll(t, cons, 1)
+		if len(msgs) != 1 {
+			t.Fatalf("fetched %d messages, want 1", len(msgs))
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		err := msgs[0].DoubleAck(ctx)
+		if err == nil {
+			t.Fatal("DoubleAck succeeded without $JS.ACK publish permission, want an error")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("DoubleAck error = %v (%T), want a context deadline; callers matching only nats sentinels miss it", err, err)
+		}
+		if got := info(t, cons).NumAckPending; got != 1 {
+			t.Errorf("NumAckPending = %d after the failed DoubleAck, want 1: nothing settled", got)
+		}
+	})
+}
+
+// waitForPermissionViolation blocks until the connection's async error handler —
+// the only place a denied disposition surfaces — reports a permissions violation
+// naming durable, and fails the test if none arrives. The $JS.ACK subject the
+// server rejects carries the stream and durable, so matching on the durable
+// attributes the violation to one disposition even with sibling subtests running
+// concurrently on the same connection.
+func waitForPermissionViolation(t *testing.T, asyncErrs func() []error, durable string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var seen []error
+		for _, err := range asyncErrs() {
+			seen = append(seen, err)
+			if errors.Is(err, nats.ErrPermissionViolation) && strings.Contains(err.Error(), durable) {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("no permissions violation naming durable %q reached the async error handler; saw %v", durable, seen)
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
