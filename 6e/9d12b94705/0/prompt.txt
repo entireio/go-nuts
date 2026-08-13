@@ -1,0 +1,20 @@
+• Still request changes on local head a7f9139.
+
+  - [P1] The new dedupe key can still silently collapse distinct originals. natsmsg/deadletter.go:98 uses only <stream>/<sequence>. Stream sequence numbers reset when a source stream is deleted and recreated, and MsgMetadata.Domain is
+    ignored. If the DLQ survives, two distinct messages can therefore produce the same ID within its duplicate window; the second publish succeeds as Duplicate, the original is acknowledged, and no second DLQ record exists. Include a
+    stable stream-incarnation component—such as domain plus original timestamp—and add a broker regression covering source recreation.
+
+  - [P2] Re-capture does not preserve the provenance chain claimed by the new policy. Although natsmsg/deadletter.go:85 retains prior Nats-Dlq-* headers, natsmsg/deadletter.go:187 overwrites the original publisher ID with the previous
+    DLQ copy’s synthesized ID; the other fixed provenance fields are similarly overwritten. The first-hop publisher identity needed for replay is therefore lost. The broad prefix allowance can also retain producer-supplied provenance.
+    Use an explicit hop-chain representation or only retain provenance whose authorship is known.
+
+  The previous counter/atomic-batch header finding is fixed: the namespace filter works, and its new real-broker tests pass.
+
+  Validation passed:
+
+  - Focused natsmsg and broker-semantics tests
+  - Full go test -race ./...
+  - golangci-lint
+  - git diff --check
+
+  GitHub PR #14 still points to 79427bc; the local branch is three commits ahead and GitHub has no checks.
