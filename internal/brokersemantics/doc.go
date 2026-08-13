@@ -47,15 +47,28 @@
 // returned no error — several of the semantics below are precisely calls that
 // return no error while doing nothing.
 //
+// For a TIMING assertion there is a second rule, because the expected value being
+// right is not enough: the tolerance has to be narrower than the distance to the
+// next plausible explanation. A ±500ms band around a 150ms ladder rung accepts the
+// 400ms rung beside it, so the case passes under precisely the off-by-one it was
+// written to reject. [assertGap] enforces this rather than trusting the author —
+// it takes the rival delays (adjacent rungs, the bare AckWait, the un-stretched
+// request), tightens the band to half the nearest rival's distance, and fails any
+// fixture whose delays sit too close to be told apart. When it does, the fixture's
+// values are what change; widening the band is how the assertion stops working.
+//
 // Then PROVE the case can fail, by breaking the thing it claims to gate and
-// watching it go red: raise the cap, grant the permission, flatten the ladder,
-// silence one disposition. Review has now caught three fixtures here that passed
-// against a live broker while gating nothing — a heartbeat test that stopped the
-// heartbeat itself, so deleting the cap left it green; a permission test that
-// exercised only Ack while the contract promised the same silence for Nak and
-// Term; and a concurrent attribution that matched a durable as a bare substring,
-// letting denied_nakdelay's violation satisfy denied_nak's assertion. None of
-// those was a wrong assertion. Each was an assertion nothing could break, which
+// watching it go red: raise the cap, grant the permission, silence one
+// disposition, or assert the rival timing and watch the real one contradict it.
+// Review has now caught four fixtures here that passed against a live broker while
+// gating nothing — a heartbeat test that stopped the heartbeat itself, so deleting
+// the cap left it green; a permission test that exercised only Ack while the
+// contract promised the same silence for Nak and Term; a concurrent attribution
+// that matched a durable as a bare substring, letting denied_nakdelay's violation
+// satisfy denied_nak's assertion; and gap bands wider than the spacing between the
+// rungs they were distinguishing, which left both the tail-repeat arithmetic and
+// the NakWithDelay stretch — the suite's two sharpest findings — unguarded. None
+// of those was a wrong assertion. Each was an assertion nothing could break, which
 // is the same defect as the fake and costs the same amount to find: one review
 // round each.
 //

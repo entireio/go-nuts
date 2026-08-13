@@ -88,10 +88,13 @@ func TestNumDeliveredInflatesWithoutHandlerInvolvement(t *testing.T) {
 func TestRedeliveryContinuesOnRepeatedAckWaitWithoutBackOff(t *testing.T) {
 	t.Parallel()
 	_, js := env(t)
+	// Longer than shortAckWait so the nearest wrong answer — a doubled or halved
+	// interval — is separable from the right one.
+	const ackWait = 400 * time.Millisecond
 	cons := newConsumer(t, js, "events", jetstream.ConsumerConfig{
 		Durable:       "flat",
 		AckPolicy:     jetstream.AckExplicitPolicy,
-		AckWait:       shortAckWait,
+		AckWait:       ackWait,
 		MaxDeliver:    4,
 		FilterSubject: "events.repo",
 		// BackOff deliberately unset.
@@ -104,7 +107,12 @@ func TestRedeliveryContinuesOnRepeatedAckWaitWithoutBackOff(t *testing.T) {
 		t.Fatal("the consumer under test has a BackOff ladder; it must have none")
 	}
 	for i, gap := range gapsBetween(got[:4]) {
-		assertGap(t, waitLabel(i+2), gap, shortAckWait)
+		// Rival: a cadence at twice the configured AckWait. That is the way
+		// "AckWait, repeated" goes wrong while still repeating — the other way,
+		// not repeating at all, is caught by waitForN above. Nothing would serve
+		// half an AckWait, and offering it as a rival only tightens the band
+		// below what jitter allows.
+		assertGap(t, waitLabel(i+2), gap, ackWait, 2*ackWait)
 	}
 }
 
@@ -126,24 +134,36 @@ func TestRedeliveryContinuesOnRepeatedAckWaitWithoutBackOff(t *testing.T) {
 //     by that rung.
 func TestBackOffRungsAreServedBeforeDeliveryN(t *testing.T) {
 	t.Parallel()
+	// Rungs spread so that each is separable from its neighbours by well over
+	// minRivalMargin: the off-by-one this test exists to reject serves the NEXT
+	// rung, so the bands have to exclude it.
 	const (
-		rung0 = 150 * time.Millisecond
-		rung1 = 400 * time.Millisecond
-		rung2 = 700 * time.Millisecond
+		rung0 = 100 * time.Millisecond
+		rung1 = 500 * time.Millisecond
+		rung2 = 1100 * time.Millisecond
 	)
 	for _, tc := range []struct {
 		name       string
 		backOff    []time.Duration
 		maxDeliver int
 		wantGaps   []time.Duration
+		noRivals   bool
 	}{
 		{
-			// The COR-1255 shape: more deliveries than rungs, so the last rung
-			// tail-repeats. Five waits from a three-rung array.
-			name:       "ladder shorter than MaxDeliver tail-repeats the last rung",
+			// One rung per wait, in order: the case the COR-1255 off-by-one gets
+			// wrong by serving rung1 where rung0 belongs.
+			name:       "each wait is served the rung before its delivery",
 			backOff:    []time.Duration{rung0, rung1, rung2},
-			maxDeliver: 6,
-			wantGaps:   []time.Duration{rung0, rung1, rung2, rung2, rung2},
+			maxDeliver: 4,
+			wantGaps:   []time.Duration{rung0, rung1, rung2},
+		},
+		{
+			// The COR-1255 shape: more deliveries than rungs, so the last rung
+			// tail-repeats.
+			name:       "ladder shorter than MaxDeliver tail-repeats the last rung",
+			backOff:    []time.Duration{rung0, rung1},
+			maxDeliver: 5,
+			wantGaps:   []time.Duration{rung0, rung1, rung1, rung1},
 		},
 		{
 			// Equal: MaxDeliver-1 waits means the last rung is never served.
@@ -158,6 +178,10 @@ func TestBackOffRungsAreServedBeforeDeliveryN(t *testing.T) {
 			backOff:    []time.Duration{rung1},
 			maxDeliver: 4,
 			wantGaps:   []time.Duration{rung1, rung1, rung1},
+			// A one-rung ladder has no neighbour to be confused with: the only
+			// other delay the server could serve is AckWait, which it has already
+			// been forced to equal.
+			noRivals: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -184,8 +208,14 @@ func TestBackOffRungsAreServedBeforeDeliveryN(t *testing.T) {
 			if len(gaps) != len(tc.wantGaps) {
 				t.Fatalf("%d waits between %d deliveries, want %d", len(gaps), tc.maxDeliver, len(tc.wantGaps))
 			}
+			// Every rung is a rival for every wait: that is what makes the
+			// bands reject a ladder served one position out.
+			rivals := tc.backOff
+			if tc.noRivals {
+				rivals = nil
+			}
 			for i, want := range tc.wantGaps {
-				assertGap(t, waitLabel(i+2), gaps[i], want)
+				assertGap(t, waitLabel(i+2), gaps[i], want, rivals...)
 			}
 		})
 	}
@@ -216,14 +246,23 @@ func TestBackOffRungsAreServedBeforeDeliveryN(t *testing.T) {
 // apart" against a ladder whose first rung is 5m).
 func TestBackOffGovernsAckTimeoutsNotNakDelays(t *testing.T) {
 	t.Parallel()
+	// The stretched delay sits at nakDelay + (rung1 - rung0), so its distance to
+	// the bare rung1 is |nakDelay - rung0| and its distance to rung0 is
+	// |nakDelay + rung1 - 2*rung0|. Both have to clear minRivalMargin, or the
+	// fixture cannot tell a stretched request from a ladder that ignored it —
+	// which is the whole finding. These values leave 325ms on both.
 	const (
-		rung0    = 200 * time.Millisecond
-		rung1    = 900 * time.Millisecond
-		nakDelay = 100 * time.Millisecond
+		rung0    = 700 * time.Millisecond
+		rung1    = 2200 * time.Millisecond
+		nakDelay = 50 * time.Millisecond
 	)
 	// The stretch: rung1 - rung0 added to every requested delay from the second
 	// wait onward.
 	stretched := nakDelay + (rung1 - rung0)
+	// What the broker could have served instead, at every position: the ladder's
+	// own rungs (a broker that ignored the request) and the request as written (a
+	// broker that did not stretch it).
+	rivals := []time.Duration{rung0, rung1, nakDelay, stretched}
 
 	for _, tc := range []struct {
 		name     string
@@ -233,20 +272,21 @@ func TestBackOffGovernsAckTimeoutsNotNakDelays(t *testing.T) {
 		{
 			name:    "plain Nak ignores the ladder and redelivers immediately",
 			dispose: func(m jetstream.Msg) error { return m.Nak() },
-			// 0 marks "immediate" — asserted with assertImmediate.
-			wantGaps: []time.Duration{0, 0, 0},
+			// 0 marks "immediate" — asserted with assertImmediate, whose
+			// threshold is far below rung0.
+			wantGaps: []time.Duration{0, 0},
 		},
 		{
 			name:    "NakWithDelay is stretched by the ladder's growth",
 			dispose: func(m jetstream.Msg) error { return m.NakWithDelay(nakDelay) },
 			// Before delivery 2 the consumer is still on rung 0, so there is
 			// nothing to stretch; from delivery 3 the rung has grown.
-			wantGaps: []time.Duration{nakDelay, stretched, stretched},
+			wantGaps: []time.Duration{nakDelay, stretched},
 		},
 		{
 			name:     "no disposition follows the ladder exactly",
 			dispose:  nil,
-			wantGaps: []time.Duration{rung0, rung1, rung1},
+			wantGaps: []time.Duration{rung0, rung1},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -257,7 +297,7 @@ func TestBackOffGovernsAckTimeoutsNotNakDelays(t *testing.T) {
 				AckPolicy:     jetstream.AckExplicitPolicy,
 				AckWait:       rung0,
 				BackOff:       []time.Duration{rung0, rung1},
-				MaxDeliver:    4,
+				MaxDeliver:    3,
 				FilterSubject: "events.repo",
 			})
 			publish(t, js, "events.repo", "x")
@@ -271,15 +311,15 @@ func TestBackOffGovernsAckTimeoutsNotNakDelays(t *testing.T) {
 				}
 			}
 			r := consume(t, cons, dispose)
-			got := r.waitForN(t, 4)
-			gaps := gapsBetween(got[:4])
+			got := r.waitForN(t, 3)
+			gaps := gapsBetween(got[:3])
 			for i, want := range tc.wantGaps {
 				lbl := waitLabel(i + 2)
 				if want == 0 {
 					assertImmediate(t, lbl, gaps[i])
 					continue
 				}
-				assertGap(t, lbl, gaps[i], want)
+				assertGap(t, lbl, gaps[i], want, rivals...)
 			}
 		})
 	}
@@ -296,11 +336,18 @@ func TestBackOffGovernsAckTimeoutsNotNakDelays(t *testing.T) {
 // configured today, and is the assumption this test exists to keep true.
 func TestBackoffPolicyDelayIsNotWhatTheBrokerServes(t *testing.T) {
 	t.Parallel()
+	// Same separation requirement as the test above: the policy's delay, the
+	// stretched delay and both bare rungs have to be mutually distinguishable, or
+	// this test cannot tell "the policy's envelope was served" from "the ladder
+	// was served" — the one distinction it exists to make.
 	const (
-		rung0 = 200 * time.Millisecond
-		rung1 = 900 * time.Millisecond
+		rung0 = 700 * time.Millisecond
+		rung1 = 2200 * time.Millisecond
 	)
-	policy := backoff.Policy{NakDelay: 100 * time.Millisecond, MaxDeliver: 3}
+	policy := backoff.Policy{NakDelay: 50 * time.Millisecond, MaxDeliver: 3}
+	// AckWait with no ladder, and both rungs with one: every delay the broker
+	// could have served other than the one each case expects.
+	rivals := []time.Duration{rung0, rung1, policy.NakDelay, policy.NakDelay + (rung1 - rung0)}
 
 	for _, tc := range []struct {
 		name    string
@@ -350,9 +397,11 @@ func TestBackoffPolicyDelayIsNotWhatTheBrokerServes(t *testing.T) {
 			if got := policy.DelayFor(2); got != policy.NakDelay {
 				t.Fatalf("policy.DelayFor(2) = %v, want %v (flat policy)", got, policy.NakDelay)
 			}
-			// ...but only one of these consumers actually serves it.
-			assertGap(t, "wait before delivery 2", gaps[0], policy.NakDelay)
-			assertGap(t, "wait before delivery 3", gaps[1], tc.wantSecondWait)
+			// ...but only one of these consumers actually serves it. The rivals are
+			// what makes the second assertion mean something: without them a band
+			// around the stretched delay would also accept the bare rung.
+			assertGap(t, "wait before delivery 2", gaps[0], policy.NakDelay, rivals...)
+			assertGap(t, "wait before delivery 3", gaps[1], tc.wantSecondWait, rivals...)
 		})
 	}
 }

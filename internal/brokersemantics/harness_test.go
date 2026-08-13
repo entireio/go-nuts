@@ -284,20 +284,72 @@ func gapsBetween(ds []delivery) []time.Duration {
 // materially early means the server used a different (usually smaller) rung, which
 // is exactly the class of error the suite exists to catch. The upper bound is
 // loose, because a busy CI box can delay a wakeup but cannot make one early.
+//
+// Neither is the real constraint. A tolerance WIDER than the distance to the next
+// plausible explanation makes a timing assertion unfalsifiable however carefully
+// its expected value was derived — a ±500ms band around a 150ms rung silently
+// accepts the 400ms rung beside it, so the fixture would pass under exactly the
+// off-by-one it exists to reject. assertGap therefore takes the rival delays and
+// tightens the band against them; these two are only the outer caps.
 const (
 	gapEarlySlack = 40 * time.Millisecond
 	gapLateSlack  = 500 * time.Millisecond
+	// minRivalMargin is the smallest half-separation a fixture may leave between
+	// its expected delay and the nearest rival. Below this the two are not
+	// separable on a loaded machine — jitter would either fail a correct run or
+	// admit a wrong one — so the fixture, not the assertion, is what has to
+	// change: spread the ladder's rungs further apart.
+	minRivalMargin = 150 * time.Millisecond
 )
 
-// assertGap pins an observed redelivery gap to the rung the server should have
-// served. label names the wait ("before delivery 3") so a failure reads as a
-// ladder position rather than an index.
-func assertGap(t *testing.T, label string, got, want time.Duration) {
+// assertGap pins an observed redelivery gap to the delay the server should have
+// served, and — because a band is only as strong as what it EXCLUDES — narrows the
+// tolerance to half the distance to the nearest rival: a delay the broker could
+// plausibly have served instead. Pass every such candidate: the adjacent ladder
+// rungs, the bare AckWait, the un-stretched request. A fixture whose rivals sit
+// closer than minRivalMargin fails outright, so indistinguishable delays cannot be
+// reintroduced by choosing tighter fixture values later.
+//
+// label names the wait ("wait before delivery 3") so a failure reads as a ladder
+// position rather than an index, and the message names the rival the observation
+// landed on when it does.
+func assertGap(t *testing.T, label string, got, want time.Duration, rivals ...time.Duration) {
 	t.Helper()
-	low, high := want-gapEarlySlack, want+gapLateSlack
-	if got < low || got > high {
-		t.Errorf("%s: gap %v, want ~%v (band %v..%v)", label, got.Round(time.Millisecond), want, low, high)
+	early, late := gapEarlySlack, gapLateSlack
+	for _, rival := range rivals {
+		if rival == want {
+			continue // the same delay appearing twice in a ladder is not a rival
+		}
+		margin := (want - rival).Abs() / 2
+		if margin < minRivalMargin {
+			t.Fatalf("%s: fixture cannot separate the expected %v from the rival %v "+
+				"(half-separation %v < %v): spread the fixture's delays further apart rather than "+
+				"asserting a band that would accept either",
+				label, want, rival, margin, minRivalMargin)
+		}
+		early, late = min(early, margin), min(late, margin)
 	}
+	low, high := want-early, want+late
+	if got >= low && got <= high {
+		return
+	}
+	// Name the single closest rival when the observation is nearer one than the
+	// expectation: that is the diagnosis, not just the miss.
+	nearest, found := time.Duration(0), false
+	for _, rival := range rivals {
+		if rival == want || (got-rival).Abs() >= (got-want).Abs() {
+			continue
+		}
+		if !found || (got-rival).Abs() < (got-nearest).Abs() {
+			nearest, found = rival, true
+		}
+	}
+	if found {
+		t.Errorf("%s: gap %v, want ~%v (band %v..%v); the observation is nearest the rival %v, which is what the server appears to have served",
+			label, got.Round(time.Millisecond), want, low, high, nearest)
+		return
+	}
+	t.Errorf("%s: gap %v, want ~%v (band %v..%v)", label, got.Round(time.Millisecond), want, low, high)
 }
 
 // assertImmediate pins a redelivery that must not wait on any ladder rung — the
