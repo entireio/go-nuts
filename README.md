@@ -123,16 +123,115 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
   Term-on-undecodable → dispatch to the handler, which owns the message's
   disposition). AckExplicit, bounded AckWait and MaxDeliver, optional
   InactiveThreshold / MaxAckPending, shutdown-aware consume-error logging,
-  optional `KeepInProgress` heartbeat.
-- **`backoff`** — the redelivery policy for transiently-failed deliveries: a
-  `NakWithDelay` envelope — flat by default, optionally growing per delivery
-  (`Factor`/`MaxDelay`) — bounded by MaxDeliver, with opt-in
-  Term-on-final-delivery so a work-queue message is removed cleanly instead of
-  orphaning un-acked. It owns disposition and delay calculation only
-  (`NakOrTerm` over `jetstream.Msg`). MaxDeliver mirrors `jetstream.ConsumerConfig`: a
-  non-positive value (`0` or `UnlimitedMaxDeliver`) means unlimited redeliveries,
-  so bridge an unset `jsconsumer` consumer with its `EffectiveMaxDeliver()`
-  rather than the raw field.
+  optional `KeepInProgress` heartbeat. Also `Retry` — see below.
+- **`jsconsumer.Schedule`** — a consumer's retry timing as plain values, and
+  `Validate` / `Err`: the single implementation of the arithmetic that says
+  whether it hangs together. Pure — no NATS connection, no I/O, no clock — so
+  the same function runs at `Start`, in a fleet CI lint over rendered NACK
+  Consumer CRs at merge time, and (when bind-only mode lands) at startup
+  against the durable's real server-side config. Compile it in rather
+  than restating the arithmetic; duplicated timing maths is exactly how
+  ENT-1535's consumer came to advertise 17h45m while really taking 34h22m.
+  Checks the cumulative ladder against `MaxTimeToDeadLetter`, `ackWait` against
+  `backOff[0]`, rung count against `maxDeliver`, the recovery envelope against
+  the breaker threshold, a breaker threshold the ladder can never reach, and
+  both ladders being set at once. It also checks the ladder against the
+  stream's `maxAge` — `Start` fills that in from live stream info, since a
+  ladder outliving retention means the message is discarded before it can be
+  captured. Zero fields are "unknown" and skip their checks, so a caller
+  that knows only part of a config still gets everything that part supports.
+  `Validate` returns every violation for a merge-time report; `Err` folds them
+  into one error.
+- **`jsconsumer.Retry`** — where a consumer's retries *end*: dead-letter
+  capture, then settle. It does **not** own the redelivery schedule. The server
+  does — through the durable's `BackOff` ladder, set via `Config.BackOff` — and
+  on the retry path `Retry` disposes of **nothing**, letting AckWait expire so
+  the ladder redelivers. That detail is load-bearing: `BackOff` governs
+  acknowledgement *timeouts*, so a plain `Nak` asks for immediate redelivery
+  and skips the ladder entirely (measured against a live server: 0s versus the
+  configured rung). A consumer that Naks burns `MaxDeliver` in milliseconds.
+
+  That split is the ENT-1535 finding, not a detail. A JetStream consumer has
+  two possible redelivery schedulers, and setting both does not pick one: the
+  server stretches each client `NakWithDelay` by the BackOff increments, so
+  redeliveries follow neither and the configured ladder becomes dead config
+  that still reads as authoritative — a consumer advertising 17h45m while
+  really taking 34h22m, with nothing saying so. Exactly one scheduler is what
+  prevents that, and the one that composes with declarative fleet management is
+  the server's. `RetryConfig` has no ladder fields, so nothing you configure
+  *here* can produce a second scheduler.
+
+  That is narrower than it sounds, and worth stating as an adoption contract
+  rather than a guarantee: a handler still holds the `jetstream.Msg` and can
+  call `NakWithDelay` itself, and `backoff.Policy` is still exported for
+  callers that predate this package. Either recreates the exact defect
+  alongside a server ladder. What the library can promise is that `Settle` is
+  the whole disposition it owns, and that `Schedule` flags the combination
+  wherever a config is modelled — including configs the library would never
+  construct. Handlers that Nak on their own are outside that.
+
+  Bound that ladder with `MaxTimeToDeadLetter` and it is the whole remedy: a
+  poison message reaches capture-then-Ack inside the SLA with no inference
+  about which message is at fault. This is what a consumer should adopt today.
+  Two things about that ladder that are easy to get wrong, and that `Schedule`
+  models so the bound is checked against what actually runs: the server repeats
+  the last `backOff` entry once the array runs out, so a short list is not a
+  short ladder; and an *absent* `backOff` is not an absent ladder — the broker
+  redelivers on `AckWait`, so the effective schedule becomes AckWait repeated
+  up to `MaxDeliver`.
+
+  Never a drop, and never a bare `Term` — the objection to `Term` being the
+  missing record, not the settlement: measured against nats-server 2.14.3 it
+  settles cleanly on limits, workqueue and interest alike, it just leaves no
+  trace of what was discarded. A failed capture leaves the message
+  for the server to redeliver, so it survives and the stall stays visible — and `CaptureReserve` holds
+  back deliveries specifically to retry it. When even those are spent the
+  message is reported as `OutcomeStranded`, not dressed up as a retry: at the
+  delivery cap nothing redelivers, so nothing will touch it again and it needs
+  the break-glass runbook. Alert on that outcome.
+
+  **Explicit non-goal:** a handler that *dies* on the poison message — panics,
+  OOMs — rather than returning an error. `Settle` is the only entry point to
+  every disposition the package owns, so such a message is not settled by any
+  of them; that follows from the callback contract, not from the breaker.
+  Recovering the panic to Ack the message would hide the bug and leave the
+  handler's state unreconciled, against the module's existing posture that a
+  panicking loop is fatal (`ShutdownGroup`). The stall stays loud — the
+  monitor polls independently of message flow and the ack-floor monitor still
+  pages — it just isn't auto-remediated.
+
+  A milder consequence of the same measured-clock design: the failure clock is
+  per-process, so restarts for unrelated reasons (a rollout, an OOM elsewhere)
+  reset it and the breaker fires **late by however much of the window was
+  lost — late, never early**. That is the safe direction, and the same
+  conservatism `FloorMonitor` applies to the stall itself.
+- **`jsconsumer.FloorMonitor`** — the durable's ack-floor health signal, and
+  the telemetry half of the poison-message story: it polls the floor and
+  reports how long it has been *stalled*, which is the signal the ack-floor
+  monitor pages on, available in-process rather than by polling consumer info
+  a second time. `Start` polls it and `Stop` joins the poll. Use it for a
+  gauge and an alert; that is its supported role.
+
+  It measures **floor-stall age**, not message stream-age: the two diverge
+  badly under backlog, where 35 minutes of receipt→first-delivery lag on a
+  perfectly healthy message would read as a stall. Stalled is also not the
+  same as *stationary* — the clock runs only while the consumer has delivered
+  past its own floor, so an idle consumer's motionless floor never accrues
+  time to charge the next arriving message with.
+
+  **The circuit breaker built on it is experimental.** Attaching the monitor to
+  `RetryConfig.Monitor` lets `Retry` evaluate whether a stalled floor plus a
+  message that has itself been failing that long warrants quarantining it —
+  but `Breaker`'s zero value is `BreakerObserve`, which measures without
+  acting, and that is the only supported mode. `BreakerEnforce` exists, keeps
+  its tests, and is documented as not-for-production pending a multi-week
+  observe soak of real trip counts; **deleting it is an acceptable outcome** if
+  bounded ladders prove sufficient. Every serious defect found in this package
+  has been in that path, all from the same root — acting on a client-side
+  inference about which message holds a consumer-global floor — while the
+  bounded ladder covers the incident with no inference at all. Leave
+  `Monitor` nil and none of the breaker's machinery exists: no failure clocks,
+  no quarantine budget, no consumer-global judgement.
 
 ## Development
 

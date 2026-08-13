@@ -46,8 +46,10 @@ type FakeMsg struct {
 	MetaErr    error
 	NakErr     error // returned by Nak/NakWithDelay after the call is recorded
 	TermErr    error // returned by Term/TermWithReason after the call is recorded
+	AckErr     error // returned by Ack/DoubleAck after the call is recorded
 
 	Acked       bool
+	DoubleAcks  int // DoubleAck calls; a plain Ack does not count
 	Termed      bool
 	Naks        int // plain Nak() calls; delayed naks land in NakDelays
 	NakDelays   []time.Duration
@@ -72,9 +74,12 @@ func (m *FakeMsg) Metadata() (*jetstream.MsgMetadata, error) {
 	return nil, errors.New("fakemsg: no metadata set")
 }
 
-func (m *FakeMsg) Ack() error                      { m.Acked = true; return nil }
-func (m *FakeMsg) DoubleAck(context.Context) error { m.Acked = true; return nil }
-func (m *FakeMsg) Nak() error                      { m.Naks++; return m.NakErr }
+func (m *FakeMsg) Ack() error { m.Acked = true; return m.AckErr }
+func (m *FakeMsg) DoubleAck(context.Context) error {
+	m.Acked, m.DoubleAcks = true, m.DoubleAcks+1
+	return m.AckErr
+}
+func (m *FakeMsg) Nak() error { m.Naks++; return m.NakErr }
 func (m *FakeMsg) NakWithDelay(d time.Duration) error {
 	m.NakDelays = append(m.NakDelays, d)
 	return m.NakErr

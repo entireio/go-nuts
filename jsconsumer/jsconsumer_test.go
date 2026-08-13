@@ -725,16 +725,22 @@ func TestRunRecreatesAfterConsumerDeleted(t *testing.T) {
 
 // runJetStreamServer starts an in-process JetStream-enabled NATS server on a
 // random loopback port and returns its client URL.
-func runJetStreamServer(t *testing.T) string {
+func runJetStreamServer(t *testing.T, opts ...func(*natsserver.Options)) string {
 	t.Helper()
-	s, err := natsserver.NewServer(&natsserver.Options{
+	o := &natsserver.Options{
 		Host:      "127.0.0.1",
 		Port:      -1, // pick a free port
 		NoLog:     true,
 		NoSigs:    true,
 		JetStream: true,
 		StoreDir:  t.TempDir(),
-	})
+	}
+	// opts may add accounts, users or permissions — the retention-probe test needs
+	// a credential that can drive consumers but not read stream info.
+	for _, fn := range opts {
+		fn(o)
+	}
+	s, err := natsserver.NewServer(o)
 	if err != nil {
 		t.Fatalf("new embedded nats server: %v", err)
 	}

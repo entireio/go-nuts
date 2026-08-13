@@ -17,7 +17,11 @@
 // Operation span name, the KeepInProgress AckWait heartbeat, the DeadLetter
 // dead-letter capture, and the natsmsgtest.FakeMsg test double),
 // [jsconsumer] (the durable JetStream pull-consumer scaffold, one-shot via Start
-// or supervised via Run), and [backoff] (the NakWithDelay redelivery policy —
+// or supervised via Run, plus Retry — the consumer's single retry mechanism —
+// Schedule, the pure validator for a consumer's retry timing that fleet CI and
+// the library share, and FloorMonitor, the ack-floor stall telemetry that can
+// also arm Retry's experimental circuit breaker, ENT-1535), and [backoff] (the
+// NakWithDelay redelivery policy —
 // flat or growing — with Term-on-final-delivery, COR-762). The legacy
 // nats.JetStreamContext publishing bridges were transitional and were removed
 // once the last caller migrated (COR-1004). natsmsg and
