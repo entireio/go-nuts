@@ -1,0 +1,9 @@
+1. [P1] Non-advancing AckFloor is still treated as proof of stranding. jsconsumer/retry.go:103 directs operators to follow the destructive runbook when the floor has not advanced. AckFloor is a contiguous watermark: an older pending
+     message can pin it even when this target’s ack landed. Non-advancement must remain uncertain and require consumer-specific evidence before removal. The nearby Captured documentation has the same assumption.
+
+  2. [P1] Preserving the original Nats-Msg-Id can silently discard distinct DLQ records. natsmsg/deadletter.go:44 intentionally carries the source ID into another stream, but NATS deduplicates stream-wide by ID alone. Two different
+     source messages sharing an ID can enter one DLQ stream; the second publish returns a successful duplicate PubAck, then this code acks the original without creating its DLQ record. Strip the ID or replace it with a DLQ-scoped
+     identity derived from origin stream and sequence.
+
+  3. [P1] Publish-control stripping omits Nats-TTL. natsmsg/deadletter.go:52 excludes expectations and rollup but not jetstream.MsgTTLHeader. Against NATS 2.14.3, the copied header either rejects capture when the DLQ disallows per-
+     message TTL or makes the captured record expire when it allows TTL. The original is then acked despite the DLQ record inheriting source retention semantics. Other current broker directives should be audited similarly.
