@@ -47,6 +47,18 @@
 // returned no error — several of the semantics below are precisely calls that
 // return no error while doing nothing.
 //
+// Then PROVE the case can fail, by breaking the thing it claims to gate and
+// watching it go red: raise the cap, grant the permission, flatten the ladder,
+// silence one disposition. Review has now caught three fixtures here that passed
+// against a live broker while gating nothing — a heartbeat test that stopped the
+// heartbeat itself, so deleting the cap left it green; a permission test that
+// exercised only Ack while the contract promised the same silence for Nak and
+// Term; and a concurrent attribution that matched a durable as a bare substring,
+// letting denied_nakdelay's violation satisfy denied_nak's assertion. None of
+// those was a wrong assertion. Each was an assertion nothing could break, which
+// is the same defect as the fake and costs the same amount to find: one review
+// round each.
+//
 // # On a nats-server bump
 //
 // These semantics are version-specific, so the suite re-runs on every server

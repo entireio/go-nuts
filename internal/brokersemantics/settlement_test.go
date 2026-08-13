@@ -298,23 +298,32 @@ func TestAckWithoutPublishPermissionSilentlySucceeds(t *testing.T) {
 
 // waitForPermissionViolation blocks until the connection's async error handler —
 // the only place a denied disposition surfaces — reports a permissions violation
-// naming durable, and fails the test if none arrives. The $JS.ACK subject the
-// server rejects carries the stream and durable, so matching on the durable
-// attributes the violation to one disposition even with sibling subtests running
-// concurrently on the same connection.
+// for durable's own $JS.ACK subject, and fails the test if none arrives.
+//
+// The subtests share one connection and run concurrently, so the match has to
+// attribute a violation to exactly one durable. The rejected subject is
+// $JS.ACK.<stream>.<durable>.<delivered>.<stream seq>.<consumer seq>.<ts>.<pending>,
+// which means the durable always appears as a DOT-DELIMITED TOKEN — and matching
+// it as a bare substring is not enough: one fixture durable is a prefix of
+// another (denied_nak of denied_nakdelay), so an unbounded match would let the
+// NakWithDelay subtest's violation satisfy the Nak subtest's assertion even if
+// plain Nak stopped reporting one. Matching "."+durable+"." is what makes the
+// attribution exact regardless of how the fixture's names are chosen later.
 func waitForPermissionViolation(t *testing.T, asyncErrs func() []error, durable string) {
 	t.Helper()
+	token := "." + durable + "."
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		var seen []error
 		for _, err := range asyncErrs() {
 			seen = append(seen, err)
-			if errors.Is(err, nats.ErrPermissionViolation) && strings.Contains(err.Error(), durable) {
+			if errors.Is(err, nats.ErrPermissionViolation) && strings.Contains(err.Error(), token) {
 				return
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Errorf("no permissions violation naming durable %q reached the async error handler; saw %v", durable, seen)
+			t.Errorf("no permissions violation naming the $JS.ACK subject token %q reached the async error handler; saw %v",
+				token, seen)
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
