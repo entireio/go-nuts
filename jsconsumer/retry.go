@@ -98,10 +98,29 @@ const (
 	// That distinction is operational, not cosmetic. A responder who reads
 	// "stranded" reaches for the break-glass removal, and removing a stream
 	// message this consumer has in fact acked takes it away from every OTHER
-	// consumer of that stream. So: on Uncertain, CHECK before acting — has the
-	// ack floor advanced past this sequence? If it has, the ack landed and
-	// there is nothing to do. If it has not, treat it as stranded and follow
-	// that runbook.
+	// consumer of that stream.
+	//
+	// So on Uncertain, CHECK before acting — but read the check correctly, because
+	// only one direction of it proves anything:
+	//
+	//   - The floor has advanced PAST this sequence: the ack landed. Nothing to
+	//     do. This direction is sound.
+	//   - The floor has NOT advanced: this proves nothing about THIS message.
+	//     AckFloor is a contiguous watermark, so any older unacked message pins
+	//     it no matter what happened to this one — see
+	//     TestAckFloorStaysStationaryWhileLaterMessagesAck in
+	//     internal/brokersemantics. Treating non-advancement as stranding is how
+	//     a responder gets talked into removing an already-settled message.
+	//
+	// To implicate this message specifically, the floor has to be pinned AT it —
+	// this sequence is the oldest unacked one — rather than merely below it
+	// because something older has not settled. Until that is established the
+	// state stays uncertain, and uncertain is not a licence to remove: the
+	// payload is already safe in the DLQ, so the cost of waiting is a pinned
+	// floor, while the cost of guessing wrong is data loss for every other
+	// consumer of the stream. Note also that NumAckPending cannot substitute for
+	// the check — an exhausted message pins the floor with NumAckPending at zero
+	// (TestExhaustedDeliveryPinsFloorWithNoAckPending).
 	OutcomeUncertain Outcome = "uncertain"
 )
 
@@ -142,9 +161,14 @@ type Settlement struct {
 	// [BreakerObserve] can count what enforcing WOULD have dead-lettered.
 	BreakerTripped bool
 	// Captured reports that the raw message reached the DLQ. It is the field
-	// that separates the two strandings: with Captured the data is safe and
-	// only the original needs clearing, without it nothing was preserved and
-	// the stream copy is all that remains.
+	// that separates the two strandings: with Captured the data is safe and at
+	// most the original needs clearing, without it nothing was preserved and the
+	// stream copy is all that remains.
+	//
+	// "At most" is doing work there. Captured says nothing about whether the
+	// original is still unsettled — see [OutcomeUncertain] for why a stationary
+	// ack floor is not evidence that it is, and why removing on that basis takes
+	// the message from every other consumer of the stream.
 	Captured bool
 }
 
@@ -1057,7 +1081,7 @@ func (r *Retry) terminate(ctx context.Context, msg jetstream.Msg, s Settlement, 
 				slog.String("cause", string(s.Cause)),
 				slog.Int("delivered", s.Delivered),
 				slog.Uint64("ack_floor", s.Floor),
-				slog.String("check", "has the ack floor advanced past this message? if so the ack landed and no action is needed"))
+				slog.String("check", "has the ack floor advanced past this message? if so the ack landed and no action is needed. if not, that is NOT proof it is unsettled — an older unacked message pins the floor regardless; the copy is already safe in the DLQ, so do not remove the original until the floor is shown to be pinned AT this sequence"))
 			r.observe(ctx, msg, s)
 			return s, fmt.Errorf("settle:dlq_ack_unconfirmed: %w", err)
 		}
