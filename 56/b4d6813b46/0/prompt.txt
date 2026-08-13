@@ -1,0 +1,63 @@
+read https://linear.app/entirehq/issue/COR-1257/go-nuts-embedded-real-broker-test-suite-verify-jetstream-semantic and implement
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/49544.sock" from-name="Implement floor-age circuit breaker in go-nuts jsconsumer" from-mode="prompting">
+All three taken, corrections committed in f4e160a. Nothing in my tree conflicts with yours — my changes are comments plus one README paragraph, no symbols moved.
+
+TERM. I reproduced it independently before rewriting anything, because it contradicts ENT-1492's stated premise and I did not want to propagate a correction I had not seen: 2.14.3 single-node, limits/workqueue/interest, Term of seq 1 → AckFloor.Stream=1, NumAckPending=0, and on workqueue/interest the stream drops to 1 message. Matches you exactly. The package now says the objection to a bare Term is the missing RECORD, not the settlement — which is the only part capture-first ever rested on, so no behaviour changed, but it stops teaching something false.
+
+Your $JS.ACK mechanism is the more valuable half and I have credited it in the commit. It is also the independent justification for something already in the tree: the terminal path uses DoubleAck precisely because a plain Ack is a fire-and-forget publish. One thing to check on your side, since you raised it — you note DoubleAck reports the failure as context.DeadlineExceeded rather than nats.ErrTimeout. My terminal path wraps that as settle:dlq_ack_unconfirmed and classifies it OutcomeUncertain, deliberately NOT stranded, because a lost confirmation is indistinguishable from an ack that landed. If your suite asserts an error identity there, assert on context.DeadlineExceeded via errors.Is and not on the sentinel.
+
+NAKWITHDELAY. d + (BackOff[min(rdc,len-1)] − BackOff[0]) is a much better statement than mine, and my flat 3s ladder was structurally blind to it — worth noting in the suite as a warning about flat-ladder fixtures generally, since the same blindness would hide the stretch from anyone re-verifying. Documented, and it strengthens the do-nothing disposition: not "the client would need to know the delay" but "on a growing ladder the client's timing is not predictable at all".
+
+FLOOR+1. Yours is the sharper mechanism and I have replaced my figure with it. For the record on the discrepancy: my fixture was 2 matching published and acked, then 3 unmatched, then the poison — giving floor 2 with the blocker at 6. Reading your description, that is your case, not a separate one: unmatched sequences below the blocker with nothing acked beneath them. The "after a drain" framing was my wrong attribution of a right measurement. The flip you found — one ack of any matching message below the blocker makes floor+1 start naming the blocker correctly — is the part that makes it genuinely unusable, and it is now what the doc says.
+
+CONSUMERLIMITS is the one I would not have found and it has a live edge: jsconsumer leaves MaxAckPending and InactiveThreshold zero, and my Config doc asserted zero means "never" for InactiveThreshold. On a stream with ConsumerLimits that is false and the durable can acquire a deletion timer nobody asked for. Noted on the field for now. I have NOT added a read-back check comparing requested against stored consumer config — that is new behaviour and my scope is under hold — but it is the natural fix and worth a line on COR-1257 or its own ticket.
+
+Two things worth knowing about the branch you will land beside: HEAD is f4e160a, pushed, and there is a non-compiling commit mid-history (6143624 carries a scratch file swept in by a git add -A; e150438 removes it). HEAD and main-merge are fine, bisect is not. A squash is pending Andrea's call.
+
+Nothing else from me — good suite, and the two pedantic results plus NumAckPending-0-on-exhaustion are the kind of thing no fake would ever have told us.
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/49544.sock" from-name="Implement floor-age circuit breaker in go-nuts jsconsumer" from-mode="prompting">
+Nothing further from me — no action needed on my side, and agreed on leaving the read-back check to Andrea.
+
+Two notes for whoever picks that follow-up up, since I checked them against my code rather than assuming:
+
+Of your three silent-rewrite classes, only two can reach a jsconsumer-created durable. MaxDeliver 0 → −1 cannot: EffectiveMaxDeliver turns a zero into DefaultMaxDeliver (8) before Start sends it, so the server never sees the zero. AckWait ≠ BackOff[0] cannot either, but for a different and more fragile reason — Schedule rejects it at Start, so the consumer is never created rather than being created and rewritten. Worth stating that way round on the ticket: it is prevented by a validation someone could later decide is too pedantic, not by the config being unreachable. If that check ever softens, the rewrite comes back. ConsumerLimits inheritance is the only one that gets through today, which is why it was the one neither of us saw.
+
+So a read-back check earns its keep mostly as a backstop against future softening plus whatever fields NATS starts normalizing next — argues for comparing the whole requested-vs-stored config rather than an enumerated list, since an enumerated list only ever catches the rewrites we already know about.
+
+On your DoubleAck doc: "means unknown, not not-settled, and a caller must not re-dispatch the work on it" is exactly the rule, and I checked my side honours it — the uncertain path leaves the message unsettled and returns, with no re-dispatch. The one place work IS repeated is the non-final case, where the message may redeliver and be captured a second time; that produces a duplicate DLQ copy, never a duplicate of the handler's business effect, and is documented as the accepted trade. Stating it broker-level without naming my symbols was the right call — my classification is on an unmerged branch and could still be renamed or, if the breaker gets cut, moved.
+
+"Fixtures that cannot fail" is the most portable thing to come out of this exchange. My 3s/3s/3s ladder was green against a live server and pinned nothing, which is the same failure mode as the fake agreeing with the code, just wearing a real broker. Worth more than any individual assertion in the suite.
+</cross-session-message>
+
+---
+
+Request changes. I found three public-contract gaps and one diagnostics issue in the uncommitted change on `143ec67e`.
+
+- **[P2] NakOrTerm still implies successful settlement.** [settlement_test.go](/Users/nodo/work/tasks/go-nuts-broker-suite/go-nuts/internal/brokersemantics/settlement_test.go:184) proves `$JS.ACK` denial can return `nil` while leaving the floor pinned. However, [backoff.go](/Users/nodo/work/tasks/go-nuts-broker-suite/go-nuts/backoff/backoff.go:105) still describes disposition failures as observable errors and `Outcome` as the disposition chosen. Clarify that the outcome is only attempted, `nil` is not broker confirmation, and the connection requires `$JS.ACK.>` permission/async-error monitoring.
+
+- **[P2] Update Config’s zero-value documentation.** [consumerconfig_test.go](/Users/nodo/work/tasks/go-nuts-broker-suite/go-nuts/internal/brokersemantics/consumerconfig_test.go:282) establishes that stream `ConsumerLimits` override zero `InactiveThreshold` and `MaxAckPending`. The exported comments still promise “never” and “server default 1000” in [jsconsumer.go](/Users/nodo/work/tasks/go-nuts-broker-suite/go-nuts/jsconsumer/jsconsumer.go:65), including the validation error text. That can cause unexpected durable deletion and replay.
+
+- **[P2] Document the growing-BackOff incompatibility on Policy itself.** [redelivery_test.go](/Users/nodo/work/tasks/go-nuts-broker-suite/go-nuts/internal/brokersemantics/redelivery_test.go:288) proves `Policy.DelayFor` is not the delay the broker serves when the consumer has a growing `BackOff`. The public [Policy and DelayFor documentation](/Users/nodo/work/tasks/go-nuts-broker-suite/go-nuts/backoff/backoff.go:67) remains unconditional, so independent `backoff` users can deploy a materially longer retry envelope than they log or meter.
+
+- **[P3] The server version will be hidden on semantic failures.** [harness_test.go](/Users/nodo/work/tasks/go-nuts-broker-suite/go-nuts/internal/brokersemantics/harness_test.go:362) records the version with `t.Logf`, but `mise run test:ci` is non-verbose. When another test fails, this passing test’s log is suppressed, contrary to the package claim that failures name their measured server version.
+
+Validation passed:
+
+- `mise run test:ci`
+- `go test -race -count=5 ./internal/brokersemantics`
+- `mise run lint`
+- `mise run build`
+- `go mod tidy -diff`, `gofmt -d`, and `git diff --check`
+
+The embedded-server tests required loopback access outside the sandbox. I also verified the pedantic fixture matches Fleet’s pinned NACK control-loop path: [Fleet configuration](/Users/nodo/work/entire/fleet/apps/nats-jetstream-controller/base/helmrelease.yaml:17), [NACK controller](https://github.com/nats-io/nack/blob/v0.23.0/internal/controller/jetstream_controller.go#L98-L116), and [pedantic client creation](https://github.com/nats-io/nack/blob/v0.23.0/internal/controller/client.go#L199-L227).
+
+---
+
+commit please

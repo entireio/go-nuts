@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.9.1-nightly.202608080619.caa0c9be9.0.20260810103236-b9638c069013",
+  "checkpoint_id": "56b4d6813b46",
+  "strategy": "manual-commit",
+  "branch": "nodo/cor-1257-go-nuts-embedded-real-broker-test-suite-verify-jetstream",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "backoff/backoff.go",
+    "jsconsumer/jsconsumer.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/56/b4d6813b46/0/metadata.json",
+      "transcript": "/56/b4d6813b46/0/full.jsonl",
+      "compact_transcript": "/56/b4d6813b46/0/transcript.jsonl",
+      "content_hash": "/56/b4d6813b46/0/content_hash.txt",
+      "prompt": "/56/b4d6813b46/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 193,
+    "cache_creation_tokens": 619841,
+    "cache_read_tokens": 23027462,
+    "output_tokens": 138413,
+    "api_call_count": 104
+  }
+}
