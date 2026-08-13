@@ -65,16 +65,37 @@ type Config struct {
 	// InactiveThreshold mirrors jetstream.ConsumerConfig.InactiveThreshold:
 	// how long the durable may go without an active subscription before the
 	// server deletes it; zero means never (the JetStream default for
-	// durables). Consumers on interest-retention streams set this so a
+	// durables) UNLESS the stream sets ConsumerLimits.InactiveThreshold — see
+	// the note below. Consumers on interest-retention streams set this so a
 	// decommissioned durable stops pinning every message it would have
 	// received, instead of holding them until the stream's MaxAge.
 	InactiveThreshold time.Duration
 
 	// MaxAckPending mirrors jetstream.ConsumerConfig.MaxAckPending: the
 	// server-side cap on deliveries outstanding un-acked across ALL replicas
-	// sharing the durable; zero uses the server default (1000). Distinct
-	// from MaxMessages below, which caps only this process's client-side
-	// buffer.
+	// sharing the durable; zero uses the server default (1000), or the stream's
+	// ConsumerLimits.MaxAckPending when it sets one — see the note below.
+	// Distinct from MaxMessages below, which caps only this process's
+	// client-side buffer.
+	//
+	// # Stream ConsumerLimits fill in both zeros
+	//
+	// A stream may carry ConsumerLimits, and the server applies them to any
+	// consumer that left the matching field zero. So on such a stream neither
+	// zero above means what it says: this scaffold's consumers inherit the
+	// STREAM's MaxAckPending instead of 1000, and — the consequential one — an
+	// InactiveThreshold instead of never, which gives the durable a deletion
+	// timer nobody here asked for. A durable deleted that way is recreated from
+	// the stream's DeliverPolicy (all, by default) and replays the retained
+	// backlog, so the cost of the surprise is a replay, not just a gap.
+	//
+	// Set both explicitly on a stream with ConsumerLimits, and read the
+	// durable's STORED config rather than assuming either field above is what is
+	// running. Requests that leave them unset are also what pedantic-mode
+	// clients reject outright (NACK's controller drives fleet Consumer CRs that
+	// way), so a config this scaffold applies quietly can fail to reconcile in
+	// the cluster. Measured in internal/brokersemantics
+	// (TestStreamConsumerLimitsAreInheritedBySilentConsumers).
 	MaxAckPending int
 
 	// Tracer opens the per-message consumer span; nil uses the global OTel
@@ -170,7 +191,7 @@ func (c Config) validate(nc *nats.Conn, onMsg func(jetstream.Msg)) error {
 		return fmt.Errorf("jsconsumer(%s): MaxMessages must not be negative", c.Name)
 	}
 	if c.MaxAckPending < -1 {
-		return fmt.Errorf("jsconsumer(%s): MaxAckPending must be -1 (unlimited), 0 (server default), or positive", c.Name)
+		return fmt.Errorf("jsconsumer(%s): MaxAckPending must be -1 (unlimited), 0 (server or stream ConsumerLimits default), or positive", c.Name)
 	}
 	if c.InactiveThreshold < 0 {
 		return fmt.Errorf("jsconsumer(%s): InactiveThreshold must not be negative", c.Name)
