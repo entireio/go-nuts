@@ -98,6 +98,8 @@ linters:
         - go.opentelemetry.io/otel/trace.Tracer
         - go.opentelemetry.io/otel/trace.Span
         - github.com/nats-io/nats.go/jetstream.JetStream
+        - github.com/nats-io/nats.go/jetstream.Stream
+        - github.com/nats-io/nats.go/jetstream.Consumer
     nolintlint:
       require-explanation: true
       require-specific: true
