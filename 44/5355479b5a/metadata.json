@@ -1,0 +1,28 @@
+{
+  "cli_version": "0.9.1-nightly.202608080619.caa0c9be9.0.20260810103236-b9638c069013",
+  "checkpoint_id": "445355479b5a",
+  "strategy": "manual-commit",
+  "branch": "nodo/ent-1601-jsconsumer-retry-schedule",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "internal/brokersemantics/publishdirectives_test.go",
+    "natsmsg/deadletter.go",
+    "natsmsg/deadletter_test.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/44/5355479b5a/0/metadata.json",
+      "transcript": "/44/5355479b5a/0/full.jsonl",
+      "compact_transcript": "/44/5355479b5a/0/transcript.jsonl",
+      "content_hash": "/44/5355479b5a/0/content_hash.txt",
+      "prompt": "/44/5355479b5a/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 47,
+    "cache_creation_tokens": 43301,
+    "cache_read_tokens": 11298714,
+    "output_tokens": 24228,
+    "api_call_count": 25
+  }
+}

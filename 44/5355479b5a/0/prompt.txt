@@ -1,0 +1,13 @@
+Still request changes on live/local head b9d7500, now down to one correctness issue.
+
+  - [P2] “Write-once” provenance cannot preserve legitimate empty values. natsmsg/deadletter.go:300 treats an empty header as uninitialized, while natsmsg/deadletter.go:316 is legitimately empty outside a JetStream domain. If that DLQ
+    record is later captured from a domain, the later hop’s domain is written as the original domain. Synthetic/no-metadata captures have the same problem for other absent fields. Use an explicit origin-initialized marker or stable empty
+    sentinel, and add a cross-domain recapture regression.
+
+  The previous findings are fixed:
+
+  - Capture no longer uses Nats-Msg-Id, eliminating silent dedupe collisions.
+  - Provenance uses an explicit carried-field allowlist.
+  - Counter, batch, TTL, schedule, and future reserved directives remain filtered.
+
+  Validation passed: focused tests, full go test -race ./..., lint, build, and git diff --check. PR #14 is clean/mergeable, but GitHub still reports no checks.
