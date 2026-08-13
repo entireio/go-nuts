@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/nats-io/nats.go"
@@ -156,6 +157,12 @@ func TestDeadLetterStripsJetStreamControlHeaders(t *testing.T) {
 	orig.Set(jetstream.ScheduleSourceHeader, "repo.ops.v1.>")
 	orig.Set(jetstream.ScheduleTTLHeader, "5m")
 	orig.Set(jetstream.ScheduleTimeZoneHeader, "America/New_York")
+	orig.Set("Nats-Schedule-Rollup", "sub")
+	orig.Set("Nats-Incr", "1")
+	orig.Set("Nats-Counter-Sources", `{"s":{"foo":"1"}}`)
+	orig.Set("Nats-Batch-Id", "uuid")
+	orig.Set("Nats-Batch-Sequence", "1")
+	orig.Set("Nats-Batch-Commit", "1")
 	orig.Set(jetstream.MsgIDHeader, "teardown/123")
 	orig.Set("traceparent", "00-abc-def-01")
 
@@ -194,6 +201,15 @@ func TestDeadLetterStripsJetStreamControlHeaders(t *testing.T) {
 		jetstream.ScheduleSourceHeader,
 		jetstream.ScheduleTTLHeader,
 		jetstream.ScheduleTimeZoneHeader,
+		// Not exported by the pinned client, so named literally here — and the
+		// reason the filter is a namespace rule rather than this list. Measured
+		// against the real broker in internal/brokersemantics.
+		"Nats-Incr",
+		"Nats-Counter-Sources",
+		"Nats-Batch-Id",
+		"Nats-Batch-Sequence",
+		"Nats-Batch-Commit",
+		"Nats-Schedule-Rollup",
 	} {
 		if v := got.Header.Get(h); v != "" {
 			t.Errorf("%s = %q on the captured copy, want it stripped", h, v)
@@ -294,6 +310,83 @@ func TestDeadLetterScopesTheDedupeKeyToTheCopy(t *testing.T) {
 	}
 	if len(pub.msgs) != 2 {
 		t.Errorf("stored %d records after re-capturing a message already captured, want 2", len(pub.msgs))
+	}
+}
+
+// TestDeadLetterKeepsOnlyApplicationHeaders pins the boundary itself rather than
+// a list of names: nothing in NATS's reserved namespace survives the copy except
+// this package's own provenance, and everything outside it survives untouched.
+// That is what makes a directive added by a future NATS release safe by default.
+func TestDeadLetterKeepsOnlyApplicationHeaders(t *testing.T) {
+	orig := nats.Header{}
+	// Application-owned: must all survive.
+	orig.Set("traceparent", "00-abc-def-01")
+	orig.Set("tracestate", "vendor=1")
+	orig.Set("X-Entire-Repo", "01KWHDFJ0C")
+	orig.Set("content-type", "application/json")
+	orig.Add("X-Multi", "one")
+	orig.Add("X-Multi", "two")
+	// Reserved namespace: must not, whatever the name or casing. The invented
+	// names stand in for directives NATS has not shipped yet.
+	orig.Set("Nats-Some-Future-Directive", "on")
+	orig.Set("nats-lowercased-directive", "on")
+	orig.Set("NATS-SHOUTED-DIRECTIVE", "on")
+	// A prior hop's provenance: kept, so a re-captured copy keeps its chain.
+	orig.Set("Nats-Dlq-Reason", "earlier hop")
+
+	msg := &natsmsgtest.FakeMsg{
+		SubjectVal: "repo.ops.v1.us.acme.teardown",
+		DataVal:    []byte(`{}`),
+		HeadersVal: orig,
+		Meta:       &jetstream.MsgMetadata{NumDelivered: 2, Stream: "repo_ops_v1", Sequence: jetstream.SequencePair{Stream: 5}},
+	}
+
+	pub := &fakeDLQPublisher{}
+	if err := natsmsg.DeadLetter(context.Background(), pub, "repo.ops.dlq.v1.bad_body", msg, "bad_body"); err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+	got := pub.msgs[0].Header
+
+	for k, want := range map[string]string{
+		"traceparent":   "00-abc-def-01",
+		"tracestate":    "vendor=1",
+		"X-Entire-Repo": "01KWHDFJ0C",
+		"content-type":  "application/json",
+	} {
+		if got.Get(k) != want {
+			t.Errorf("application header %s = %q, want %q", k, got.Get(k), want)
+		}
+	}
+	if len(got["X-Multi"]) != 2 {
+		t.Errorf("X-Multi = %v, want both values preserved", got["X-Multi"])
+	}
+	for _, k := range []string{"Nats-Some-Future-Directive", "nats-lowercased-directive", "NATS-SHOUTED-DIRECTIVE"} {
+		if v := got.Get(k); v != "" {
+			t.Errorf("reserved-namespace header %s = %q, want it dropped", k, v)
+		}
+	}
+	// The provenance this package writes is the one part of the namespace it may
+	// use, so the reason is overwritten for this hop and the earlier hop's other
+	// Nats-Dlq- headers would carry through.
+	if got.Get(natsmsg.DLQReasonHeader) != "bad_body" {
+		t.Errorf("%s = %q, want this hop's reason", natsmsg.DLQReasonHeader, got.Get(natsmsg.DLQReasonHeader))
+	}
+
+	// Belt and braces: enumerate what the copy actually carries from the reserved
+	// namespace. Exactly two things may — this package's own Nats-Dlq- provenance,
+	// and the Nats-Msg-Id it authors itself for the copy's dedupe. Nothing that
+	// came from the original survives. Nats-Msg-Id is safe to author where the
+	// rejected directives were not: dedupe is always available on a stream, so it
+	// can never fail the capture.
+	for k := range got {
+		low := strings.ToLower(k)
+		if !strings.HasPrefix(low, "nats-") {
+			continue
+		}
+		if strings.HasPrefix(low, strings.ToLower(natsmsg.DLQHeaderPrefix)) || low == "nats-msg-id" {
+			continue
+		}
+		t.Errorf("captured copy carries reserved header %q from the original", k)
 	}
 }
 

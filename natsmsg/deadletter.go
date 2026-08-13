@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -29,63 +30,69 @@ const (
 	// the DLQ-scoped Nats-Msg-Id is built from.
 	DLQOriginStreamHeader = "Nats-Dlq-Origin-Stream"
 	// DLQOriginMsgIDHeader carries the original's own Nats-Msg-Id, which cannot
-	// stay in place (see dlqStrippedHeaders) but is still worth keeping: a replay
-	// tool restoring a message to its source stream needs the publisher's dedupe
-	// key, not the DLQ's.
+	// stay in place (see the header policy on DeadLetter) but is still worth
+	// keeping: a replay tool restoring a message to its source stream needs the
+	// publisher's dedupe key, not the DLQ's.
 	DLQOriginMsgIDHeader = "Nats-Dlq-Origin-Msg-Id"
+
+	// DLQHeaderPrefix is the namespace this package writes provenance into, and
+	// the only part of the reserved Nats- namespace a captured copy keeps. A copy
+	// that is itself dead-lettered later therefore accumulates its chain of
+	// provenance rather than losing the earlier hop.
+	DLQHeaderPrefix = "Nats-Dlq-"
 )
 
-// dlqStrippedHeaders are the JetStream publish-control headers removed when
-// copying an original into the DLQ. They are instructions to the BROKER about
-// the publish, not metadata about the payload, and every one of them is
-// evaluated against the stream being published TO — so carried onto the DLQ
-// they are asserted about the wrong stream.
+// natsHeaderPrefix is NATS's reserved header namespace. Everything the broker
+// interprets lives under it, which is what makes it the right boundary to filter
+// on — see the header policy on [DeadLetter].
+const natsHeaderPrefix = "Nats-"
+
+// keepsHeaderOnCapture reports whether a header from the original belongs on the
+// captured copy.
 //
-// This is not hypothetical tidiness. An original published with
-// Nats-Expected-Stream naming its own stream fails the capture publish with
-// err 10060 on EVERY attempt, so the message rides the whole ladder and ends
-// as a strand with the floor still pinned — one producer class defeating the
-// "never drop, never strand silently" guarantee, and defeating the breaker
-// identically since it too terminates through this capture. Nats-Rollup is
-// worse than a failed publish: honoured on the DLQ it would purge the very
-// subject the DLQ exists to retain.
+// The rule is a namespace boundary, deliberately, and it is the third design of
+// this filter. The first copied everything; the second named the directives to
+// drop. Both failed the same way: a deny-list has to be complete against a set
+// the broker keeps growing, and each round of "one more header" was a live
+// silent-failure path in the meantime — expectations (err 10060), per-message TTL
+// (10166), counter increments (10168), atomic-batch publishes (10174), each one
+// able to fail a capture on every delivery and strand a message the DLQ would
+// have taken.
 //
-// Nats-TTL is in the list for a reason that took a second pass to see: carried
-// onto a DLQ that allows per-message TTL it makes the captured RECORD expire on
-// the source stream's retention terms, and onto one that does not it fails the
-// capture outright. Either way the original is acked against a copy that is not
-// durable on the DLQ's own terms. The Nats-Schedule family is worse still: a
-// copied schedule expression turns the captured record into a scheduled publish,
-// and Nats-Schedule-Target would deliver it somewhere else entirely.
+// So this fails closed instead. Nats- is NATS's reserved header namespace: an
+// application has no business writing there, and everything the broker
+// interprets lives under it. A captured copy therefore keeps
 //
-// Nats-Msg-Id is stripped too, but it is REPLACED rather than merely dropped —
-// see dlqMsgID. Carrying the publisher's own ID through was a silent-loss path:
-// JetStream dedupes by that ID alone, stream-wide across every subject in the
-// DLQ, so two DIFFERENT originals that happen to share an ID inside the
-// duplicate window collapse onto one record. The second publish returns a
-// SUCCESSFUL PubAck with Duplicate set, this function reports success, and the
-// caller acks an original whose copy was never stored. A DLQ-scoped ID keeps the
-// dedupe that is wanted (re-capturing the SAME original after a failed Ack) and
-// removes the collision that is not.
+//   - every header OUTSIDE that namespace, verbatim — tracing (traceparent),
+//     application metadata, anything the payload's own readers rely on; and
+//   - nothing INSIDE it except this package's own [DLQHeaderPrefix] provenance.
 //
-// The server-set republish/direct-get headers (Nats-Stream, Nats-Sequence and
-// friends) are deliberately left alone: they are provenance rather than
-// directives, and a message that was itself republished carries real information
-// in them.
-var dlqStrippedHeaders = []string{
-	jetstream.MsgIDHeader,
-	jetstream.ExpectedStreamHeader,
-	jetstream.ExpectedLastSeqHeader,
-	jetstream.ExpectedLastSubjSeqHeader,
-	jetstream.ExpectedLastSubjSeqSubjHeader,
-	jetstream.ExpectedLastMsgIDHeader,
-	jetstream.MsgTTLHeader,
-	jetstream.MsgRollup,
-	jetstream.ScheduleHeader,
-	jetstream.ScheduleTargetHeader,
-	jetstream.ScheduleSourceHeader,
-	jetstream.ScheduleTTLHeader,
-	jetstream.ScheduleTimeZoneHeader,
+// A directive NATS adds in a future release is dropped by this rule before anyone
+// here has heard of it, which is the property the two earlier designs lacked. The
+// matching is case-insensitive even though the broker's own lookup is a
+// case-sensitive byte compare (server.getHeaderKeyIndex), so an oddly-cased
+// directive is inert today: the cost of being stricter than necessary is nothing,
+// and it holds if that ever changes.
+//
+// What this deliberately gives up: the server-set republish and direct-get
+// provenance (Nats-Stream, Nats-Sequence, Nats-Time-Stamp, Nats-Subject) on a
+// message that was itself republished. Keeping those would mean asserting they
+// are safe for a client to publish, which the client library explicitly says they
+// are not. The facts that matter about the original are re-stated in this
+// package's own namespace instead — origin subject, origin stream, stream
+// sequence, delivery count and the publisher's dedupe key — so a replay tool
+// reads provenance it can trust the authorship of.
+func keepsHeaderOnCapture(key string) bool {
+	if !hasPrefixFold(key, natsHeaderPrefix) {
+		return true
+	}
+	return hasPrefixFold(key, DLQHeaderPrefix)
+}
+
+// hasPrefixFold is strings.HasPrefix under ASCII case folding. Header keys are
+// ASCII by protocol, so a byte-wise fold is the whole of it.
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
 }
 
 // dlqMsgID is the captured copy's own dedupe key: the original's stream and
@@ -142,11 +149,13 @@ func SubjectToken(s string) string {
 // and headers and adding Nats-Dlq-* provenance (reason, origin subject, origin
 // stream, delivery count, stream sequence, and the original's own Nats-Msg-Id).
 //
-// JetStream's publish-control headers are the exception to "preserving headers":
-// they are directives about the publish, so on the DLQ they would be obeyed
-// against the wrong stream. They are stripped, and Nats-Msg-Id is re-derived
-// from the original's identity so the copy dedupes as itself — see
-// dlqStrippedHeaders and dlqMsgID.
+// "Headers" there means the ones an application owns. NATS's reserved Nats-
+// namespace does not survive the copy at all — those are directives to the
+// broker, and on the DLQ they would be obeyed against the wrong stream — with the
+// single exception of this package's own Nats-Dlq- provenance. Nats-Msg-Id is
+// re-derived from the original's identity so the copy dedupes as itself. See
+// [keepsHeaderOnCapture] for the boundary and why it is a namespace rule rather
+// than a list, and dlqMsgID for the key.
 //
 // It is the capture step a consumer runs before giving up on a message it can
 // never process. DeadLetter copies the poison to a durable DLQ subject so it can
@@ -161,21 +170,22 @@ func SubjectToken(s string) string {
 // captured copy. Publishing is bounded by dlqPublishTimeout regardless of ctx's
 // deadline.
 func DeadLetter(ctx context.Context, pub DLQPublisher, dlqSubject string, msg jetstream.Msg, reason string) error {
+	src := msg.Headers()
 	hdr := nats.Header{}
-	for k, v := range msg.Headers() {
+	for k, v := range src {
+		// Filter on the way in rather than deleting afterwards: a copy that never
+		// holds a directive cannot leak one through a name this package failed to
+		// enumerate. See keepsHeaderOnCapture.
+		if !keepsHeaderOnCapture(k) {
+			continue
+		}
 		hdr[k] = append([]string(nil), v...)
 	}
-	// Keep the original's dedupe key as provenance before dropping it, so a
-	// replay tool restoring the message upstream still has the publisher's ID.
-	if id := hdr.Get(jetstream.MsgIDHeader); id != "" {
+	// The publisher's dedupe key does not survive as-is (it would collapse
+	// unrelated messages in the DLQ, see dlqMsgID) but a replay tool restoring the
+	// message upstream needs it, so it moves into this package's namespace.
+	if id := src.Get(jetstream.MsgIDHeader); id != "" {
 		hdr.Set(DLQOriginMsgIDHeader, id)
-	}
-	// Drop the broker directives before they are re-asserted against the DLQ
-	// stream. Deleting after the copy rather than filtering inside it keeps the
-	// stripped set readable in one place; see dlqStrippedHeaders for why each one
-	// has to go.
-	for _, h := range dlqStrippedHeaders {
-		hdr.Del(h)
 	}
 	hdr.Set(DLQReasonHeader, reason)
 	hdr.Set(DLQOriginHeader, msg.Subject())
