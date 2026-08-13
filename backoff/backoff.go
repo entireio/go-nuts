@@ -10,7 +10,9 @@
 //
 // Delay calculation ([Policy.DelayFor]) is independent of message disposition:
 // it is a pure function of the delivery count, so a caller can pin or meter the
-// delay envelope without a message in hand.
+// delay envelope without a message in hand. What the BROKER then serves is another
+// matter on a consumer carrying a growing server-side BackOff ladder, which
+// stretches every requested delay — see [Policy.DelayFor].
 //
 // # Zero-value and unlimited semantics
 //
@@ -55,8 +57,9 @@ import (
 // thing; the named constant lets a caller say so on purpose.
 const UnlimitedMaxDeliver = -1
 
-// Outcome is the disposition NakOrTerm chose, for the caller's metrics and
-// logs.
+// Outcome is the disposition NakOrTerm ATTEMPTED, for the caller's metrics and
+// logs. It records the branch the policy took, not a settlement the broker
+// confirmed — see [Policy.NakOrTerm] for why those differ.
 type Outcome string
 
 const (
@@ -67,6 +70,11 @@ const (
 // Policy is the redelivery envelope a consumer applies to transient
 // failures. MaxDeliver must match the consumer's on-server MaxDeliver — the
 // policy detects the final delivery by comparing against it.
+//
+// The envelope holds only on a consumer whose on-server BackOff ladder is absent
+// or flat. A GROWING ladder overrides the policy's timing — the broker serves a
+// materially longer delay than the policy computes, so the envelope a caller logs
+// or meters is not the one the message experiences. See [Policy.DelayFor].
 type Policy struct {
 	// NakDelay is the base delay before redelivery, and with a zero Factor
 	// the whole envelope: flat suits failures expected to clear on their own
@@ -102,11 +110,25 @@ type Policy struct {
 // final delivery still Naks; the broker drops the Nak at MaxDeliver and the
 // stream's retention decides the message's fate.
 //
-// The returned Outcome reports which disposition was chosen, for the caller's
-// metrics and logs. A disposition error is worth a log line but nothing more:
-// a failed Nak redelivers via AckWait expiry anyway, and a failed Term on a
-// work-queue stream means the message lingers exactly as it would have without
-// the policy.
+// The returned Outcome reports which disposition was ATTEMPTED, for the caller's
+// metrics and logs. It is not evidence that the broker accepted it, and neither is
+// a nil error: Nak and Term are fire-and-forget publishes to $JS.ACK.>, so both
+// return once the request is written to the connection. If the connection's
+// identity lacks publish permission on $JS.ACK.> — the gap COR-1224 found on five
+// live consumers — every disposition here returns nil while the server rejects it,
+// the delivery stays outstanding, and the consumer's ack floor stops advancing with
+// nothing logged anywhere. The rejection surfaces only on the connection's async
+// error handler, which is why a consumer running this policy needs that grant and
+// needs [nuts.Connect]'s async-error logging (or its own handler) to notice when it
+// is missing. A caller that must KNOW a message settled has to use the message's
+// DoubleAck instead and treat its error as "unknown", not "not settled" — a lost
+// confirmation is indistinguishable from an ack that landed, so it is not grounds
+// to re-dispatch the work.
+//
+// A returned error is therefore the lesser failure — the client could not even
+// write the request — and is worth a log line but nothing more: a failed Nak
+// redelivers via AckWait expiry anyway, and a failed Term on a work-queue stream
+// means the message lingers exactly as it would have without the policy.
 func (p Policy) NakOrTerm(msg jetstream.Msg) (Outcome, error) {
 	if p.TermOnExhaustion && IsFinalDelivery(msg, p.MaxDeliver) {
 		if err := msg.Term(); err != nil {
@@ -126,6 +148,24 @@ func (p Policy) NakOrTerm(msg jetstream.Msg) (Outcome, error) {
 // numDelivered ≤ 1 — including the 0 that [NumDelivered] reports when
 // metadata is unavailable — reads as the first delivery. Exposed so a caller
 // can log or meter the delay it is about to apply.
+//
+// It is the delay the policy REQUESTS, which is what the broker serves only when
+// the consumer has no on-server BackOff ladder, or a flat one. On a consumer with a
+// GROWING ladder the server offsets the delivery's timestamp by the requested delay
+// but still measures it against the ladder's current rung, so the delay actually
+// served is
+//
+//	requested + (BackOff[rung] - BackOff[0])
+//
+// where rung is the delivery's position in the ladder, clamped to its last entry.
+// A flat ladder makes that second term zero and the request is honoured exactly; a
+// growing one stretches every delay from the second redelivery onward — by hours,
+// on a production ladder — while this function keeps reporting the request. A
+// caller metering DelayFor there is publishing a retry envelope the broker never
+// served, and cannot express its own envelope at all: the disposition that follows
+// such a ladder faithfully is doing nothing and letting AckWait expire. Measured in
+// internal/brokersemantics (TestBackOffGovernsAckTimeoutsNotNakDelays,
+// TestBackoffPolicyDelayIsNotWhatTheBrokerServes).
 func (p Policy) DelayFor(numDelivered int) time.Duration {
 	if p.Factor <= 1 || numDelivered <= 1 {
 		return p.NakDelay

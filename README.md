@@ -139,6 +139,33 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
 Requires Go 1.26. Tasks via [mise](https://mise.jdx.dev): `mise run test`,
 `mise run lint`, `mise run fmt`.
 
+### Testing: the fake vs the real broker
+
+Tests here split by what they can prove, because the two halves fail in opposite
+directions:
+
+- **`natsmsgtest.FakeMsg`** — library logic only. Given this input, which
+  disposition did the code choose, with which delay, after which branch. A fake
+  cannot check what the broker does in response: it encodes the same model of
+  JetStream as the code, so a belief held wrongly in both places passes.
+- **`internal/brokersemantics`** — every JetStream semantic this module's code and
+  docs rely on, measured against an embedded in-process `nats-server` at the
+  version pinned in `go.mod`: settlement and ack-floor movement, delivery
+  counting, `BackOff` ladder arithmetic, `NakWithDelay` under a ladder, config
+  normalization and rejection (including pedantic mode), and the library's own
+  end-to-end claims (`TermOnExhaustion`, `KeepInProgress`, `DeadLetter`, durable
+  resume).
+
+If a doc comment in this module states a JetStream behaviour, a test in
+`internal/brokersemantics` measures it. That suite carries **no build tag** — it
+runs in the default `go test ./...`, so it gates every merge; a tag CI forgets to
+pass is a gate that silently does not run.
+
+**On a `nats-server` bump, re-run it and read the failures as findings**, not as
+tests to fix: a red assertion there means the belief in the doc comment it cites
+needs re-deciding at the new version. `TestPinnedServerVersion` records which
+version the measurements came from.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).

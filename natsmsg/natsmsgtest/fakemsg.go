@@ -2,6 +2,24 @@
 // NATS consumers handle. It lives apart from the packages under test so
 // white-box unit tests (package foo, not foo_test) can import it without
 // cycles or extra fixture dependencies.
+//
+// # Scope: library logic, never broker semantics
+//
+// A fake answers one question: given this input, what did the code DO — which
+// disposition did it choose, with which delay, after which branch. That is all it
+// may be used for.
+//
+// It cannot answer what the BROKER does in response, because it encodes the same
+// model of JetStream that the code under test does: a belief held wrongly in both
+// places produces a green test. Every P1 in the A1 review cycle had that shape —
+// Term's settlement, NumDelivered's meaning, the BackOff ladder's arithmetic — so
+// assertions of that kind belong in the real-broker suite
+// (internal/brokersemantics), which measures them against an embedded nats-server
+// and runs in the same default `go test ./...` (COR-1257).
+//
+// In particular, a FakeMsg's Meta is whatever the test sets: scripting
+// NumDelivered proves how the code reads a delivery count, never that the server
+// would have produced it.
 package natsmsgtest
 
 import (
