@@ -2,6 +2,7 @@ package brokersemantics
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -204,8 +205,17 @@ func TestDeadLetterCarriesNoPublishDirectiveOntoTheDLQ(t *testing.T) {
 	if got := stored.Header.Get(natsmsg.DLQOriginMsgIDHeader); got != "producer/01KWHDFJ0C" {
 		t.Errorf("%s = %q, want the producer's key relocated here", natsmsg.DLQOriginMsgIDHeader, got)
 	}
-	if got := stored.Header.Get(jetstream.MsgIDHeader); got != "events/1" {
-		t.Errorf("copy dedupe key = %q, want events/1 (origin stream and sequence)", got)
+	// The copy's key names the stored message it was made from: no domain here, the
+	// source stream, its sequence, and its store time. Read the timestamp back off
+	// the delivered message rather than hardcoding it — the point is the shape and
+	// that it is derived, not a literal.
+	origMeta, err := msgs[0].Metadata()
+	if err != nil {
+		t.Fatalf("metadata: %v", err)
+	}
+	wantKey := "_.events.1." + strconv.FormatInt(origMeta.Timestamp.UnixNano(), 10)
+	if got := stored.Header.Get(jetstream.MsgIDHeader); got != wantKey {
+		t.Errorf("copy dedupe key = %q, want %q", got, wantKey)
 	}
 	// And nothing from the reserved namespace leaked in under a name this suite
 	// did not think to enumerate.
@@ -218,6 +228,107 @@ func TestDeadLetterCarriesNoPublishDirectiveOntoTheDLQ(t *testing.T) {
 			continue
 		}
 		t.Errorf("captured copy carries reserved header %q", h)
+	}
+}
+
+// TestDeadLetterKeyDistinguishesARecreatedSourceStream measures the collision the
+// DLQ dedupe key has to survive, against a really recreated stream rather than a
+// fixture asserting what recreation would do.
+//
+// A stream sequence names a message only within one incarnation of one stream. The
+// stream here is deleted and recreated inside the DLQ's duplicate window, so the
+// second message is stored at sequence 1 exactly as the first was, on a stream of
+// the same name. Keyed on stream and sequence alone the two captures produced one
+// ID; JetStream answered the second publish with a SUCCESSFUL PubAck marked
+// Duplicate and stored nothing, and the caller — seeing success — acked an original
+// whose copy did not exist. The store timestamp in the key is what separates them.
+//
+// This is not a hypothetical ordering: the DLQ is what a source stream's messages
+// are rescued INTO, so it routinely outlives the source.
+func TestDeadLetterKeyDistinguishesARecreatedSourceStream(t *testing.T) {
+	t.Parallel()
+	_, js := env(t)
+	// The DLQ outlives the source, and dedupes over a window wide enough to hold
+	// both captures — the server's own default is two minutes.
+	newStream(t, js, jetstream.StreamConfig{
+		Name: "events_dlq_recreated", Subjects: []string{"dlq.recreated.>"},
+		Duplicates: time.Minute,
+	})
+
+	capture := func(t *testing.T, payload string) {
+		t.Helper()
+		cons := newConsumer(t, js, "events", jetstream.ConsumerConfig{
+			Durable:       "recreate_capturer",
+			AckPolicy:     jetstream.AckExplicitPolicy,
+			AckWait:       time.Minute,
+			FilterSubject: "events.repo",
+		})
+		publish(t, js, "events.repo", payload)
+		msgs := fetchAll(t, cons, 1)
+		if len(msgs) != 1 {
+			t.Fatalf("fetched %d messages, want 1", len(msgs))
+		}
+		meta, err := msgs[0].Metadata()
+		if err != nil {
+			t.Fatalf("metadata: %v", err)
+		}
+		if meta.Sequence.Stream != 1 {
+			t.Fatalf("message stored at stream sequence %d, want 1 — the test needs the "+
+				"reused sequence to be the thing under test", meta.Sequence.Stream)
+		}
+		if err := natsmsg.DeadLetter(t.Context(), js, "dlq.recreated.bad_body", msgs[0], "bad_body"); err != nil {
+			t.Fatalf("DeadLetter: %v", err)
+		}
+		if err := msgs[0].Ack(); err != nil {
+			t.Fatalf("ack after capture: %v", err)
+		}
+	}
+
+	capture(t, "first incarnation")
+
+	// Delete and recreate the source. Sequence numbering restarts at 1, and the
+	// consumer goes with the stream, so the next capture presents the same
+	// (stream, sequence) pair as the first.
+	if err := js.DeleteStream(t.Context(), "events"); err != nil {
+		t.Fatalf("delete source stream: %v", err)
+	}
+	newStream(t, js, jetstream.StreamConfig{Name: "events", Subjects: []string{"events.>"}})
+	capture(t, "second incarnation")
+
+	dlq, err := js.Stream(t.Context(), "events_dlq_recreated")
+	if err != nil {
+		t.Fatalf("dlq stream: %v", err)
+	}
+	si, err := dlq.Info(t.Context())
+	if err != nil {
+		t.Fatalf("dlq info: %v", err)
+	}
+	if si.State.Msgs != 2 {
+		t.Fatalf("DLQ holds %d records after capturing two distinct messages, want 2: "+
+			"a collapse here means the second original was acked with no copy stored", si.State.Msgs)
+	}
+
+	first, err := dlq.GetMsg(t.Context(), 1)
+	if err != nil {
+		t.Fatalf("read first captured copy: %v", err)
+	}
+	second, err := dlq.GetMsg(t.Context(), 2)
+	if err != nil {
+		t.Fatalf("read second captured copy: %v", err)
+	}
+	if string(first.Data) != "first incarnation" || string(second.Data) != "second incarnation" {
+		t.Errorf("captured payloads = %q, %q; want the two distinct originals",
+			first.Data, second.Data)
+	}
+	k1, k2 := first.Header.Get(jetstream.MsgIDHeader), second.Header.Get(jetstream.MsgIDHeader)
+	if k1 == k2 {
+		t.Errorf("both copies carry dedupe key %q; the key does not separate stream incarnations", k1)
+	}
+	// Both name stream sequence 1 — the reused sequence is real, and the key is
+	// what disambiguates it.
+	if first.Header.Get(natsmsg.DLQStreamSeqHeader) != "1" || second.Header.Get(natsmsg.DLQStreamSeqHeader) != "1" {
+		t.Errorf("origin sequences = %q, %q; want both 1",
+			first.Header.Get(natsmsg.DLQStreamSeqHeader), second.Header.Get(natsmsg.DLQStreamSeqHeader))
 	}
 }
 

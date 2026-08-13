@@ -29,16 +29,25 @@ const (
 	// With DLQStreamSeqHeader it identifies the original exactly, which is what
 	// the DLQ-scoped Nats-Msg-Id is built from.
 	DLQOriginStreamHeader = "Nats-Dlq-Origin-Stream"
-	// DLQOriginMsgIDHeader carries the original's own Nats-Msg-Id, which cannot
-	// stay in place (see the header policy on DeadLetter) but is still worth
-	// keeping: a replay tool restoring a message to its source stream needs the
-	// publisher's dedupe key, not the DLQ's.
+	// DLQOriginMsgIDHeader records the Nats-Msg-Id the captured message itself
+	// carried, which cannot stay in place under its own name (it would dedupe the
+	// copy as the original — see dlqMsgID) but a replay tool restoring the message
+	// upstream needs.
+	//
+	// Read it as "what the captured message's dedupe key was", because that is all
+	// it claims. When the captured message came from a producer this is the
+	// producer's key. When it was itself a DLQ copy, it is that copy's DLQ key —
+	// which points at the previous record rather than at the first publisher.
+	// Either way the VALUE came off the message and is not something this package
+	// vouches for; only the fact that it was there is.
 	DLQOriginMsgIDHeader = "Nats-Dlq-Origin-Msg-Id"
 
-	// DLQHeaderPrefix is the namespace this package writes provenance into, and
-	// the only part of the reserved Nats- namespace a captured copy keeps. A copy
-	// that is itself dead-lettered later therefore accumulates its chain of
-	// provenance rather than losing the earlier hop.
+	// DLQHeaderPrefix is the namespace this package writes provenance into. Every
+	// header under it on a captured copy was written by the capture that produced
+	// that copy — an inbound one is dropped like any other reserved header, so a
+	// producer cannot present provenance as though this package had vouched for
+	// it. Provenance therefore describes ONE hop; see [DeadLetter] on how to walk
+	// a chain of them.
 	DLQHeaderPrefix = "Nats-Dlq-"
 )
 
@@ -61,11 +70,9 @@ const natsHeaderPrefix = "Nats-"
 //
 // So this fails closed instead. Nats- is NATS's reserved header namespace: an
 // application has no business writing there, and everything the broker
-// interprets lives under it. A captured copy therefore keeps
-//
-//   - every header OUTSIDE that namespace, verbatim — tracing (traceparent),
-//     application metadata, anything the payload's own readers rely on; and
-//   - nothing INSIDE it except this package's own [DLQHeaderPrefix] provenance.
+// interprets lives under it. A captured copy therefore keeps every header
+// OUTSIDE that namespace verbatim — tracing (traceparent), application metadata,
+// anything the payload's own readers rely on — and nothing at all from inside it.
 //
 // A directive NATS adds in a future release is dropped by this rule before anyone
 // here has heard of it, which is the property the two earlier designs lacked. The
@@ -74,19 +81,22 @@ const natsHeaderPrefix = "Nats-"
 // directive is inert today: the cost of being stricter than necessary is nothing,
 // and it holds if that ever changes.
 //
-// What this deliberately gives up: the server-set republish and direct-get
-// provenance (Nats-Stream, Nats-Sequence, Nats-Time-Stamp, Nats-Subject) on a
-// message that was itself republished. Keeping those would mean asserting they
-// are safe for a client to publish, which the client library explicitly says they
-// are not. The facts that matter about the original are re-stated in this
-// package's own namespace instead — origin subject, origin stream, stream
-// sequence, delivery count and the publisher's dedupe key — so a replay tool
-// reads provenance it can trust the authorship of.
+// Nothing inside the namespace is exempt, including this package's own
+// [DLQHeaderPrefix]. That is an authorship rule, not tidiness: a header this
+// package did not write is a header whose truth it cannot vouch for, and both
+// alternatives are worse. Keeping an inbound Nats-Dlq- header lets any producer
+// hand a replay tool provenance that looks like the library's, and the fields are
+// overwritten for the current hop anyway — so retaining them preserved nothing
+// while lending a stranger's claims this package's authority.
+//
+// Also given up deliberately: the server-set republish and direct-get provenance
+// (Nats-Stream, Nats-Sequence, Nats-Time-Stamp, Nats-Subject) on a message that
+// was itself republished. Keeping those would mean asserting they are safe for a
+// client to publish, which the client library explicitly says they are not. What
+// matters about the captured message is re-stated in this package's own namespace,
+// where the authorship is known.
 func keepsHeaderOnCapture(key string) bool {
-	if !hasPrefixFold(key, natsHeaderPrefix) {
-		return true
-	}
-	return hasPrefixFold(key, DLQHeaderPrefix)
+	return !hasPrefixFold(key, natsHeaderPrefix)
 }
 
 // hasPrefixFold is strings.HasPrefix under ASCII case folding. Header keys are
@@ -95,19 +105,60 @@ func hasPrefixFold(s, prefix string) bool {
 	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
 }
 
-// dlqMsgID is the captured copy's own dedupe key: the original's stream and
-// stream sequence, which name it uniquely across every stream in the deployment.
+// dlqMsgID is the captured copy's own dedupe key, naming the stored message the
+// copy was made from: its domain, stream, stream sequence and store timestamp.
 //
-// This is what makes a re-capture idempotent without making distinct messages
-// collide. When the DLQ publish succeeds but the original's Ack does not, the
-// message redelivers and is captured again (the settle:dlq_ack_failed path in
-// jsconsumer.Retry, which prefers a duplicate in the DLQ over a pinned floor);
-// that second publish carries the SAME origin stream and sequence, so the DLQ's
-// duplicate window collapses it onto the first record. Two different originals
-// can never produce the same key, so the collapse only ever happens to copies
-// that genuinely are the same message.
+// The key exists to make a re-capture idempotent. When the DLQ publish succeeds
+// but the original's Ack does not, the message redelivers and is captured again
+// (the settle:dlq_ack_failed path in jsconsumer.Retry, which prefers a duplicate
+// in the DLQ over a pinned floor); presenting the same key lets the DLQ's
+// duplicate window collapse the second copy onto the first. That requires two
+// properties, and both are why the key is built from these four fields and no
+// others.
+//
+// STABLE for one stored message. Every component is a fixed property of the
+// message as stored, so it is identical on delivery 1 and delivery 6, before and
+// after a consumer restart. NumDelivered is deliberately NOT part of it: it
+// changes per delivery, and including it would give each redelivery a different
+// key — turning the intended collapse into a pile of near-duplicate records.
+//
+// DISTINCT for any two stored messages. Stream sequence alone is not enough,
+// which is the reason for the other three. A sequence identifies a message only
+// within one incarnation of one stream: delete a stream and recreate it and
+// numbering restarts at 1, so a DLQ that outlives the source — the normal case,
+// since the DLQ is what the source's messages are rescued INTO — would see the
+// same stream/sequence pair naming two unrelated messages. Inside a duplicate
+// window that collapsed the second onto the first, and because a duplicate
+// PubAck reports success the caller would then Ack an original whose copy was
+// never stored. The store timestamp separates incarnations (a recreated stream
+// cannot re-store a message at the same nanosecond), and the domain separates
+// same-named streams in different JetStream domains, which Sequence and Stream
+// together cannot.
+//
+// The dot separator is unambiguous rather than merely tidy: domain and stream
+// arrive as single tokens of the dot-delimited $JS.ACK reply subject, so neither
+// can contain a dot, and the other two components are decimal digits. An absent
+// domain is written as "_", mirroring the wire format's own sentinel, so the
+// field is never empty.
 func dlqMsgID(meta *jetstream.MsgMetadata) string {
-	return meta.Stream + "/" + strconv.FormatUint(meta.Sequence.Stream, 10)
+	domain := meta.Domain
+	if domain == "" {
+		domain = "_"
+	}
+	// A real delivery always carries a store time; a zero one means the metadata
+	// did not come from the broker. Write it as 0 rather than letting UnixNano
+	// report its undefined value for the zero Time, which is a large negative
+	// number that reads like a real timestamp.
+	stored := "0"
+	if !meta.Timestamp.IsZero() {
+		stored = strconv.FormatInt(meta.Timestamp.UnixNano(), 10)
+	}
+	return strings.Join([]string{
+		domain,
+		meta.Stream,
+		strconv.FormatUint(meta.Sequence.Stream, 10),
+		stored,
+	}, ".")
 }
 
 // DLQPublisher is the publish surface DeadLetter needs — the modern
@@ -151,11 +202,31 @@ func SubjectToken(s string) string {
 //
 // "Headers" there means the ones an application owns. NATS's reserved Nats-
 // namespace does not survive the copy at all — those are directives to the
-// broker, and on the DLQ they would be obeyed against the wrong stream — with the
-// single exception of this package's own Nats-Dlq- provenance. Nats-Msg-Id is
-// re-derived from the original's identity so the copy dedupes as itself. See
+// broker, and on the DLQ they would be obeyed against the wrong stream — and the
+// provenance this function adds is written fresh on top. Nats-Msg-Id is re-derived
+// from the captured message's identity so the copy dedupes as itself. See
 // [keepsHeaderOnCapture] for the boundary and why it is a namespace rule rather
 // than a list, and dlqMsgID for the key.
+//
+// # Provenance describes one hop
+//
+// Every Nats-Dlq- header on a copy was written by the capture that produced that
+// copy, and describes that capture only. Dead-lettering a message that is ITSELF
+// a DLQ copy — a replay tool giving up on a record — does not accumulate the
+// earlier hop's fields into the new copy: they are overwritten with this hop's,
+// and an inbound Nats-Dlq- header is dropped before that anyway, because a header
+// this package did not write is one whose truth it cannot vouch for.
+//
+// A chain is still walkable, as a chain of records rather than a chain of headers.
+// DLQOriginStreamHeader and DLQStreamSeqHeader name the exact stored message the
+// copy was made from, so the previous hop is one GetMsg away, and its own
+// provenance names the hop before it. What that costs is honest to state: the
+// walk needs each intermediate record to still exist. On a DLQ that retains its
+// messages they do; where a replay tool Acks records off a work-queue DLQ as it
+// reprocesses them, a link can dangle, and only the fields on the copy in hand
+// remain. Callers that need first-publisher identity to survive an arbitrary
+// number of hops should carry it in their own header, outside the reserved
+// namespace, where it is theirs to keep.
 //
 // It is the capture step a consumer runs before giving up on a message it can
 // never process. DeadLetter copies the poison to a durable DLQ subject so it can

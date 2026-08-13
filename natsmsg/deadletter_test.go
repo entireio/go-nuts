@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -19,6 +20,18 @@ import (
 // carrying an expectation about any OTHER stream is rejected, exactly as the
 // broker does.
 const dlqStreamName = "repo_ops_dlq_v1"
+
+// storedAt stands in for the broker's store time on the fixtures' originals. Real
+// deliveries always carry one; it is part of the copy's dedupe key because it is
+// what tells two incarnations of the same stream sequence apart.
+var storedAt = time.Date(2026, 8, 13, 9, 41, 12, 345678901, time.UTC)
+
+// wantKey is the dedupe key a copy of the fixtures' stream at seq is expected to
+// carry: no domain, the origin stream, the origin sequence, the store time.
+func wantKey(seq uint64) string {
+	return "_.repo_ops_v1." + strconv.FormatUint(seq, 10) + "." +
+		strconv.FormatInt(storedAt.UnixNano(), 10)
+}
 
 type fakeDLQPublisher struct {
 	msgs    []*nats.Msg
@@ -83,7 +96,7 @@ func TestDeadLetter(t *testing.T) {
 		SubjectVal: "repo.ops.v1.us.acme.teardown",
 		DataVal:    []byte(`{"target":{"ulid":"X"}}`),
 		HeadersVal: orig,
-		Meta:       &jetstream.MsgMetadata{NumDelivered: 4, Stream: "repo_ops_v1", Sequence: jetstream.SequencePair{Stream: 999}},
+		Meta:       &jetstream.MsgMetadata{NumDelivered: 4, Stream: "repo_ops_v1", Sequence: jetstream.SequencePair{Stream: 999}, Timestamp: storedAt},
 	}
 
 	t.Run("captures payload + provenance", func(t *testing.T) {
@@ -121,8 +134,8 @@ func TestDeadLetter(t *testing.T) {
 		if got.Header.Get(natsmsg.DLQOriginMsgIDHeader) != "teardown/123" {
 			t.Errorf("origin msg id = %q", got.Header.Get(natsmsg.DLQOriginMsgIDHeader))
 		}
-		if got.Header.Get(jetstream.MsgIDHeader) != "repo_ops_v1/999" {
-			t.Errorf("copy dedupe key = %q, want it scoped to the origin", got.Header.Get(jetstream.MsgIDHeader))
+		if got.Header.Get(jetstream.MsgIDHeader) != wantKey(999) {
+			t.Errorf("copy dedupe key = %q, want %q", got.Header.Get(jetstream.MsgIDHeader), wantKey(999))
 		}
 	})
 
@@ -170,7 +183,7 @@ func TestDeadLetterStripsJetStreamControlHeaders(t *testing.T) {
 		SubjectVal: "repo.ops.v1.us.acme.teardown",
 		DataVal:    []byte(`{"target":{"ulid":"X"}}`),
 		HeadersVal: orig,
-		Meta:       &jetstream.MsgMetadata{NumDelivered: 4, Stream: "repo_ops_v1", Sequence: jetstream.SequencePair{Stream: 999}},
+		Meta:       &jetstream.MsgMetadata{NumDelivered: 4, Stream: "repo_ops_v1", Sequence: jetstream.SequencePair{Stream: 999}, Timestamp: storedAt},
 	}
 
 	pub := &fakeDLQPublisher{}
@@ -219,8 +232,8 @@ func TestDeadLetterStripsJetStreamControlHeaders(t *testing.T) {
 	// Nats-Msg-Id does not survive either — it is replaced by a key scoped to
 	// this copy, with the publisher's own kept as provenance. See
 	// TestDeadLetterScopesTheDedupeKeyToTheCopy.
-	if v := got.Header.Get(jetstream.MsgIDHeader); v != "repo_ops_v1/999" {
-		t.Errorf("%s = %q, want the DLQ-scoped key", jetstream.MsgIDHeader, v)
+	if v := got.Header.Get(jetstream.MsgIDHeader); v != wantKey(999) {
+		t.Errorf("%s = %q, want the DLQ-scoped key %q", jetstream.MsgIDHeader, v, wantKey(999))
 	}
 	if v := got.Header.Get(natsmsg.DLQOriginMsgIDHeader); v != "teardown/123" {
 		t.Errorf("%s = %q, want the publisher's key kept as provenance", natsmsg.DLQOriginMsgIDHeader, v)
@@ -269,6 +282,7 @@ func TestDeadLetterScopesTheDedupeKeyToTheCopy(t *testing.T) {
 				NumDelivered: 6,
 				Stream:       "repo_ops_v1",
 				Sequence:     jetstream.SequencePair{Stream: seq},
+				Timestamp:    storedAt,
 			},
 		}
 	}
@@ -285,11 +299,11 @@ func TestDeadLetterScopesTheDedupeKeyToTheCopy(t *testing.T) {
 	if len(pub.msgs) != 2 {
 		t.Fatalf("stored %d DLQ records for 2 distinct messages, want 2: a collapse here is a lost message", len(pub.msgs))
 	}
-	if got := pub.msgs[0].Header.Get(jetstream.MsgIDHeader); got != "repo_ops_v1/41" {
-		t.Errorf("copy dedupe key = %q, want it scoped to the origin (repo_ops_v1/41)", got)
+	if got := pub.msgs[0].Header.Get(jetstream.MsgIDHeader); got != wantKey(41) {
+		t.Errorf("copy dedupe key = %q, want %q", got, wantKey(41))
 	}
-	if got := pub.msgs[1].Header.Get(jetstream.MsgIDHeader); got != "repo_ops_v1/77" {
-		t.Errorf("copy dedupe key = %q, want it scoped to the origin (repo_ops_v1/77)", got)
+	if got := pub.msgs[1].Header.Get(jetstream.MsgIDHeader); got != wantKey(77) {
+		t.Errorf("copy dedupe key = %q, want %q", got, wantKey(77))
 	}
 	// The publisher's key is not lost, just relocated.
 	for i, m := range pub.msgs {
@@ -331,14 +345,16 @@ func TestDeadLetterKeepsOnlyApplicationHeaders(t *testing.T) {
 	orig.Set("Nats-Some-Future-Directive", "on")
 	orig.Set("nats-lowercased-directive", "on")
 	orig.Set("NATS-SHOUTED-DIRECTIVE", "on")
-	// A prior hop's provenance: kept, so a re-captured copy keeps its chain.
+	// A prior hop's provenance: dropped too, so nothing on the copy is provenance
+	// this package did not write (see
+	// TestDeadLetterDoesNotInheritProvenanceItDidNotWrite).
 	orig.Set("Nats-Dlq-Reason", "earlier hop")
 
 	msg := &natsmsgtest.FakeMsg{
 		SubjectVal: "repo.ops.v1.us.acme.teardown",
 		DataVal:    []byte(`{}`),
 		HeadersVal: orig,
-		Meta:       &jetstream.MsgMetadata{NumDelivered: 2, Stream: "repo_ops_v1", Sequence: jetstream.SequencePair{Stream: 5}},
+		Meta:       &jetstream.MsgMetadata{NumDelivered: 2, Stream: "repo_ops_v1", Sequence: jetstream.SequencePair{Stream: 5}, Timestamp: storedAt},
 	}
 
 	pub := &fakeDLQPublisher{}
@@ -365,9 +381,7 @@ func TestDeadLetterKeepsOnlyApplicationHeaders(t *testing.T) {
 			t.Errorf("reserved-namespace header %s = %q, want it dropped", k, v)
 		}
 	}
-	// The provenance this package writes is the one part of the namespace it may
-	// use, so the reason is overwritten for this hop and the earlier hop's other
-	// Nats-Dlq- headers would carry through.
+	// The provenance on the copy is this hop's, written after the filter ran.
 	if got.Get(natsmsg.DLQReasonHeader) != "bad_body" {
 		t.Errorf("%s = %q, want this hop's reason", natsmsg.DLQReasonHeader, got.Get(natsmsg.DLQReasonHeader))
 	}
@@ -387,6 +401,130 @@ func TestDeadLetterKeepsOnlyApplicationHeaders(t *testing.T) {
 			continue
 		}
 		t.Errorf("captured copy carries reserved header %q from the original", k)
+	}
+}
+
+// TestDeadLetterDedupeKeyDistinguishesStreamIncarnations: a stream sequence names
+// a message only within one incarnation of one stream. Delete a stream and
+// recreate it and numbering restarts, so a DLQ that outlives the source — the
+// normal case, since the DLQ is what the source's messages are rescued into —
+// would see one stream/sequence pair naming two unrelated messages. Keyed on that
+// pair alone the second capture collapsed onto the first and the caller acked an
+// original with no stored copy.
+//
+// The store time separates them, and the domain separates same-named streams in
+// different JetStream domains. Measured against a real recreated stream in
+// internal/brokersemantics; this pins the key's shape.
+func TestDeadLetterDedupeKeyDistinguishesStreamIncarnations(t *testing.T) {
+	newMsg := func(stream, domain string, seq uint64, stored time.Time) *natsmsgtest.FakeMsg {
+		return &natsmsgtest.FakeMsg{
+			SubjectVal: "repo.ops.v1.us.acme.teardown",
+			DataVal:    []byte(`{}`),
+			HeadersVal: nats.Header{},
+			Meta: &jetstream.MsgMetadata{
+				NumDelivered: 1, Stream: stream, Domain: domain,
+				Sequence: jetstream.SequencePair{Stream: seq}, Timestamp: stored,
+			},
+		}
+	}
+	later := storedAt.Add(90 * time.Second)
+
+	cases := map[string]struct{ a, b *natsmsgtest.FakeMsg }{
+		"same stream and sequence, different incarnation": {
+			newMsg("repo_ops_v1", "", 1, storedAt),
+			newMsg("repo_ops_v1", "", 1, later),
+		},
+		"same stream and sequence, different domain": {
+			newMsg("repo_ops_v1", "hub", 1, storedAt),
+			newMsg("repo_ops_v1", "leaf", 1, storedAt),
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			pub := &fakeDLQPublisher{}
+			for _, m := range []*natsmsgtest.FakeMsg{tc.a, tc.b} {
+				if err := natsmsg.DeadLetter(context.Background(), pub, "repo.ops.dlq.v1.bad_body", m, "bad_body"); err != nil {
+					t.Fatalf("DeadLetter: %v", err)
+				}
+			}
+			if len(pub.msgs) != 2 {
+				t.Errorf("stored %d records for 2 distinct messages, want 2: a collapse here is a lost message", len(pub.msgs))
+			}
+		})
+	}
+
+	// The other half of the contract: the key must NOT vary with anything that
+	// changes between deliveries of one message, or the re-capture after a failed
+	// Ack would pile up near-duplicates instead of collapsing.
+	t.Run("stable across redeliveries of one message", func(t *testing.T) {
+		pub := &fakeDLQPublisher{}
+		for _, delivered := range []uint64{1, 4, 6} {
+			m := newMsg("repo_ops_v1", "", 41, storedAt)
+			m.Meta.NumDelivered = delivered
+			if err := natsmsg.DeadLetter(context.Background(), pub, "repo.ops.dlq.v1.bad_body", m, "bad_body"); err != nil {
+				t.Fatalf("DeadLetter (delivery %d): %v", delivered, err)
+			}
+		}
+		if len(pub.msgs) != 1 {
+			t.Errorf("stored %d records for 3 captures of ONE message, want 1", len(pub.msgs))
+		}
+	})
+}
+
+// TestDeadLetterDoesNotInheritProvenanceItDidNotWrite: provenance describes one
+// hop, and every Nats-Dlq- header on a copy is written by the capture that made
+// it. An inbound one is dropped like any other reserved header — otherwise a
+// producer could hand a replay tool provenance that looks like this package's, and
+// the fields get overwritten for the current hop anyway, so retaining them
+// preserved nothing while lending a stranger's claims the library's authority.
+func TestDeadLetterDoesNotInheritProvenanceItDidNotWrite(t *testing.T) {
+	// A producer forging every provenance field, plus a plausible-looking hop
+	// from some earlier DLQ.
+	orig := nats.Header{}
+	orig.Set(natsmsg.DLQReasonHeader, "not the real reason")
+	orig.Set(natsmsg.DLQOriginHeader, "some.other.subject")
+	orig.Set(natsmsg.DLQOriginStreamHeader, "not_the_real_stream")
+	orig.Set(natsmsg.DLQStreamSeqHeader, "1")
+	orig.Set(natsmsg.DLQDeliveredHeader, "99")
+	orig.Set(natsmsg.DLQOriginMsgIDHeader, "forged/id")
+	orig.Set("Nats-Dlq-Invented-Field", "whatever")
+	orig.Set(jetstream.MsgIDHeader, "producer/real")
+
+	msg := &natsmsgtest.FakeMsg{
+		SubjectVal: "repo.ops.v1.us.acme.teardown",
+		DataVal:    []byte(`{}`),
+		HeadersVal: orig,
+		Meta: &jetstream.MsgMetadata{
+			NumDelivered: 4, Stream: "repo_ops_v1",
+			Sequence: jetstream.SequencePair{Stream: 999}, Timestamp: storedAt,
+		},
+	}
+
+	pub := &fakeDLQPublisher{}
+	if err := natsmsg.DeadLetter(context.Background(), pub, "repo.ops.dlq.v1.bad_body", msg, "bad_body"); err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+	got := pub.msgs[0].Header
+
+	// Every field describes THIS capture, not the forged one.
+	for h, want := range map[string]string{
+		natsmsg.DLQReasonHeader:       "bad_body",
+		natsmsg.DLQOriginHeader:       "repo.ops.v1.us.acme.teardown",
+		natsmsg.DLQOriginStreamHeader: "repo_ops_v1",
+		natsmsg.DLQStreamSeqHeader:    "999",
+		natsmsg.DLQDeliveredHeader:    "4",
+		// Authored from the Nats-Msg-Id the message really carried, not from the
+		// forged Origin-Msg-Id.
+		natsmsg.DLQOriginMsgIDHeader: "producer/real",
+	} {
+		if got.Get(h) != want {
+			t.Errorf("%s = %q, want %q — provenance must describe this capture", h, got.Get(h), want)
+		}
+	}
+	// A field this package does not write does not survive just because it is in
+	// the namespace.
+	if v := got.Get("Nats-Dlq-Invented-Field"); v != "" {
+		t.Errorf("Nats-Dlq-Invented-Field = %q, want it dropped; nothing inbound is trusted", v)
 	}
 }
 
