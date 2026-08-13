@@ -1,0 +1,6 @@
+- [P2] KeepInProgress never reaches the automatic cap. With AckWait=200ms, the 15-tick cap occurs after roughly 1s, but the test sleeps only 600ms and then explicitly calls stop() at internal/brokersemantics/library_test.go:191.
+    Removing the cap entirely would still leave this test green. The existing unit test also calls stop(), so it does not compensate. The broker test should leave the heartbeat untouched and wait for redelivery after the cap.
+
+  - [P2] The permission test covers only Ack, not the Nak/Term behavior now documented. The new public contract says Nak and Term silently succeed when $JS.ACK.> publishing is denied at backoff/backoff.go:113, but the fixture only
+    invokes Ack() at internal/brokersemantics/settlement_test.go:222. If NakWithDelay or Term diverges in a future client/server version, the advertised semantic gate stays green. This should be table-driven over fresh messages for the
+    dispositions being promised.
