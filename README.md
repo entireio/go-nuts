@@ -199,6 +199,12 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
   panicking loop is fatal (`ShutdownGroup`). The stall stays loud — the
   monitor polls independently of message flow and the ack-floor monitor still
   pages — it just isn't auto-remediated.
+
+  A milder consequence of the same measured-clock design: the failure clock is
+  per-process, so restarts for unrelated reasons (a rollout, an OOM elsewhere)
+  reset it and the breaker fires **late by however much of the window was
+  lost — late, never early**. That is the safe direction, and the same
+  conservatism `FloorMonitor` applies to the stall itself.
 - **`jsconsumer.FloorMonitor`** — the durable's ack-floor health signal, and
   the telemetry half of the poison-message story: it polls the floor and
   reports how long it has been *stalled*, which is the signal the ack-floor

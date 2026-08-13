@@ -194,14 +194,26 @@ func (s Schedule) Validate() []Violation {
 		add("CaptureReserve", "%d leaves no deliveries for the handler out of MaxDeliver %d", s.CaptureReserve, s.MaxDeliver)
 	}
 
-	// A server ladder must have somewhere to apply every rung.
+	// A server ladder must have somewhere to apply every rung. The bound
+	// mirrors the server's own (it rejects len(BackOff) > MaxDeliver, despite
+	// error text implying strict >), so the equal case stays legal here too —
+	// suspicious rather than wrong, since MaxDeliver deliveries leave only
+	// MaxDeliver-1 redeliveries and that last rung is never served.
 	if n := len(s.ServerBackOff); n > 0 && s.MaxDeliver > 0 && n > s.MaxDeliver {
-		add("ServerBackOff", "has %d rungs but MaxDeliver is %d: there are only %d redeliveries to schedule", n, s.MaxDeliver, s.MaxDeliver)
+		add("ServerBackOff", "has %d rungs but MaxDeliver %d schedules at most %d of them: %d deliveries leave %d redeliveries", n, s.MaxDeliver, s.MaxDeliver-1, s.MaxDeliver, s.MaxDeliver-1)
 	}
-	// JetStream applies BackOff[0] in place of AckWait on the first delivery,
-	// so a disagreement means the first redelivery lands on neither value.
+	// The server does not run a consumer whose AckWait disagrees with its first
+	// rung: on the ordinary create/update path it silently REWRITES the stored
+	// AckWait to BackOff[0] (measured in internal/brokersemantics,
+	// TestAckWaitIsNormalizedToFirstBackOffRung). So the redelivery timing is
+	// knowable — it is the ladder — and what the declared AckWait becomes is a
+	// value nothing on the server ever holds. That is worth a violation for two
+	// reasons: the config lies to whoever reads it, and a pedantic-mode client
+	// rejects the same request outright rather than normalizing it, so a
+	// mismatch this scaffold would apply quietly fails to reconcile under
+	// NACK's controller.
 	if len(s.ServerBackOff) > 0 && s.AckWait > 0 && s.AckWait != s.ServerBackOff[0] {
-		add("AckWait", "%s disagrees with ServerBackOff[0] (%s): the server applies the first rung in place of AckWait, so the first redelivery follows neither", s.AckWait, s.ServerBackOff[0])
+		add("AckWait", "%s disagrees with ServerBackOff[0] (%s): the server stores the first rung in place of it, so the declared AckWait never runs — and a pedantic-mode create rejects the mismatch instead of rewriting it", s.AckWait, s.ServerBackOff[0])
 	}
 
 	if s.MaxDeliver <= 0 || s.DeadLetterDelivery() < 1 {

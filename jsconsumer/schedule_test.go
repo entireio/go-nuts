@@ -27,8 +27,11 @@ func hasField(vs []Violation, field string) bool {
 	return false
 }
 
-// TestScheduleAcceptsTheBoundedLadder: the shape Track A actually ships — a
-// flat client ladder, no server BackOff, bounded end to end.
+// TestScheduleAcceptsTheBoundedLadder: a bounded flat ladder expressed with no
+// server BackOff, so NakDelay stands in as the modelled schedule. Kept as
+// coverage of that modelling path — it is NOT the adopted shape: Track A ships
+// a SERVER-owned ladder (see the ServerBackOff cases below), since the client
+// ladder was removed once the CR/server was decided as the single owner.
 func TestScheduleAcceptsTheBoundedLadder(t *testing.T) {
 	s := Schedule{
 		NakDelay: 5 * time.Minute, MaxDeliver: 6, CaptureReserve: 1,

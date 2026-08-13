@@ -220,10 +220,11 @@ func TestNewFloorMonitorRejectsUnworkableConfig(t *testing.T) {
 	}
 }
 
-// TestRetryWithoutMonitorIsMessageLocal: omitting the monitor leaves Settle
-// deciding from delivery metadata alone — no consumer-global inference, and
-// no ack-floor poll. This is the composition an adopter uses when it wants to
-// own the quarantine judgement itself.
+// TestNewRetryDefaults covers the constructor's defaults and, in its second
+// half, what omitting the monitor buys: Settle then decides from delivery
+// metadata alone — no consumer-global inference and no ack-floor poll — so a
+// rung longer than any breaker threshold is legal. That is the composition an
+// adopter uses when it wants to own the quarantine judgement itself.
 func TestNewRetryDefaults(t *testing.T) {
 	r, _ := newTestRetry(t, nil)
 	if r.cfg.MinDeliveries != DefaultMinDeliveries {
@@ -260,7 +261,8 @@ func TestNewRetryDefaults(t *testing.T) {
 }
 
 // TestSettleRetriesOnTheLadder: the ordinary path — no floor observation yet,
-// deliveries left — naks with the ladder delay and touches nothing else.
+// deliveries left — disposes of nothing, leaving the delivery for the server's
+// ladder to redeliver on AckWait expiry.
 func TestSettleRetriesOnTheLadder(t *testing.T) {
 	r, pub := newTestRetry(t, nil)
 	msg := deliveredMsg(2774437, 2)
@@ -290,8 +292,11 @@ func TestSettleRetriesOnTheLadder(t *testing.T) {
 // regression test for the filtered-consumer defect: the message sits at a
 // stream sequence far above the ack floor, exactly as a poison event does when
 // non-matching subjects sit between it and the floor. An identification rule
-// keyed on floor+1 misses it (measured against a live server: floor 2, blocker
-// at stream 6); the conjunction does not.
+// keyed on floor+1 misses it — with unmatched sequences below the blocker and
+// nothing acked beneath them, floor+1 names a message this consumer never
+// receives — while the conjunction used here does not depend on naming the
+// blocker at all. See shouldQuarantine for the mechanism; the specific floor
+// and blocker sequences once quoted here could not be reproduced.
 func TestSettleBreakerDeadLettersThroughAStall(t *testing.T) {
 	var got Settlement
 	r, pub := newTestRetry(t, func(c *RetryConfig) {
@@ -318,7 +323,7 @@ func TestSettleBreakerDeadLettersThroughAStall(t *testing.T) {
 		t.Error("blocker not Acked; the ack floor stays pinned")
 	}
 	if msg.Termed {
-		t.Error("blocker Termed; a Term does not settle the message (ENT-1492)")
+		t.Error("blocker Termed; a Term settles it but leaves no record of what was discarded")
 	}
 	if msg.Naks != 0 || len(msg.NakDelays) != 0 {
 		t.Errorf("blocker also naked (%d plain, %d delayed), want none", msg.Naks, len(msg.NakDelays))
@@ -821,9 +826,9 @@ func TestSettleDeadLettersOnExhaustion(t *testing.T) {
 }
 
 // TestSettleNeverDropsOnCaptureFailure: a failed DLQ publish must not become
-// a lost message. The original is Nak'd instead, the error surfaces as
-// settle:dlq_publish_failed, and the Settlement still names the terminal
-// branch that could not complete.
+// a lost message. The original is left untouched for the server's ladder to
+// redeliver, the error surfaces as settle:dlq_publish_failed, and the
+// Settlement still names the terminal branch that could not complete.
 func TestSettleNeverDropsOnCaptureFailure(t *testing.T) {
 	r, pub := newTestRetry(t, nil)
 	pub.err = errors.New("no responders")
@@ -847,7 +852,7 @@ func TestSettleNeverDropsOnCaptureFailure(t *testing.T) {
 }
 
 // TestSettleStrandsWhenCaptureFailsWithNoDeliveriesLeft: at the broker's own
-// cap a Nak is dropped, so nothing will retry the capture — calling that
+// cap nothing redelivers, so nothing will retry the capture — calling that
 // "retried" would tell the adopter's metrics the opposite of the truth. The
 // message is left unsettled (still pinning the floor, so the monitor fires)
 // and reported as what it is: stranded, needing the break-glass runbook.
@@ -868,7 +873,7 @@ func TestSettleStrandsWhenCaptureFailsWithNoDeliveriesLeft(t *testing.T) {
 		t.Fatalf("Settle err = %v, want settle:stranded", err)
 	}
 	if s.Outcome != OutcomeStranded {
-		t.Fatalf("Outcome = %q, want %q — a dropped Nak is not a retry", s.Outcome, OutcomeStranded)
+		t.Fatalf("Outcome = %q, want %q — nothing redelivers past the cap, so this is not a retry", s.Outcome, OutcomeStranded)
 	}
 	if msg.Acked || msg.Termed || msg.Naks != 0 || len(msg.NakDelays) != 0 {
 		t.Errorf("stranded message disposed (ack=%v term=%v naks=%d/%d), want it left unsettled",
@@ -880,8 +885,9 @@ func TestSettleStrandsWhenCaptureFailsWithNoDeliveriesLeft(t *testing.T) {
 }
 
 // TestCaptureReserveRetriesAFailedCapture: the reserve exists so a DLQ blip
-// at exactly the wrong moment is a retry rather than a stranding. Delivery 4
-// captures, fails, and Naks with deliveries still in hand.
+// at exactly the wrong moment is a retry rather than a stranding. The logically
+// exhausting delivery captures, fails, and is left for the ladder with the
+// reserved delivery still in hand.
 func TestCaptureReserveRetriesAFailedCapture(t *testing.T) {
 	r, pub := newTestRetry(t, nil)
 	pub.err = errors.New("dlq stream unavailable")
@@ -1018,6 +1024,7 @@ func TestTerminalAckIsConfirmed(t *testing.T) {
 // captures on the handler's cancelled context — the fake would never notice.
 type ctxRespectingDLQ struct {
 	fakeDLQ
+
 	sawDone []bool // one entry per publish: whether its ctx was cancellable at all
 }
 
@@ -1036,6 +1043,7 @@ func (f *ctxRespectingDLQ) PublishMsg(ctx context.Context, m *nats.Msg, opts ...
 // observable at all.
 type ctxRecordingMsg struct {
 	*natsmsgtest.FakeMsg
+
 	ackCtxErr  error
 	ackCtxDone bool
 }
@@ -1103,8 +1111,11 @@ func TestTerminateSurvivesAShutdownCancelledContext(t *testing.T) {
 }
 
 // TestSettleNeverTerms pins the invariant across every path: this package's
-// terminal branch is dead-letter-then-Ack, and a bare Term — which does not
-// settle a message and leaves no record of it — never happens.
+// terminal branch is dead-letter-then-Ack, and a bare Term never happens. Not
+// because a Term fails to settle — measured against nats-server it settles
+// cleanly, advancing the ack floor past the message — but because it settles
+// with no record of what was discarded, which is the surface this package
+// exists to close.
 func TestSettleNeverTerms(t *testing.T) {
 	cases := map[string]func(*Retry, *fakeDLQ) *natsmsgtest.FakeMsg{
 		"ladder": func(*Retry, *fakeDLQ) *natsmsgtest.FakeMsg { return deliveredMsg(10, 2) },
@@ -1356,7 +1367,7 @@ func TestConfigRejectsUnworkableBackOff(t *testing.T) {
 			c.MaxDeliver = 2
 			c.BackOff = []time.Duration{time.Minute, time.Minute, time.Minute}
 			return c
-		}(), "only 2 redeliveries"},
+		}(), "schedules at most 1 of them"}, // MaxDeliver 2 = one redelivery, not two
 		{"ackWait disagrees with the first rung", func() Config {
 			c := base
 			c.AckWait = 30 * time.Second

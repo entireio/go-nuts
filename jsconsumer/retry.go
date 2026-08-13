@@ -523,8 +523,11 @@ type RetryConfig struct {
 // the checks will otherwise find for you: three 5-minute rungs put delivery 4
 // at exactly 15 minutes, so a 15-minute threshold could quarantine a
 // transient still inside the recovery window RecoverBy declares. The
-// validation is deliberately strict about this — run NewRetry once locally
-// rather than discovering the arithmetic in CI.
+// validation is deliberately strict about this, and it does not live in
+// NewRetry: everything needing the LADDER is checked by [Schedule], which
+// Config.validate runs at Start. Run [Schedule.Validate] over the intended
+// numbers — the same call fleet CI makes against a rendered Consumer CR —
+// rather than discovering the arithmetic at startup.
 type Retry struct {
 	cfg RetryConfig
 	// failureTTL is how long a message's failure clock is kept after its last
@@ -597,8 +600,22 @@ func NewRetry(cfg RetryConfig) (*Retry, error) {
 	if cfg.RecoverBy == 0 {
 		cfg.RecoverBy = cfg.MinDeliveries
 	}
-	if cfg.RecoverBy > cfg.MaxDeliver-cfg.CaptureReserve {
-		return nil, fmt.Errorf("jsconsumer: RetryConfig.RecoverBy (%d) exceeds the ladder's %d deliveries: recovery is expected after the ladder has already given up", cfg.RecoverBy, cfg.MaxDeliver-cfg.CaptureReserve)
+	// Ask [Schedule] rather than restating its arithmetic: this comparison and
+	// its wording existed here verbatim, which is exactly how two copies of one
+	// rule drift apart. The Schedule built here deliberately carries no rungs
+	// and no FloorAge — NewRetry does not know the consumer's server ladder — so
+	// only the ladder-free RecoverBy checks can fire, and only those are
+	// surfaced. MaxDeliver and CaptureReserve are already validated above with
+	// messages naming the RetryConfig field, so Schedule's versions of those
+	// would be duplicates in the other direction.
+	for _, v := range (Schedule{
+		MaxDeliver:     cfg.MaxDeliver,
+		CaptureReserve: cfg.CaptureReserve,
+		RecoverBy:      cfg.RecoverBy,
+	}).Validate() {
+		if v.Field == "RecoverBy" {
+			return nil, fmt.Errorf("jsconsumer: RetryConfig.%s", v)
+		}
 	}
 	// Everything that needs the LADDER — cumulative time to dead-letter,
 	// recovery envelope versus breaker threshold — is checked by

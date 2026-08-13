@@ -24,9 +24,13 @@
 //
 // [FloorMonitor] is the separate, advisory half: it polls the durable's ack
 // floor and reports how long it has been stalled. Hand it to a Retry and it
-// becomes the floor-age circuit breaker, dead-lettering the message pinning a
-// stalled floor; use it alone and it is just the health signal, leaving the
-// quarantine decision to the adopter.
+// becomes the floor-age circuit breaker — which does NOT identify the message
+// pinning the floor, because consumer info does not carry that: it acts on a
+// conjunction of independently true facts, so it may quarantine a message that
+// was failing alongside the blocker rather than being it (bounded to one per
+// stall window, and the copy is replayable — see [Retry]). Use the monitor
+// alone and it is just the health signal, leaving the quarantine decision to
+// the adopter.
 //
 // Lifted from entire-api's internal/jsconsumer (COR-929), folding in the
 // module's shutdown classification ([nuts.IsShutdownFetchErr] gates the
