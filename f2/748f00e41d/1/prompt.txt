@@ -1,0 +1,33 @@
+Read Linear ENT-1601 and ENT-1535 (the 2026-08-12/13 comments carry all
+decisions) for context. Task: reconcile and clean the A1 branch
+`nodo/ent-1601-jsconsumer-retry-schedule` now that the COR-1257 broker-
+semantics suite has merged to main. Do NOT merge the branch — that's a
+separate review step. A previous session worked this branch; it is retired,
+work only from the git state.
+
+1. Fetch; rebase the branch onto origin/main (main tip carries
+   internal/brokersemantics — 21 real-broker tests + a follow-up fix).
+2. Expected conflicts, doc-only, resolution pre-agreed:
+   - jsconsumer/jsconsumer.go: two ConsumerLimits doc blocks collide.
+     KEEP MAIN'S version (the suite's — it already folded the branch's one
+     distinct point); drop the branch-side 7-line duplicate note from
+     f4e160a.
+   - README.md: ordinary textual merge, keep both sides' content coherent.
+3. While rewriting history anyway, fix the broken-bisect pair: 6143624
+   ("correct the docs...") accidentally contains a reviewer scratch file
+   (swept in by git add -A) and does not compile; e150438 only removes that
+   file. Squash e150438 INTO 6143624 so the result is the doc corrections
+   alone, compiling. Note: interactive rebase isn't supported here — script
+   it via GIT_SEQUENCE_EDITOR.
+4. Verify EVERY commit on the rebased branch builds (e.g. rebase with
+   --exec 'go build ./... && go vet ./...', or replay-check per commit).
+   Bisect-safety is the point of this exercise.
+5. Full gate on the final HEAD: gofmt -s, build, vet, go test ./... (this
+   now includes the real-broker suite), go test -race, golangci-lint,
+   git diff --check.
+6. Force-push is authorized ONCE steps 4–5 are green (reviewers pinned old
+   SHAs — the rewrite is deliberate, decided by Andrea). Use
+   --force-with-lease.
+7. Report: new HEAD, commit count (should be 8), how per-commit build
+   verification was done, gate results, and the two conflict resolutions
+   as diffs-in-words. Touch nothing else; no Linear writes.
