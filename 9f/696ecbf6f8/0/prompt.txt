@@ -1,0 +1,14 @@
+One P2 remains. The previous heartbeat-cap finding is fixed.
+
+- **[P2] Durable attribution still permits a sibling false positive.** [settlement_test.go:312](/Users/nodo/work/tasks/go-nuts-broker-suite/go-nuts/internal/brokersemantics/settlement_test.go:312) uses `strings.Contains(err.Error(), durable)`, but `denied_nak` is a substring of sibling durable `denied_nakdelay`. Because those subtests run concurrently against one async-error collector, the NakWithDelay violation can satisfy the Nak assertion even if plain Nak stops reporting one. Match the `$JS.ACK` subject token exactly—such as `.` + durable + `.`—or use non-overlapping durable names.
+
+Reviewed updated local head `2683ab7` against current GitHub `main` `143ec67`. The branch remains unpublished, so there is no PR/CI state.
+
+Validation passed:
+
+- Full race-enabled suite
+- Both rewritten fixtures repeated 10 times under the race detector
+- Lint
+- Build
+- Module tidiness
+- Whitespace checks

@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.9.1-nightly.202608080619.caa0c9be9.0.20260810103236-b9638c069013",
+  "checkpoint_id": "9f696ecbf6f8",
+  "strategy": "manual-commit",
+  "branch": "nodo/cor-1257-go-nuts-embedded-real-broker-test-suite-verify-jetstream",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "internal/brokersemantics/doc.go",
+    "internal/brokersemantics/settlement_test.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/9f/696ecbf6f8/0/metadata.json",
+      "transcript": "/9f/696ecbf6f8/0/full.jsonl",
+      "compact_transcript": "/9f/696ecbf6f8/0/transcript.jsonl",
+      "content_hash": "/9f/696ecbf6f8/0/content_hash.txt",
+      "prompt": "/9f/696ecbf6f8/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 11,
+    "cache_creation_tokens": 6954,
+    "cache_read_tokens": 2179317,
+    "output_tokens": 5773,
+    "api_call_count": 6
+  }
+}
