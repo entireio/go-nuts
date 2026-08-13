@@ -1,0 +1,7 @@
+can you commit push and create a trail
+
+---
+
+- P1 — the retention safety check fails open. jsconsumer/jsconsumer.go:340 silently returns success for every StreamInfo error, including authorization and transport failures. StreamInfo and consumer creation use separate JetStream API
+    subjects, so a credential can create the consumer without being able to read maxAge. An invalid ladder can then start and let the source expire before DLQ capture—the exact loss this check promises to prevent. Run already treats
+    ErrStreamNotFound as retryable, so the probe can return its error rather than swallowing it. The current entire-search grant includes $JS.API.>, so the immediate target is not exposed, but the reusable library contract is.
