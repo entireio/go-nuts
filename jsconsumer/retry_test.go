@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/trace"
@@ -1843,6 +1844,125 @@ func TestStartChecksTheLadderAgainstStreamRetention(t *testing.T) {
 		t.Fatalf("Start(roomy retention): %v", err)
 	}
 	run.Stop()
+}
+
+// TestStartFailsWhenTheStreamRetentionCannotBeRead is the regression for a
+// safety check that failed open.
+//
+// Reading the stream and creating the consumer are separate JetStream API
+// subjects, so a credential can be allowed to do the second and not the first.
+// The retention check used to answer "fine" for every StreamInfo error, which
+// meant exactly that credential started a consumer whose ladder outlives the
+// stream's max_age — the message expires before the ladder reaches capture,
+// which is the ENT-1492 loss the check exists to prevent. A check that cannot
+// read the stream has not passed; it has not run.
+//
+// The ladder here is the one the test above proves invalid against 10-minute
+// retention, so under the old behaviour Start SUCCEEDS and the consumer runs
+// unchecked.
+func TestStartFailsWhenTheStreamRetentionCannotBeRead(t *testing.T) {
+	// Two credentials on one server: an admin that provisions the stream, and the
+	// consumer's own, which may create and drive consumers but may not read stream
+	// info. That split is expressible in ordinary NATS permissions, which is the
+	// whole point — the grant looks complete for consuming.
+	const adminUser, restrictedUser, pass = "admin", "capturer", "pw"
+	url := runJetStreamServer(t, func(o *natsserver.Options) {
+		o.Users = []*natsserver.User{
+			{Username: adminUser, Password: pass},
+			{Username: restrictedUser, Password: pass, Permissions: &natsserver.Permissions{
+				Publish: &natsserver.SubjectPermission{Allow: []string{
+					// $JS.API.INFO is needed for the client's own account/version
+					// probe; without it nothing JetStream works at all and the test
+					// would "pass" for the wrong reason.
+					"$JS.API.INFO", "$JS.API.CONSUMER.>", "$JS.ACK.>", "short.>",
+				}},
+				Subscribe: &natsserver.SubjectPermission{Allow: []string{">"}},
+			}},
+		}
+	})
+
+	admin, err := nats.Connect(url, nats.UserInfo(adminUser, pass))
+	if err != nil {
+		t.Fatalf("connect admin: %v", err)
+	}
+	t.Cleanup(admin.Close)
+	adminJS, err := jetstream.New(admin)
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	if _, err := adminJS.CreateStream(t.Context(), jetstream.StreamConfig{
+		Name: "short_v1", Subjects: []string{"short.>"}, MaxAge: 10 * time.Minute,
+	}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+
+	// The consumer's connection. Async permission errors are expected here, so
+	// they are collected rather than left to print during the run.
+	restricted, err := nats.Connect(url, nats.UserInfo(restrictedUser, pass),
+		nats.ErrorHandler(func(*nats.Conn, *nats.Subscription, error) {}))
+	if err != nil {
+		t.Fatalf("connect restricted: %v", err)
+	}
+	t.Cleanup(restricted.Close)
+
+	r, _ := newTestRetry(t, func(c *RetryConfig) { c.Monitor, c.Breaker = nil, BreakerObserve })
+	cfg := Config{
+		Stream: "short_v1", Durable: "d", Name: "c",
+		AckWait: 5 * time.Minute, MaxDeliver: 6, BackOff: testLadder(), Retry: r,
+	}
+	// The schedule is coherent on its own: 20m to dead-letter, no bound declared.
+	// Only the stream's 10m retention makes it wrong, and that is what this
+	// credential cannot see.
+	if err := cfg.validate(restricted, func(jetstream.Msg) {}); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	// Deliberately no ctx deadline of the test's own. A denied publish gets no
+	// reply, so the probe waits out jetstream's default API timeout (~5s) — the
+	// slowest test in this package, and worth it: a tighter deadline would be spent
+	// by the probe, leaving CreateOrUpdateConsumer to fail on an expired context
+	// instead. Start would then return an error under the OLD behaviour too, and the
+	// test would pass while proving nothing.
+	_, startErr := Start(t.Context(), restricted, cfg, func(jetstream.Msg) {})
+	if startErr == nil {
+		t.Fatal("Start succeeded without being able to read the stream's retention; " +
+			"an unchecked ladder is how the message expires before capture")
+	}
+	if !strings.Contains(startErr.Error(), "retention") {
+		t.Errorf("Start err = %v, want it to name the retention check it could not run", startErr)
+	}
+	// The consumer must not exist: failing the check has to happen BEFORE
+	// CreateOrUpdateConsumer, or a durable is left behind running an unchecked
+	// ladder even though Start reported failure.
+	if _, err := adminJS.Consumer(t.Context(), "short_v1", "d"); err == nil {
+		t.Error("the durable was created despite the retention check failing")
+	} else if !errors.Is(err, jetstream.ErrConsumerNotFound) {
+		t.Errorf("checking for the durable: %v, want ErrConsumerNotFound", err)
+	}
+}
+
+// TestStartRidesOutAStreamThatDoesNotExistYet: making the retention probe report
+// its errors must not break the declarative-provisioning race Run is built for.
+// A stream that is not there yet surfaces as ErrStreamNotFound, which stays
+// retryable, so Run keeps waiting for the provisioner instead of giving up.
+func TestStartRidesOutAStreamThatDoesNotExistYet(t *testing.T) {
+	nc, _ := runTestEnv(t)
+	r, _ := newTestRetry(t, func(c *RetryConfig) { c.Monitor, c.Breaker = nil, BreakerObserve })
+	cfg := Config{
+		Stream: "not_provisioned_yet", Durable: "d", Name: "c",
+		AckWait: 5 * time.Minute, MaxDeliver: 6, BackOff: testLadder(), Retry: r,
+	}
+	_, err := Start(t.Context(), nc, cfg, func(jetstream.Msg) {})
+	if err == nil {
+		t.Fatal("Start succeeded against a stream that does not exist")
+	}
+	if !errors.Is(err, jetstream.ErrStreamNotFound) {
+		t.Errorf("Start err = %v, want it to wrap ErrStreamNotFound", err)
+	}
+	if !isRetryableStartError(err) {
+		t.Error("a not-yet-provisioned stream is not retryable; Run would give up on the " +
+			"provisioning race it exists to ride out")
+	}
 }
 
 // TestFinalAckFailureIsUncertainNotStranded: a failed DoubleAck does not prove

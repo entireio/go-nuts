@@ -334,20 +334,39 @@ func (c Config) schedule() Schedule {
 // discards the message first. That is silent data loss dressed as a retry
 // policy, and it is only visible with both halves in hand.
 //
-// Unreadable stream info is not fatal. The stream may legitimately not exist
-// yet — the declarative-provisioning race [Run] is built to ride out — and
-// consumer creation below reports that far better than a retention probe can.
+// A stream this cannot read is an error, not a pass. That distinction is the
+// whole value of the check: it exists to stop a consumer whose ladder outlives
+// retention from starting, so answering "fine" whenever the retention is
+// unknown removes the protection in exactly the case where nothing else
+// supplies it. Reading the stream and creating the consumer are separate
+// JetStream API subjects ($JS.API.STREAM.INFO.> and $JS.API.CONSUMER.>), so a
+// credential can be able to do the second and not the first — and then a
+// swallowed error means the invalid ladder starts and the source expires the
+// message before capture, which is the ENT-1492 loss this check promises to
+// prevent.
+//
+// The legitimate case still rides out, but through the classifier rather than
+// through a blanket pass: a stream that does not exist yet — the
+// declarative-provisioning race — surfaces as [jetstream.ErrStreamNotFound],
+// which [isRetryableStartError] already treats as retryable, so [Run] keeps
+// waiting for the stream to appear exactly as before. A denied
+// STREAM.INFO publish gets no reply and times out, which is retryable too: the
+// consumer never starts, [Run] logs the failure on every attempt, and the safe
+// outcome is a consumer that is loudly absent rather than quietly unchecked.
 func (c Config) checkAgainstStream(ctx context.Context, js jetstream.JetStream) error {
 	if c.Retry == nil && len(c.BackOff) == 0 {
 		return nil
 	}
+	// js.Stream fetches STREAM.INFO to build the handle, so the config is
+	// already in hand — a second Info call would be one more round trip and one
+	// more failure mode on the startup path.
 	stream, err := js.Stream(ctx, c.Stream)
 	if err != nil {
-		return nil //nolint:nilerr // absent or unreadable stream is CreateOrUpdateConsumer's error to report, not this check's
+		return fmt.Errorf("jsconsumer(%s): read stream %q to check the ladder against its retention: %w", c.Name, c.Stream, err)
 	}
-	info, err := stream.Info(ctx)
-	if err != nil || info == nil {
-		return nil //nolint:nilerr // see above
+	info := stream.CachedInfo()
+	if info == nil {
+		return fmt.Errorf("jsconsumer(%s): stream %q returned no config to check the ladder against its retention", c.Name, c.Stream)
 	}
 	sched := c.schedule()
 	sched.StreamMaxAge = info.Config.MaxAge
