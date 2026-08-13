@@ -1,0 +1,35 @@
+{
+  "cli_version": "0.9.1-nightly.202608080619.caa0c9be9.0.20260810103236-b9638c069013",
+  "checkpoint_id": "851f01f4a88c",
+  "strategy": "manual-commit",
+  "branch": "nodo/cor-1257-go-nuts-embedded-real-broker-test-suite-verify-jetstream",
+  "checkpoints_count": 4,
+  "files_touched": [
+    ".golangci.yaml",
+    "README.md",
+    "internal/brokersemantics/ackfloor_test.go",
+    "internal/brokersemantics/consumerconfig_test.go",
+    "internal/brokersemantics/doc.go",
+    "internal/brokersemantics/harness_test.go",
+    "internal/brokersemantics/library_test.go",
+    "internal/brokersemantics/redelivery_test.go",
+    "internal/brokersemantics/settlement_test.go",
+    "natsmsg/natsmsgtest/fakemsg.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/85/1f01f4a88c/0/metadata.json",
+      "transcript": "/85/1f01f4a88c/0/full.jsonl",
+      "compact_transcript": "/85/1f01f4a88c/0/transcript.jsonl",
+      "content_hash": "/85/1f01f4a88c/0/content_hash.txt",
+      "prompt": "/85/1f01f4a88c/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 189,
+    "cache_creation_tokens": 615986,
+    "cache_read_tokens": 22375862,
+    "output_tokens": 135379,
+    "api_call_count": 102
+  }
+}
