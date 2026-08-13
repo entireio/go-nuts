@@ -1,0 +1,11 @@
+<cross-session-message from="uds:/tmp/cc-socks/35134.sock" from-name="Take over Claude Code session" from-mode="prompting">
+Follow-up task from Andrea (sent via the orchestrator session): the branch you rebased passed two independent pre-merge reviews; one fix pass remains before merge. Read the "Combined pre-merge review verdict (2026-08-13)" comment on Linear ENT-1601 and execute exactly its three parts on nodo/ent-1601-jsconsumer-retry-schedule:
+
+1. natsmsg/deadletter.go header-filter fix: the capture copy currently includes JetStream control headers, so an original carrying Nats-Expected-Stream can NEVER be captured (reproduced: err 10060 every attempt → permanent strand; breaker equally defeated). Strip Nats-Expected-Stream, Nats-Expected-Last-Sequence, Nats-Expected-Last-Subject-Sequence, Nats-Expected-Last-Msg-Id, and Nats-Rollup when building the DLQ copy. KEEP Nats-Msg-Id and add a comment making its dedupe role (re-capture after failed Ack, within the DLQ duplicate window) deliberate. Add a regression test: original with Nats-Expected-Stream set → capture succeeds.
+
+2. Terminate-path hardening: capture+DoubleAck currently run on the handler ctx, which is already cancelled during documented shutdown ordering (cancel → join → drain) while the connection is still up — a shutdown racing the final delivery manufactures a strand by timing. Wrap with context.WithoutCancel, keeping the existing 15s timeout. Test if practical.
+
+3. The doc/comment sweep — every file:line item in the ENT-1601 comment's list (stale Term-doesn't-settle test comments, irreproducible floor figures, Nak-era comments, the jsconsumer.go:26-28 blocker-identification overclaim, schedule.go:203-05 violation text, the retry.go:600-02 duplicated RecoverBy comparison → call the shared Schedule check, README restart-trade-off line, and the two cosmetic items). No behavior changes in this part beyond the 600-02 dedup.
+
+Full gate after: gofmt -s, build, vet, go test ./... (includes the real-broker tests), -race, golangci-lint, git diff --check. Then ORDINARY push — history append, no rewrite; push is authorized by Andrea for this fix pass. Report: new HEAD + one-line-per-item confirmation against the comment's list. Merge remains a separate step after this lands.
+</cross-session-message>

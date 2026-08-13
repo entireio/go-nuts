@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.9.1-nightly.202608080619.caa0c9be9.0.20260810103236-b9638c069013",
+  "checkpoint_id": "159861531561",
+  "strategy": "manual-commit",
+  "branch": "nodo/ent-1601-jsconsumer-retry-schedule",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "natsmsg/deadletter.go",
+    "natsmsg/deadletter_test.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/15/9861531561/0/metadata.json",
+      "transcript": "/15/9861531561/0/full.jsonl",
+      "compact_transcript": "/15/9861531561/0/transcript.jsonl",
+      "content_hash": "/15/9861531561/0/content_hash.txt",
+      "prompt": "/15/9861531561/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 49,
+    "cache_creation_tokens": 47664,
+    "cache_read_tokens": 3562804,
+    "output_tokens": 14471,
+    "api_call_count": 26
+  }
+}
