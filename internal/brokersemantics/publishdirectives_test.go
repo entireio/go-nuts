@@ -2,7 +2,6 @@ package brokersemantics
 
 import (
 	"errors"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -205,97 +204,108 @@ func TestDeadLetterCarriesNoPublishDirectiveOntoTheDLQ(t *testing.T) {
 	if got := stored.Header.Get(natsmsg.DLQOriginMsgIDHeader); got != "producer/01KWHDFJ0C" {
 		t.Errorf("%s = %q, want the producer's key relocated here", natsmsg.DLQOriginMsgIDHeader, got)
 	}
-	// The copy's key names the stored message it was made from: no domain here, the
-	// source stream, its sequence, and its store time. Read the timestamp back off
-	// the delivered message rather than hardcoding it — the point is the shape and
-	// that it is derived, not a literal.
-	origMeta, err := msgs[0].Metadata()
-	if err != nil {
-		t.Fatalf("metadata: %v", err)
-	}
-	wantKey := "_.events.1." + strconv.FormatInt(origMeta.Timestamp.UnixNano(), 10)
-	if got := stored.Header.Get(jetstream.MsgIDHeader); got != wantKey {
-		t.Errorf("copy dedupe key = %q, want %q", got, wantKey)
+	// The copy carries no dedupe identity at all — see
+	// TestEveryCaptureLeavesItsOwnDLQRecord.
+	if got := stored.Header.Get(jetstream.MsgIDHeader); got != "" {
+		t.Errorf("%s = %q on the captured copy, want none", jetstream.MsgIDHeader, got)
 	}
 	// And nothing from the reserved namespace leaked in under a name this suite
-	// did not think to enumerate.
+	// did not think to enumerate. Only this package's own provenance may appear.
 	for h := range stored.Header {
 		low := strings.ToLower(h)
 		if !strings.HasPrefix(low, "nats-") {
 			continue
 		}
-		if strings.HasPrefix(low, strings.ToLower(natsmsg.DLQHeaderPrefix)) || low == "nats-msg-id" {
+		if strings.HasPrefix(low, strings.ToLower(natsmsg.DLQHeaderPrefix)) {
 			continue
 		}
 		t.Errorf("captured copy carries reserved header %q", h)
 	}
 }
 
-// TestDeadLetterKeyDistinguishesARecreatedSourceStream measures the collision the
-// DLQ dedupe key has to survive, against a really recreated stream rather than a
-// fixture asserting what recreation would do.
+// TestEveryCaptureLeavesItsOwnDLQRecord is the invariant capture-time dedupe was
+// traded away for, measured against the real broker: N captures leave N records,
+// whatever they are captures of.
 //
-// A stream sequence names a message only within one incarnation of one stream. The
-// stream here is deleted and recreated inside the DLQ's duplicate window, so the
-// second message is stored at sequence 1 exactly as the first was, on a stream of
-// the same name. Keyed on stream and sequence alone the two captures produced one
-// ID; JetStream answered the second publish with a SUCCESSFUL PubAck marked
-// Duplicate and stored nothing, and the caller — seeing success — acked an original
-// whose copy did not exist. The store timestamp in the key is what separates them.
+// Two schemes for a copy's Nats-Msg-Id were tried and each had a collision class.
+// Both failed in the invisible direction — JetStream answers a suppressed publish
+// with a SUCCESSFUL PubAck marked Duplicate, so the caller reads success, Acks the
+// original, and the message is gone with no record. Copies therefore carry no
+// dedupe identity, and the DLQ here declares a duplicate window wide enough that
+// any identity WOULD have collapsed these captures, so the test would fail if one
+// came back.
 //
-// This is not a hypothetical ordering: the DLQ is what a source stream's messages
-// are rescued INTO, so it routinely outlives the source.
-func TestDeadLetterKeyDistinguishesARecreatedSourceStream(t *testing.T) {
+// Case (a) is the source-recreation case: the stream is deleted and recreated, so
+// the second message is stored at sequence 1 exactly as the first was, on a stream
+// of the same name. Case (b) is the general one, including re-capturing the very
+// same stored message — the case the dedupe existed for.
+func TestEveryCaptureLeavesItsOwnDLQRecord(t *testing.T) {
 	t.Parallel()
 	_, js := env(t)
-	// The DLQ outlives the source, and dedupes over a window wide enough to hold
-	// both captures — the server's own default is two minutes.
 	newStream(t, js, jetstream.StreamConfig{
-		Name: "events_dlq_recreated", Subjects: []string{"dlq.recreated.>"},
+		Name: "events_dlq_norecords", Subjects: []string{"dlq.norecords.>"},
 		Duplicates: time.Minute,
 	})
-
-	capture := func(t *testing.T, payload string) {
+	consumer := func(t *testing.T) jetstream.Consumer {
 		t.Helper()
-		cons := newConsumer(t, js, "events", jetstream.ConsumerConfig{
-			Durable:       "recreate_capturer",
+		return newConsumer(t, js, "events", jetstream.ConsumerConfig{
+			Durable:       "norecords_capturer",
 			AckPolicy:     jetstream.AckExplicitPolicy,
 			AckWait:       time.Minute,
 			FilterSubject: "events.repo",
 		})
-		publish(t, js, "events.repo", payload)
-		msgs := fetchAll(t, cons, 1)
-		if len(msgs) != 1 {
-			t.Fatalf("fetched %d messages, want 1", len(msgs))
-		}
-		meta, err := msgs[0].Metadata()
-		if err != nil {
-			t.Fatalf("metadata: %v", err)
-		}
-		if meta.Sequence.Stream != 1 {
-			t.Fatalf("message stored at stream sequence %d, want 1 — the test needs the "+
-				"reused sequence to be the thing under test", meta.Sequence.Stream)
-		}
-		if err := natsmsg.DeadLetter(t.Context(), js, "dlq.recreated.bad_body", msgs[0], "bad_body"); err != nil {
-			t.Fatalf("DeadLetter: %v", err)
-		}
-		if err := msgs[0].Ack(); err != nil {
-			t.Fatalf("ack after capture: %v", err)
-		}
 	}
 
-	capture(t, "first incarnation")
+	// (a) First incarnation: publish, capture, settle.
+	cons := consumer(t)
+	publish(t, js, "events.repo", "first incarnation")
+	first := fetchAll(t, cons, 1)
+	if len(first) != 1 {
+		t.Fatalf("fetched %d messages, want 1", len(first))
+	}
+	if err := natsmsg.DeadLetter(t.Context(), js, "dlq.norecords.bad_body", first[0], "bad_body"); err != nil {
+		t.Fatalf("DeadLetter (first incarnation): %v", err)
+	}
+	if err := first[0].Ack(); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
 
-	// Delete and recreate the source. Sequence numbering restarts at 1, and the
-	// consumer goes with the stream, so the next capture presents the same
-	// (stream, sequence) pair as the first.
+	// Delete and recreate the source. Sequence numbering restarts at 1.
 	if err := js.DeleteStream(t.Context(), "events"); err != nil {
 		t.Fatalf("delete source stream: %v", err)
 	}
 	newStream(t, js, jetstream.StreamConfig{Name: "events", Subjects: []string{"events.>"}})
-	capture(t, "second incarnation")
 
-	dlq, err := js.Stream(t.Context(), "events_dlq_recreated")
+	cons = consumer(t)
+	publish(t, js, "events.repo", "second incarnation")
+	second := fetchAll(t, cons, 1)
+	if len(second) != 1 {
+		t.Fatalf("fetched %d messages, want 1", len(second))
+	}
+	meta, err := second[0].Metadata()
+	if err != nil {
+		t.Fatalf("metadata: %v", err)
+	}
+	if meta.Sequence.Stream != 1 {
+		t.Fatalf("message stored at sequence %d, want 1 — the reused sequence is what "+
+			"this case is about", meta.Sequence.Stream)
+	}
+	if err := natsmsg.DeadLetter(t.Context(), js, "dlq.norecords.bad_body", second[0], "bad_body"); err != nil {
+		t.Fatalf("DeadLetter (second incarnation): %v", err)
+	}
+
+	// (b) And capture that same stored message twice more, as the failed-Ack path
+	// does: the DLQ publish lands, the Ack does not, the message redelivers.
+	for i := range 2 {
+		if err := natsmsg.DeadLetter(t.Context(), js, "dlq.norecords.bad_body", second[0], "bad_body"); err != nil {
+			t.Fatalf("re-capture %d: %v", i+1, err)
+		}
+	}
+	if err := second[0].Ack(); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+
+	dlq, err := js.Stream(t.Context(), "events_dlq_norecords")
 	if err != nil {
 		t.Fatalf("dlq stream: %v", err)
 	}
@@ -303,32 +313,159 @@ func TestDeadLetterKeyDistinguishesARecreatedSourceStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dlq info: %v", err)
 	}
-	if si.State.Msgs != 2 {
-		t.Fatalf("DLQ holds %d records after capturing two distinct messages, want 2: "+
-			"a collapse here means the second original was acked with no copy stored", si.State.Msgs)
+	// Four captures: two distinct originals plus two re-captures of the second.
+	if si.State.Msgs != 4 {
+		t.Fatalf("DLQ holds %d records after 4 captures, want 4: a missing record means "+
+			"an original was acked with nothing stored", si.State.Msgs)
+	}
+	for seq := uint64(1); seq <= 4; seq++ {
+		rec, err := dlq.GetMsg(t.Context(), seq)
+		if err != nil {
+			t.Fatalf("read captured copy %d: %v", seq, err)
+		}
+		if v := rec.Header.Get(jetstream.MsgIDHeader); v != "" {
+			t.Errorf("record %d carries %s = %q, want no dedupe identity", seq, jetstream.MsgIDHeader, v)
+		}
+	}
+	// Both incarnations really are in there, told apart by their origin store time.
+	r1, err := dlq.GetMsg(t.Context(), 1)
+	if err != nil {
+		t.Fatalf("read record 1: %v", err)
+	}
+	r2, err := dlq.GetMsg(t.Context(), 2)
+	if err != nil {
+		t.Fatalf("read record 2: %v", err)
+	}
+	if string(r1.Data) != "first incarnation" || string(r2.Data) != "second incarnation" {
+		t.Errorf("captured payloads = %q, %q; want the two distinct originals", r1.Data, r2.Data)
+	}
+	if r1.Header.Get(natsmsg.DLQStreamSeqHeader) != "1" || r2.Header.Get(natsmsg.DLQStreamSeqHeader) != "1" {
+		t.Errorf("origin sequences = %q, %q; want both 1 — the reuse is real",
+			r1.Header.Get(natsmsg.DLQStreamSeqHeader), r2.Header.Get(natsmsg.DLQStreamSeqHeader))
+	}
+	if t1, t2 := r1.Header.Get(natsmsg.DLQOriginTimestampHeader), r2.Header.Get(natsmsg.DLQOriginTimestampHeader); t1 == t2 || t1 == "" {
+		t.Errorf("origin store times = %q, %q; want distinct, non-empty values — this is "+
+			"what replay-side dedupe tells incarnations apart by", t1, t2)
+	}
+}
+
+// TestReCaptureKeepsTheFirstHopProvenance: the failed-Ack path captures one message
+// more than once, and the later captures must not overwrite what the first recorded.
+// Origin provenance is write-once; only the per-hop fields move.
+func TestReCaptureKeepsTheFirstHopProvenance(t *testing.T) {
+	t.Parallel()
+	_, js := env(t)
+	newStream(t, js, jetstream.StreamConfig{Name: "events_dlq_recapture", Subjects: []string{"dlq.recapture.>"}})
+	cons := newConsumer(t, js, "events", jetstream.ConsumerConfig{
+		Durable:       "recapture_capturer",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       time.Minute,
+		FilterSubject: "events.repo",
+	})
+
+	orig := nats.NewMsg("events.repo")
+	orig.Data = []byte(`{"repo":"01KWHDFJ0C"}`)
+	orig.Header.Set(jetstream.MsgIDHeader, "producer/01KWHDFJ0C")
+	if _, err := js.PublishMsg(t.Context(), orig); err != nil {
+		t.Fatalf("publish: %v", err)
 	}
 
+	msgs := fetchAll(t, cons, 1)
+	if len(msgs) != 1 {
+		t.Fatalf("fetched %d messages, want 1", len(msgs))
+	}
+	// Two captures of the same delivery, then a third standing in for a later
+	// redelivery with a higher delivery count.
+	for _, reason := range []string{"bad_body", "bad_body_again"} {
+		if err := natsmsg.DeadLetter(t.Context(), js, "dlq.recapture.bad_body", msgs[0], reason); err != nil {
+			t.Fatalf("DeadLetter (%s): %v", reason, err)
+		}
+	}
+
+	dlq, err := js.Stream(t.Context(), "events_dlq_recapture")
+	if err != nil {
+		t.Fatalf("dlq stream: %v", err)
+	}
 	first, err := dlq.GetMsg(t.Context(), 1)
 	if err != nil {
-		t.Fatalf("read first captured copy: %v", err)
+		t.Fatalf("read first copy: %v", err)
 	}
 	second, err := dlq.GetMsg(t.Context(), 2)
 	if err != nil {
-		t.Fatalf("read second captured copy: %v", err)
+		t.Fatalf("read second copy: %v", err)
 	}
-	if string(first.Data) != "first incarnation" || string(second.Data) != "second incarnation" {
-		t.Errorf("captured payloads = %q, %q; want the two distinct originals",
-			first.Data, second.Data)
+
+	// Every origin field is identical across the two records.
+	for _, h := range []string{
+		natsmsg.DLQOriginHeader, natsmsg.DLQOriginStreamHeader, natsmsg.DLQStreamSeqHeader,
+		natsmsg.DLQOriginDomainHeader, natsmsg.DLQOriginTimestampHeader, natsmsg.DLQOriginMsgIDHeader,
+	} {
+		if a, b := first.Header.Get(h), second.Header.Get(h); a != b {
+			t.Errorf("%s = %q on the first copy and %q on the re-capture; origin provenance is write-once", h, a, b)
+		}
 	}
-	k1, k2 := first.Header.Get(jetstream.MsgIDHeader), second.Header.Get(jetstream.MsgIDHeader)
-	if k1 == k2 {
-		t.Errorf("both copies carry dedupe key %q; the key does not separate stream incarnations", k1)
+	if got := first.Header.Get(natsmsg.DLQOriginMsgIDHeader); got != "producer/01KWHDFJ0C" {
+		t.Errorf("first-hop publisher key = %q, want producer/01KWHDFJ0C", got)
 	}
-	// Both name stream sequence 1 — the reused sequence is real, and the key is
-	// what disambiguates it.
-	if first.Header.Get(natsmsg.DLQStreamSeqHeader) != "1" || second.Header.Get(natsmsg.DLQStreamSeqHeader) != "1" {
-		t.Errorf("origin sequences = %q, %q; want both 1",
-			first.Header.Get(natsmsg.DLQStreamSeqHeader), second.Header.Get(natsmsg.DLQStreamSeqHeader))
+	if got := first.Header.Get(natsmsg.DLQOriginStreamHeader); got != "events" {
+		t.Errorf("origin stream = %q, want events", got)
+	}
+	// Per-hop fields move: this hop's reason, and a hop count that advanced.
+	if got := second.Header.Get(natsmsg.DLQReasonHeader); got != "bad_body_again" {
+		t.Errorf("re-capture reason = %q, want this hop's reason", got)
+	}
+	if a, b := first.Header.Get(natsmsg.DLQHopsHeader), second.Header.Get(natsmsg.DLQHopsHeader); a != "1" || b != "1" {
+		// Both are hop 1: each capture reads the ORIGINAL, which carries no hop
+		// count. The counter advances only when a DLQ RECORD is itself captured.
+		t.Errorf("hop counts = %q, %q; want both 1 — re-capturing an original is still its first hop", a, b)
+	}
+
+	// Re-capturing the ORIGINAL cannot actually distinguish write-once from
+	// overwrite: both captures derive the same values from the same stored message,
+	// so the assertions above hold either way. The case that discriminates is
+	// capturing a DLQ RECORD, where this hop's own stream, sequence and subject all
+	// differ from the first hop's — so that is measured here too, against the real
+	// broker rather than only in the package's unit tests.
+	newStream(t, js, jetstream.StreamConfig{Name: "events_dlq2_recapture", Subjects: []string{"dlq2.recapture.>"}})
+	dlqCons := newConsumer(t, js, "events_dlq_recapture", jetstream.ConsumerConfig{
+		Durable:       "replay_gave_up",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       time.Minute,
+		FilterSubject: "dlq.recapture.>",
+	})
+	records := fetchAll(t, dlqCons, 1)
+	if len(records) != 1 {
+		t.Fatalf("fetched %d DLQ records, want 1", len(records))
+	}
+	if err := natsmsg.DeadLetter(t.Context(), js, "dlq2.recapture.gave_up", records[0], "gave up replaying"); err != nil {
+		t.Fatalf("DeadLetter of a DLQ record: %v", err)
+	}
+
+	dlq2, err := js.Stream(t.Context(), "events_dlq2_recapture")
+	if err != nil {
+		t.Fatalf("second dlq stream: %v", err)
+	}
+	hop2, err := dlq2.GetMsg(t.Context(), 1)
+	if err != nil {
+		t.Fatalf("read the re-captured copy: %v", err)
+	}
+	// Origin still names the FIRST hop — the source stream and subject, not the DLQ
+	// the record was just read from.
+	for h, want := range map[string]string{
+		natsmsg.DLQOriginStreamHeader: "events",
+		natsmsg.DLQOriginHeader:       "events.repo",
+		natsmsg.DLQStreamSeqHeader:    first.Header.Get(natsmsg.DLQStreamSeqHeader),
+		natsmsg.DLQOriginMsgIDHeader:  "producer/01KWHDFJ0C",
+	} {
+		if got := hop2.Header.Get(h); got != want {
+			t.Errorf("after re-capturing a DLQ record, %s = %q, want %q — origin provenance is write-once", h, got, want)
+		}
+	}
+	if got := hop2.Header.Get(natsmsg.DLQReasonHeader); got != "gave up replaying" {
+		t.Errorf("re-capture reason = %q, want this hop's", got)
+	}
+	if got := hop2.Header.Get(natsmsg.DLQHopsHeader); got != "2" {
+		t.Errorf("hop count = %q, want 2 after capturing a DLQ record", got)
 	}
 }
 
