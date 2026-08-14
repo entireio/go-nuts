@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.9.1-nightly.202608080619.caa0c9be9.0.20260810103236-b9638c069013",
+  "checkpoint_id": "58d6df711574",
+  "strategy": "manual-commit",
+  "branch": "nodo/jsconsumer-runner-state-callbacks",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "drain.go",
+    "jsconsumer/jsconsumer.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/58/d6df711574/0/metadata.json",
+      "transcript": "/58/d6df711574/0/full.jsonl",
+      "compact_transcript": "/58/d6df711574/0/transcript.jsonl",
+      "content_hash": "/58/d6df711574/0/content_hash.txt",
+      "prompt": ""
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 174,
+    "cache_creation_tokens": 147551,
+    "cache_read_tokens": 62631368,
+    "output_tokens": 91410,
+    "api_call_count": 87
+  }
+}
