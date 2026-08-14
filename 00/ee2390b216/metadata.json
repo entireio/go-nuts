@@ -1,0 +1,29 @@
+{
+  "cli_version": "0.9.1-nightly.202608080619.caa0c9be9.0.20260810103236-b9638c069013",
+  "checkpoint_id": "00ee2390b216",
+  "strategy": "manual-commit",
+  "branch": "nodo/natstest-shutdown-before-ready-wait",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "helpers_test.go",
+    "internal/brokersemantics/harness_test.go",
+    "jsconsumer/jsconsumer_test.go",
+    "natsmsg/publish_test.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/00/ee2390b216/0/metadata.json",
+      "transcript": "/00/ee2390b216/0/full.jsonl",
+      "compact_transcript": "/00/ee2390b216/0/transcript.jsonl",
+      "content_hash": "/00/ee2390b216/0/content_hash.txt",
+      "prompt": "/00/ee2390b216/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 537,
+    "cache_creation_tokens": 626824,
+    "cache_read_tokens": 110403092,
+    "output_tokens": 297226,
+    "api_call_count": 269
+  }
+}

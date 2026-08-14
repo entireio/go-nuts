@@ -1,0 +1,46 @@
+Read, in order: Linear COR-1254 (ALL comments — especially the canary verdict
+with the two structural blockers), the program status comment on COR-1252,
+ENT-1601's "A1 library work MERGED" comment, and COR-1009. Mission: migrate
+mirror-pipeline's legacy consume loops onto go-nuts jsconsumer (main, 832d765+)
+— ONE TRAIL/PR PER CONSUMER, each independently reviewable, mergeable, and
+revertable. Hard rule from the program: NO NACK Consumer CRs in this work —
+that half of Track D is parked.
+
+PHASE 0 — analysis only, no code. Inventory the four loops (worker/consumer,
+webhook-forwarder, meta-fanout + lifecycle, fanoutengine). For each, document:
+stream + retention type + durable name; current retry/give-up semantics
+(client NakWithDelay ladders, Term sites, KV fail-index + rekick, and
+ESPECIALLY any reliance on server-side InactiveThreshold reaping — the
+2026-06-01 interest-stream safety valve the canary found; migrations must
+preserve or consciously replace it, never silently drop it); whether a paired
+DLQ + publish grant exists; and the proposed target shape. Key judgment call,
+stated per loop: the jsconsumer SCAFFOLD (fetch/ack/heartbeat/shutdown
+discipline) migrates always — but the GIVE-UP model does not automatically
+become Retry/capture-then-Ack. A workqueue loop with a designed KV fail-index
++ rekick path keeps that give-up, migrated onto the scaffold; Retry is for
+loops where dead-letter-to-DLQ is the right semantic and a DLQ pairing exists.
+Where a DLQ or grant is missing, flag it as a fleet change — never widen a
+grant in-place. End phase 0 with: the per-loop table, a lowest-risk-first
+migration order with rationale, and whether a PR-0 (shared scaffold plumbing)
+is needed so later PRs stay independent. STOP for my approval before writing
+code.
+
+PER-LOOP RULES for the migration PRs (hard-won this week, all recorded on
+ENT-1601/COR-1254):
+- Same durable names — no recreation, no redelivery storms.
+- If the loop moves to a server-owned ladder: the failure disposition is DO
+  NOTHING (measured: plain Nak redelivers in 0s; BackOff paces ack timeouts);
+  ackWait = backoff[0]; the three MaxDeliver numbers must agree (consumer,
+  len(backoff) with tail-repeat semantics, Retry) — validate with go-nuts'
+  exported jsconsumer.Schedule, never hand arithmetic.
+- Each trail body carries a before/after timing-contract table (the old
+  effective ladder vs the new one) and the InactiveThreshold decision for
+  that loop, explicitly.
+- No bare Term anywhere. Settle-outcome observability (metrics/logs) per the
+  entire-search adoption pattern (trail #131 is the reference).
+- Real-broker tests where give-up semantics change (the embedded nats-server
+  pattern from go-nuts internal/brokersemantics).
+- Full gate per repo conventions; one trail per loop; branches for later
+  loops base on main (or on PR-0 once merged), never stacked on each other.
+- Merge cadence is mine: after each merge I'll watch staging before green-
+  lighting the next.
