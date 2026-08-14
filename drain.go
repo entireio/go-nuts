@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // ErrDrainTimeout is returned when a connection does not reach CLOSED within
@@ -84,9 +85,28 @@ func IsTransientFetchErr(err error) bool {
 // Keeping the set here rather than in each caller is the point: two services
 // already share these consumer loops, and the alert noise this package exists
 // to remove comes back the moment their classifications drift.
+//
+// # The modern client's errors are separate values
+//
+// The [jetstream] package does not reuse the nats.* error values: its
+// ErrStreamNotFound is a distinct type carrying an APIError, so errors.Is finds
+// neither across the two. A consumer migrated to the modern client therefore had
+// every rollout-ordering failure classified as a FAULT until those spellings were
+// added here — which is the exact alert erosion above, arriving through the door
+// this predicate holds shut. mirror-pipeline hit it while migrating its lifecycle
+// fan (COR-1254) and carried a local extension until this landed.
+//
+// A MISSING CONSUMER is deliberately absent in both spellings, for the same
+// reason nats.ErrConsumerDeleted is (see transientFetchErrs): recreating the
+// durable replays the stream's retained backlog, and the log is the only evidence.
+// A caller that is still waiting for its FIRST bind knows the same error is
+// expected there and can say so itself; this predicate cannot tell those apart
+// from the value alone, and guessing wrong is a silent replay.
 func IsTransientSubscribeErr(err error) bool {
 	return IsTransientFetchErr(err) ||
 		errors.Is(err, nats.ErrStreamNotFound) ||
+		errors.Is(err, jetstream.ErrStreamNotFound) ||
+		errors.Is(err, jetstream.ErrJetStreamNotEnabled) ||
 		errors.Is(err, nats.ErrTimeout) ||
 		errors.Is(err, context.DeadlineExceeded)
 }

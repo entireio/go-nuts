@@ -15,6 +15,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel/trace"
 
+	nuts "github.com/entireio/go-nuts"
 	"github.com/entireio/go-nuts/backoff"
 	"github.com/entireio/go-nuts/natsmsg/natsmsgtest"
 )
@@ -803,5 +804,182 @@ func TestStartDeliversToOnMsg(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("message did not reach onMsg")
+	}
+}
+
+// mustCreateStream provisions a stream for the runner-state tests below. The older
+// tests in this file each inline their own CreateStream; not touching those here.
+func mustCreateStream(t *testing.T, nc *nats.Conn, name, subject string) {
+	t.Helper()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	if _, err := js.CreateStream(t.Context(), jetstream.StreamConfig{
+		Name:     name,
+		Subjects: []string{subject},
+	}); err != nil {
+		t.Fatalf("create stream %s: %v", name, err)
+	}
+}
+
+// TestOnConsumingReportsBindAndLoopClose pins the readiness signal Run could not
+// previously expose.
+//
+// Before this, a supervised consumer was unobservable from outside: Run retries
+// everything it can and returns only for a config the broker will never accept, so
+// an adopter with a /readyz gate had to reconstruct "am I consuming" by polling
+// CONSUMER.INFO on a ticker. mirror-pipeline did exactly that and spent five review
+// rounds on the bookkeeping (COR-1254).
+//
+// Both transitions are asserted, because only one of them fails if the false is
+// dropped: true on bind, false when the loop closes.
+func TestOnConsumingReportsBindAndLoopClose(t *testing.T) {
+	url := runJetStreamServer(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	mustCreateStream(t, nc, "events", "events.>")
+
+	states := make(chan bool, 8)
+	cfg := Config{
+		Stream:        "events",
+		Durable:       "on_consuming",
+		FilterSubject: "events.>",
+		Name:          "probe",
+		OnConsuming:   func(_ context.Context, consuming bool) { states <- consuming },
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	r, err := Start(ctx, nc, cfg, func(jetstream.Msg) {})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	select {
+	case got := <-states:
+		if !got {
+			t.Fatalf("first state = %v, want true once the durable is bound", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("OnConsuming never reported the bind")
+	}
+
+	// Stopping closes the consume loop, which must be reported: a /readyz gate that
+	// only ever learns about the bind is worse than none.
+	cancel()
+	r.Stop()
+	select {
+	case got := <-states:
+		if got {
+			t.Fatalf("state after the loop closed = %v, want false", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("OnConsuming never reported the loop closing")
+	}
+}
+
+// TestOnStartErrorSeesRetryableFailures pins the failure-run signal.
+//
+// Run logs a retryable start failure at warn on every attempt and returns nothing,
+// so a sustained outage reads exactly like deploy churn to anything consuming logs.
+// The adopter needs the ERROR to run its own severity clock and failure counter.
+//
+// The fixture withholds the stream, which is retryable by construction
+// (ErrStreamNotFound), so Run keeps attempting rather than returning — the state
+// this callback exists for. It also pins that the error is classifiable: a value
+// nuts.IsTransientSubscribeErr cannot recognise would be reported at fault severity
+// by every adopter, which is the alert erosion the predicate exists to prevent.
+func TestOnStartErrorSeesRetryableFailures(t *testing.T) {
+	url := runJetStreamServer(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	// Deliberately NO stream.
+
+	errs := make(chan error, 8)
+	cfg := Config{
+		Stream:        "never_provisioned",
+		Durable:       "on_start_error",
+		FilterSubject: "never_provisioned.>",
+		Name:          "probe",
+		OnStartError:  func(_ context.Context, err error) { errs <- err },
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, nc, cfg, func(jetstream.Msg) {}) }()
+
+	select {
+	case got := <-errs:
+		if got == nil {
+			t.Fatal("OnStartError was called with a nil error")
+		}
+		if !nuts.IsTransientSubscribeErr(got) {
+			t.Errorf("a missing stream must classify as a transient subscribe error, got %v — "+
+				"an adopter would log this as a fault on every rollout", got)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("OnStartError never saw the retryable start failure")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run returned %v, want nil for a ctx-driven exit", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+}
+
+// TestOnStartErrorIsNotCalledForPermanentFailures pins the division of labour: a
+// configuration the broker will never accept is RETURNED, so the caller surfaces it,
+// and must not also arrive on the retry channel. Reporting both would make an
+// adopter's failure counter and its fatal path describe the same event.
+func TestOnStartErrorIsNotCalledForPermanentFailures(t *testing.T) {
+	url := runJetStreamServer(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	mustCreateStream(t, nc, "events", "events.>")
+
+	// Pre-create the durable with an immutable field set differently, so the
+	// scaffold's create is rejected outright rather than retried.
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	if _, err := js.CreateOrUpdateConsumer(t.Context(), "events", jetstream.ConsumerConfig{
+		Durable:       "immutable_clash",
+		AckPolicy:     jetstream.AckNonePolicy,
+		FilterSubject: "events.>",
+	}); err != nil {
+		t.Fatalf("seed consumer: %v", err)
+	}
+
+	var startErrors int
+	cfg := Config{
+		Stream:        "events",
+		Durable:       "immutable_clash",
+		FilterSubject: "events.>",
+		Name:          "probe",
+		OnStartError:  func(context.Context, error) { startErrors++ },
+	}
+
+	runErr := Run(t.Context(), nc, cfg, func(jetstream.Msg) {})
+	if runErr == nil {
+		t.Fatal("Run returned nil for a permanently rejected configuration")
+	}
+	if startErrors != 0 {
+		t.Errorf("OnStartError was called %d times for a permanent failure; it is returned, not retried", startErrors)
 	}
 }

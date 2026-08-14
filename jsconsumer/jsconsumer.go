@@ -169,6 +169,46 @@ type Config struct {
 	// ack floor, and one poll loop should read it.
 	FloorMonitor *FloorMonitor
 
+	// OnConsuming reports whether this consumer currently holds a live consume
+	// loop: true once the durable is bound and delivery has begun, false when
+	// that loop closes — a consumer deleted on the server, a subscription
+	// invalidated, or a [Runner.Stop]. Optional.
+	//
+	// It exists because a supervised loop is otherwise unobservable from
+	// outside. [Run] retries every failure it can and returns only for a
+	// configuration the broker will never accept, so an adopter had no way to
+	// answer "am I consuming right now" — and the ones with a /readyz gate need
+	// exactly that. mirror-pipeline's first migrated consumer reconstructed it by
+	// polling CONSUMER.INFO on a ticker: ~130 lines of probe, cadence and
+	// first-bind bookkeeping, five review rounds of defects, all of it inferring
+	// a fact the runner already knew (COR-1254). Ten more consumers were queued
+	// behind that same copy.
+	//
+	// Assign an atomic and read it from the health handler:
+	//
+	//	OnConsuming: func(_ context.Context, consuming bool) { c.consuming.Store(consuming) },
+	//
+	// Called from the runner's own goroutines, so it must not block and must not
+	// call back into the Runner (Stop from inside it deadlocks). It reports state
+	// changes, not a heartbeat: consuming true says the loop is live, never that a
+	// message arrived.
+	OnConsuming func(ctx context.Context, consuming bool)
+
+	// OnStartError observes each start attempt [Run] will RETRY, with the error
+	// that caused it. Optional, and only ever called by Run — [Start] returns its
+	// error to the caller instead.
+	//
+	// This is the failure-run signal, the companion to OnConsuming's boolean. Run
+	// logs a retryable failure at warn on every attempt and nothing else, so a
+	// sustained outage is indistinguishable from deploy churn to anything reading
+	// logs; a service that escalates on how long it has been failing (severity
+	// clocks, a recoverable-failure counter) needs the error, not the line. Pair
+	// it with [nuts.IsTransientSubscribeErr] to classify.
+	//
+	// Errors Run will NOT retry never arrive here — they are returned, so a
+	// permanently rejected configuration is the caller's to surface.
+	OnStartError func(ctx context.Context, err error)
+
 	// Tracer opens the per-message consumer span; nil uses the global OTel
 	// tracer provider.
 	Tracer trace.Tracer
@@ -496,6 +536,10 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 	}
 	watcherDone := make(chan struct{})
 	r := &Runner{cc: cc, closed: cc.Closed(), watcherDone: watcherDone}
+	// The loop is live from here: Consume has the subscription and deliveries are
+	// flowing. Reported before the ctx watcher is armed so a caller's readiness
+	// cannot observe the false that follows a close without first seeing the true.
+	cfg.notifyConsuming(ctx, true)
 	if cfg.Retry != nil {
 		cfg.Retry.attach(cfg.Name, cfg.logger())
 	}
@@ -515,8 +559,30 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 			r.Stop()
 		case <-r.closed:
 		}
+		// Both arms mean the same thing to a reader of OnConsuming: this loop is no
+		// longer delivering. Stop's own join has already returned by the time
+		// ctx.Done reaches here, and the closed arm is the loop dying underneath us
+		// — a deleted consumer, an invalidated subscription — which is precisely the
+		// case a /readyz gate must not miss.
+		cfg.notifyConsuming(ctx, false)
 	}()
 	return r, nil
+}
+
+// notifyConsuming reports a consume-loop state change, if the adopter asked for
+// one. Nil-safe so every call site stays a single line.
+func (c Config) notifyConsuming(ctx context.Context, consuming bool) {
+	if c.OnConsuming != nil {
+		c.OnConsuming(ctx, consuming)
+	}
+}
+
+// notifyStartError reports a start attempt that will be retried, if the adopter
+// asked for one.
+func (c Config) notifyStartError(ctx context.Context, err error) {
+	if c.OnStartError != nil {
+		c.OnStartError(ctx, err)
+	}
 }
 
 // isRetryableStartError classifies the narrow set of failures that can become
@@ -607,6 +673,11 @@ func Run(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.Ms
 			if !isRetryableStartError(err) {
 				return err
 			}
+			// Retryable: the caller never sees this error, so it is reported here or
+			// nowhere. A warn line per attempt cannot tell deploy churn from a
+			// sustained outage; OnStartError hands the adopter the error so its own
+			// severity clock and failure counter can.
+			cfg.notifyStartError(ctx, err)
 			cfg.logger().WarnContext(ctx, cfg.Name+": start consumer failed; retrying",
 				slog.Any("error", err), slog.Duration("retry_in", delay))
 		} else {
