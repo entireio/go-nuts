@@ -66,10 +66,18 @@ func startServer(t *testing.T, opts ...func(*natsserver.Options)) *natsserver.Se
 		t.Fatalf("new embedded nats server: %v", err)
 	}
 	go s.Start()
+	// Register the shutdown BEFORE waiting on readiness, and keep it in that
+	// order. A server that never reports ready is still running: still bound to
+	// its port and still holding its JetStream store. Fataling first leaves it
+	// there for the rest of the process — and because t.TempDir registered its own
+	// cleanup earlier, cleanups run LIFO and the store directory is removed
+	// underneath a live server rather than after it stopped. The consequence lands
+	// as a flake in a LATER parallel test, which is the kind of failure that gets
+	// blamed on anything but its cause.
+	t.Cleanup(s.Shutdown)
 	if !s.ReadyForConnections(10 * time.Second) {
 		t.Fatal("embedded nats server not ready in time")
 	}
-	t.Cleanup(s.Shutdown)
 	return s
 }
 

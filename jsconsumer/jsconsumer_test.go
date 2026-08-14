@@ -745,10 +745,13 @@ func runJetStreamServer(t *testing.T, opts ...func(*natsserver.Options)) string 
 		t.Fatalf("new embedded nats server: %v", err)
 	}
 	go s.Start()
+	// Shutdown registered BEFORE the readiness wait, so a server that never
+	// becomes ready is still torn down — see startServer in
+	// internal/brokersemantics for why the order matters.
+	t.Cleanup(s.Shutdown)
 	if !s.ReadyForConnections(10 * time.Second) {
 		t.Fatal("embedded nats server not ready in time")
 	}
-	t.Cleanup(s.Shutdown)
 	return s.ClientURL()
 }
 

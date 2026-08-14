@@ -38,10 +38,13 @@ func newStreamConn(t *testing.T) *nats.Conn {
 		t.Fatalf("new embedded nats server: %v", err)
 	}
 	go s.Start()
+	// Shutdown registered BEFORE the readiness wait, so a server that never
+	// becomes ready is still torn down — see startServer in
+	// internal/brokersemantics for why the order matters.
+	t.Cleanup(s.Shutdown)
 	if !s.ReadyForConnections(10 * time.Second) {
 		t.Fatal("embedded nats server not ready in time")
 	}
-	t.Cleanup(s.Shutdown)
 
 	nc, err := nats.Connect(s.ClientURL())
 	if err != nil {
