@@ -3,10 +3,11 @@
   "checkpoint_id": "58d6df711574",
   "strategy": "manual-commit",
   "branch": "nodo/jsconsumer-runner-state-callbacks",
-  "checkpoints_count": 1,
+  "checkpoints_count": 2,
   "files_touched": [
     "drain.go",
-    "jsconsumer/jsconsumer.go"
+    "jsconsumer/jsconsumer.go",
+    "jsconsumer/jsconsumer_test.go"
   ],
   "sessions": [
     {
@@ -15,13 +16,20 @@
       "compact_transcript": "/58/d6df711574/0/transcript.jsonl",
       "content_hash": "/58/d6df711574/0/content_hash.txt",
       "prompt": ""
+    },
+    {
+      "metadata": "/58/d6df711574/1/metadata.json",
+      "transcript": "/58/d6df711574/1/full.jsonl",
+      "compact_transcript": "/58/d6df711574/1/transcript.jsonl",
+      "content_hash": "/58/d6df711574/1/content_hash.txt",
+      "prompt": "/58/d6df711574/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 174,
-    "cache_creation_tokens": 147551,
-    "cache_read_tokens": 62631368,
-    "output_tokens": 91410,
-    "api_call_count": 87
+    "input_tokens": 196,
+    "cache_creation_tokens": 256425,
+    "cache_read_tokens": 63413983,
+    "output_tokens": 100877,
+    "api_call_count": 98
   }
 }
