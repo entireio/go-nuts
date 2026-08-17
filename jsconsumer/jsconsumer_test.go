@@ -290,6 +290,25 @@ func TestRetryableStartError(t *testing.T) {
 	}
 }
 
+func TestAttemptEarnedRetryResetUsesFailureTime(t *testing.T) {
+	started := time.Unix(1, 0)
+	if attemptEarnedRetryReset(started, time.Time{}, 0, false) {
+		t.Fatal("attempt with no failure time earned a retry reset")
+	}
+	if attemptEarnedRetryReset(started, started.Add(runRetryMax-time.Nanosecond), 0, false) {
+		t.Fatal("failure before the healthy window earned a retry reset")
+	}
+	if !attemptEarnedRetryReset(started, started.Add(runRetryMax), 0, false) {
+		t.Fatal("failure after the healthy window did not earn a retry reset")
+	}
+	if attemptEarnedRetryReset(started, started.Add(10*runRetryMax), 0, true) {
+		t.Fatal("heartbeat detection delay without a delivery earned a retry reset")
+	}
+	if !attemptEarnedRetryReset(started, started.Add(time.Second), 1, true) {
+		t.Fatal("successful delivery did not earn an error-driven retry reset")
+	}
+}
+
 // TestIsShutdownConsumeErr pins the classifier over BOTH error families: the
 // jetstream consume loop emits its own jetstream.ErrConnectionClosed (a
 // distinct value wrapping neither core sentinel), and either family is benign
@@ -322,15 +341,15 @@ func TestConsumeErrorEpisode(t *testing.T) {
 
 	t.Run("one no-responder stays on nats.go's in-place recovery path", func(t *testing.T) {
 		var episode consumeErrorEpisode
-		if episode.shouldRestart(start, nats.ErrNoResponders) {
+		if episode.shouldRestart(start, nats.ErrNoResponders, 0) {
 			t.Fatal("one no-responder requested a restart")
 		}
 		// The heartbeat notification is what makes nats.go issue another
 		// pull; it is not independent proof that the retry failed.
-		if episode.shouldRestart(start.Add(consumeErrorDebounce), jetstream.ErrNoHeartbeat) {
+		if episode.shouldRestart(start.Add(consumeErrorDebounce), jetstream.ErrNoHeartbeat, 0) {
 			t.Fatal("first missing heartbeat preempted nats.go's retry")
 		}
-		if !episode.shouldRestart(start.Add(consumeErrorDebounce+time.Second), nats.ErrNoResponders) {
+		if !episode.shouldRestart(start.Add(consumeErrorDebounce+time.Second), nats.ErrNoResponders, 0) {
 			t.Fatal("a repeated no-responder after nats.go's retry did not request a restart")
 		}
 	})
@@ -338,20 +357,20 @@ func TestConsumeErrorEpisode(t *testing.T) {
 	t.Run("unknown persistent server error restarts", func(t *testing.T) {
 		var episode consumeErrorEpisode
 		unknown409 := errors.New("nats: consumer is push based")
-		if episode.shouldRestart(start, unknown409) {
+		if episode.shouldRestart(start, unknown409, 0) {
 			t.Fatal("first unknown server error requested a restart")
 		}
-		if !episode.shouldRestart(start.Add(consumeErrorDebounce), unknown409) {
+		if !episode.shouldRestart(start.Add(consumeErrorDebounce), unknown409, 0) {
 			t.Fatal("persistent unknown server error did not request a restart")
 		}
 	})
 
 	t.Run("two missing pull heartbeats restart", func(t *testing.T) {
 		var episode consumeErrorEpisode
-		if episode.shouldRestart(start, jetstream.ErrNoHeartbeat) {
+		if episode.shouldRestart(start, jetstream.ErrNoHeartbeat, 0) {
 			t.Fatal("first missing heartbeat requested a restart")
 		}
-		if !episode.shouldRestart(start.Add(consumeErrorDebounce), jetstream.ErrNoHeartbeat) {
+		if !episode.shouldRestart(start.Add(consumeErrorDebounce), jetstream.ErrNoHeartbeat, 0) {
 			t.Fatal("second missing heartbeat did not request a restart")
 		}
 	})
@@ -359,17 +378,46 @@ func TestConsumeErrorEpisode(t *testing.T) {
 	t.Run("debounce and quiet period bound one episode", func(t *testing.T) {
 		var episode consumeErrorEpisode
 		err := errors.New("persistent")
-		if episode.shouldRestart(start, err) || episode.shouldRestart(start.Add(time.Millisecond), err) {
+		if episode.shouldRestart(start, err, 0) || episode.shouldRestart(start.Add(time.Millisecond), err, 0) {
 			t.Fatal("error burst inside the debounce requested a restart")
 		}
-		if !episode.shouldRestart(start.Add(consumeErrorDebounce), err) {
+		if !episode.shouldRestart(start.Add(consumeErrorDebounce), err, 0) {
 			t.Fatal("persistent error after the debounce did not request a restart")
 		}
 
-		if episode.shouldRestart(start.Add(consumeErrorDebounce+consumeErrorQuietPeriod+time.Second), err) {
+		if episode.shouldRestart(start.Add(consumeErrorDebounce+consumeErrorQuietPeriod+time.Second), err, 0) {
 			t.Fatal("error after a quiet period inherited the old episode")
 		}
 	})
+
+	t.Run("successful delivery resets the episode", func(t *testing.T) {
+		var episode consumeErrorEpisode
+		err := errors.New("notify-only")
+		if episode.shouldRestart(start, err, 0) {
+			t.Fatal("first error requested a restart")
+		}
+		if episode.shouldRestart(start.Add(consumeErrorDebounce), err, 1) {
+			t.Fatal("error after a successful delivery inherited the old episode")
+		}
+		if !episode.shouldRestart(start.Add(2*consumeErrorDebounce), err, 1) {
+			t.Fatal("repeated error after the last delivery did not request a restart")
+		}
+	})
+}
+
+func TestInPlaceRecoveryConsumeErr(t *testing.T) {
+	for _, err := range []error{
+		jetstream.ErrServerShutdown,
+		jetstream.ErrConsumerLeadershipChanged,
+		jetstream.ErrPinIDMismatch,
+	} {
+		if !isInPlaceRecoveryConsumeErr(err) {
+			t.Errorf("%v did not stay on nats.go's in-place recovery path", err)
+		}
+	}
+	if isInPlaceRecoveryConsumeErr(nats.ErrNoResponders) {
+		t.Error("no-responders was accepted without probing the durable")
+	}
 }
 
 // TestStartRejectsKeepInProgressWithPrefetch pins the config conflict: the
@@ -491,6 +539,35 @@ func TestExplicitStopReleasesWatcher(t *testing.T) {
 	}
 }
 
+func TestProbeConsumeLoopClassifiesDurableState(t *testing.T) {
+	run, js, _ := startTestConsumer(t, func(jetstream.Msg) {})
+
+	got, err := run.probeConsumeLoop(t.Context())
+	if err != nil || got != consumeProbeHealthy {
+		t.Fatalf("healthy pull durable probe = (%v, %v), want (%v, nil)", got, err, consumeProbeHealthy)
+	}
+	if err := js.DeleteConsumer(t.Context(), "events_v1", "test_durable"); err != nil {
+		t.Fatalf("delete pull durable: %v", err)
+	}
+	got, err = run.probeConsumeLoop(t.Context())
+	if !errors.Is(err, jetstream.ErrConsumerNotFound) || got != consumeProbeRestart {
+		t.Fatalf("missing durable probe = (%v, %v), want (%v, ErrConsumerNotFound)", got, err, consumeProbeRestart)
+	}
+
+	if _, err := js.CreateOrUpdatePushConsumer(t.Context(), "events_v1", jetstream.ConsumerConfig{
+		Durable:        "test_durable",
+		DeliverSubject: "deliver.test_durable",
+		FilterSubject:  "events.repo",
+		AckPolicy:      jetstream.AckExplicitPolicy,
+	}); err != nil {
+		t.Fatalf("create push replacement: %v", err)
+	}
+	got, err = run.probeConsumeLoop(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "push consumer") || got != consumeProbeRestart {
+		t.Fatalf("push durable probe = (%v, %v), want (%v, push-consumer error)", got, err, consumeProbeRestart)
+	}
+}
+
 // TestStartAppliesConsumerTunables: InactiveThreshold and MaxAckPending must
 // land on the on-server consumer config — interest-stream consumers depend on
 // InactiveThreshold so a decommissioned durable stops pinning messages, and
@@ -550,13 +627,8 @@ func TestStartAppliesConsumerTunables(t *testing.T) {
 func compressRunRetries(t *testing.T) {
 	t.Helper()
 	origInitial, origMax := runRetryInitial, runRetryMax
-	origConsumeErrorDebounce := consumeErrorDebounce
 	runRetryInitial, runRetryMax = 20*time.Millisecond, 100*time.Millisecond
-	consumeErrorDebounce = 20 * time.Millisecond
-	t.Cleanup(func() {
-		runRetryInitial, runRetryMax = origInitial, origMax
-		consumeErrorDebounce = origConsumeErrorDebounce
-	})
+	t.Cleanup(func() { runRetryInitial, runRetryMax = origInitial, origMax })
 }
 
 // runTestEnv boots an embedded JetStream server and a connection, returning
@@ -824,7 +896,6 @@ func TestRunRecreatesWhenReconnectFindsDurableDeleted(t *testing.T) {
 	}
 	t.Cleanup(runnerNC.Close)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	done := make(chan error, 1)
 	got := make(chan string, 1)
 	cfg := Config{
@@ -839,6 +910,24 @@ func TestRunRecreatesWhenReconnectFindsDurableDeleted(t *testing.T) {
 			got <- string(m.Data())
 		})
 	}()
+	// Registered now to cover every early t.Fatal path, then registered again
+	// immediately after the replacement server so LIFO cleanup joins Run before
+	// shutting that server down. Once keeps the duplicate registration safe.
+	var stopRun sync.Once
+	joinRun := func() {
+		stopRun.Do(func() {
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("Run returned %v on cancel, want nil", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Error("Run did not return after ctx cancel")
+			}
+		})
+	}
+	t.Cleanup(joinRun)
 
 	waitForConsumer := func(js jetstream.JetStream) {
 		t.Helper()
@@ -862,6 +951,7 @@ func TestRunRecreatesWhenReconnectFindsDurableDeleted(t *testing.T) {
 	// its consume loop can restore a pull request on the restarted broker.
 	adminNC.Close()
 	firstServer.Shutdown()
+	firstServer.WaitForShutdown()
 	deadline := time.Now().Add(5 * time.Second)
 	for runnerNC.Status() != nats.RECONNECTING {
 		if time.Now().After(deadline) {
@@ -870,6 +960,7 @@ func TestRunRecreatesWhenReconnectFindsDurableDeleted(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	secondServer := restartJetStreamServer(t, port, storeDir)
+	t.Cleanup(joinRun)
 	adminNC, err = nats.Connect(secondServer.ClientURL())
 	if err != nil {
 		t.Fatalf("connect replacement admin: %v", err)
@@ -895,16 +986,6 @@ func TestRunRecreatesWhenReconnectFindsDurableDeleted(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("message did not arrive after reconnecting without the durable")
 	}
-
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Run returned %v on cancel, want nil", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("Run did not return after ctx cancel")
-	}
 }
 
 // runJetStreamServer starts an in-process JetStream-enabled NATS server on a
@@ -924,8 +1005,8 @@ func runJetStreamServer(t *testing.T, opts ...func(*natsserver.Options)) *natsse
 func restartJetStreamServer(t *testing.T, port int, storeDir string) *natsserver.Server {
 	t.Helper()
 	var lastErr error
-	for range 5 {
-		s, err := tryRunJetStreamServer(t, 500*time.Millisecond, func(o *natsserver.Options) {
+	for range 3 {
+		s, err := tryRunJetStreamServer(t, 2*time.Second, func(o *natsserver.Options) {
 			o.Port = port
 			o.StoreDir = storeDir
 		})
@@ -964,13 +1045,29 @@ func tryRunJetStreamServer(
 	if err != nil {
 		return nil, fmt.Errorf("new embedded nats server: %w", err)
 	}
-	go s.Start()
+	startDone := make(chan struct{})
+	go func() {
+		s.Start()
+		close(startDone)
+	}()
+	var shutdownOnce sync.Once
+	shutdown := func() {
+		shutdownOnce.Do(func() {
+			s.Shutdown()
+			s.WaitForShutdown()
+			select {
+			case <-startDone:
+			case <-time.After(5 * time.Second):
+				t.Errorf("embedded nats Start did not return after shutdown")
+			}
+		})
+	}
 	// Shutdown registered BEFORE the readiness wait, so a server that never
 	// becomes ready is still torn down — see startServer in
 	// internal/brokersemantics for why the order matters.
-	t.Cleanup(s.Shutdown)
+	t.Cleanup(shutdown)
 	if !s.ReadyForConnections(readyTimeout) {
-		s.Shutdown()
+		shutdown()
 		return nil, fmt.Errorf("embedded nats server not ready in %s", readyTimeout)
 	}
 	return s, nil

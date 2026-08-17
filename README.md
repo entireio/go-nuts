@@ -119,7 +119,8 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
   `Start` (one-shot create-or-update durable → consume → stop on context
   cancel), `Run` (the production default for long-lived services: supervise
   startup and recreate a closed or persistently unreachable loop with
-  exponential backoff), and
+  exponential backoff, including waiting for a not-yet-provisioned stream at
+  boot), and
   `Process` (consumer span re-parented across the NATS hop → decode →
   Term-on-undecodable → dispatch to the handler, which owns the message's
   disposition). AckExplicit, bounded AckWait and MaxDeliver, optional
