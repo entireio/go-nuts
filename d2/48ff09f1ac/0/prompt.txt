@@ -1,0 +1,30 @@
+# AGENTS.md instructions for /Users/nodo/work/tasks/nats-robustness
+
+<INSTRUCTIONS>
+# Task: nats-robustness
+
+This directory is the task workspace for `nats-robustness`.
+
+The repos needed to complete this task are:
+
+- `entire-api`
+- `entiredb`
+- `fleet`
+- `go-nuts`
+- `infra`
+- `mirror-pipeline`
+
+## Commit trailers
+
+Every commit for this task carries an `Entire-Checkpoint: <checkpoint-id>` trailer.
+A post-commit git hook adds it **automatically** — do not add or edit it yourself.
+
+When amending, rebasing, squashing, or otherwise rewriting commits, preserve any
+existing `Entire-Checkpoint` trailer instead of dropping or changing it.
+
+If a commit is missing its trailer, something is broken: run
+`entire workspace doctor` from the workspace root to diagnose (and `--fix` to
+repair). As a last resort, `entire attach <session-id>` inside the repo creates
+the checkpoint and prints the trailer — never type a trailer in by hand.
+
+</INSTRUCTIONS>
