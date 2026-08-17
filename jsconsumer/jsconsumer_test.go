@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -886,6 +887,196 @@ func TestRunRecreatesAfterConsumerDeleted(t *testing.T) {
 	}
 }
 
+// TestRunPreservesConsumeLoopAcrossBrokerRestart covers the other half of
+// durable recovery: routine maintenance must stay on nats.go's reconnect path
+// when the durable still exists. The replacement broker deliberately lets the
+// worker drive that existing durable but not create/update one, so delivery
+// after reconnect proves Run preserved the original ConsumeContext. An
+// unnecessary teardown cannot silently pass by creating an equivalent loop —
+// it loses the ability to consume (and any client-side prefetch with it).
+func TestRunPreservesConsumeLoopAcrossBrokerRestart(t *testing.T) {
+	compressRunRetries(t)
+	origDebounce := consumeErrorDebounce
+	consumeErrorDebounce = 50 * time.Millisecond
+	t.Cleanup(func() { consumeErrorDebounce = origDebounce })
+
+	const adminUser, workerUser, pass = "admin", "worker", "pw"
+	users := func(workerPermissions *natsserver.Permissions) []*natsserver.User {
+		return []*natsserver.User{
+			{Username: adminUser, Password: pass},
+			{Username: workerUser, Password: pass, Permissions: workerPermissions},
+		}
+	}
+	fullWorkerPermissions := &natsserver.Permissions{
+		Publish:   &natsserver.SubjectPermission{Allow: []string{"$JS.API.>", "$JS.ACK.>"}},
+		Subscribe: &natsserver.SubjectPermission{Allow: []string{"_INBOX.>"}},
+	}
+	existingOnlyWorkerPermissions := &natsserver.Permissions{
+		Publish: &natsserver.SubjectPermission{Allow: []string{
+			"$JS.API.INFO",
+			"$JS.API.CONSUMER.INFO.events_v1.restart_durable",
+			"$JS.API.CONSUMER.MSG.NEXT.events_v1.restart_durable",
+			"$JS.ACK.events_v1.restart_durable.>",
+		}},
+		Subscribe: &natsserver.SubjectPermission{Allow: []string{"_INBOX.>"}},
+	}
+
+	storeDir := t.TempDir()
+	firstServer := runJetStreamServer(t, func(o *natsserver.Options) {
+		o.StoreDir = storeDir
+		o.Users = users(fullWorkerPermissions)
+	})
+	tcpAddr, ok := firstServer.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("embedded server address has type %T, want *net.TCPAddr", firstServer.Addr())
+	}
+	port := tcpAddr.Port
+	url := firstServer.ClientURL()
+	adminNC, err := nats.Connect(url, nats.UserInfo(adminUser, pass))
+	if err != nil {
+		t.Fatalf("connect admin: %v", err)
+	}
+	t.Cleanup(adminNC.Close)
+	js, err := jetstream.New(adminNC)
+	if err != nil {
+		t.Fatalf("admin jetstream.New: %v", err)
+	}
+	if _, err := js.CreateStream(t.Context(), jetstream.StreamConfig{
+		Name: "events_v1", Subjects: []string{"events.>"},
+	}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+
+	runnerNC, err := nats.Connect(url,
+		nats.UserInfo(workerUser, pass),
+		nats.MaxReconnects(-1),
+		nats.CustomReconnectDelay(func(int) time.Duration { return 20 * time.Millisecond }),
+		nats.ErrorHandler(func(*nats.Conn, *nats.Subscription, error) {}),
+	)
+	if err != nil {
+		t.Fatalf("connect runner: %v", err)
+	}
+	t.Cleanup(runnerNC.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	deliveries := make(chan jetstream.Msg, 1)
+	logs := &logCapture{}
+	cfg := Config{
+		Stream: "events_v1", Durable: "restart_durable", FilterSubject: "events.repo",
+		Name: "testconsumer", SpanName: "test.consume", Logger: slog.New(logs),
+	}
+	go func() {
+		done <- Run(ctx, runnerNC, cfg, func(m jetstream.Msg) {
+			deliveries <- m
+		})
+	}()
+	var stopRun sync.Once
+	joinRun := func() {
+		stopRun.Do(func() {
+			cancel()
+			select {
+			case runErr := <-done:
+				if runErr != nil {
+					t.Errorf("Run returned %v on cancel, want nil", runErr)
+				}
+			case <-time.After(10 * time.Second):
+				t.Error("Run did not return after ctx cancel")
+			}
+		})
+	}
+	t.Cleanup(joinRun)
+
+	cons, err := js.Consumer(t.Context(), cfg.Stream, cfg.Durable)
+	for startDeadline := time.Now().Add(5 * time.Second); err != nil; {
+		if time.Now().After(startDeadline) {
+			t.Fatalf("durable did not start: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+		cons, err = js.Consumer(t.Context(), cfg.Stream, cfg.Durable)
+	}
+	before, err := cons.Info(t.Context())
+	if err != nil {
+		t.Fatalf("consumer info before restart: %v", err)
+	}
+
+	// Leave the core NATS service briefly available without JetStream between
+	// the old and replacement servers. The reconnecting ConsumeContext gets a
+	// real no-responders response while the durable is merely unavailable, not
+	// deleted — the transport-inconclusive probe must preserve the loop.
+	adminNC.Close()
+	firstServer.Shutdown()
+	firstServer.WaitForShutdown()
+	time.Sleep(100 * time.Millisecond)
+	coreServer := restartCoreServer(t, port, func(o *natsserver.Options) {
+		o.Users = users(fullWorkerPermissions)
+	})
+	t.Cleanup(joinRun)
+	connectedDeadline := time.Now().Add(5 * time.Second)
+	for runnerNC.Status() != nats.CONNECTED {
+		if time.Now().After(connectedDeadline) {
+			t.Fatal("runner did not reconnect while JetStream was unavailable")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	consumeErrorDeadline := time.Now().Add(5 * time.Second)
+	for logs.count(cfg.Name+": consume error") < 2 {
+		if time.Now().After(consumeErrorDeadline) {
+			t.Fatalf("consume loop did not observe the maintenance errors: logs=%v", logs.snapshot())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Give Run enough time to act on the compressed debounce. A version that
+	// counts the shutdown plus no-responders pair as durable damage has stopped
+	// the original loop and entered its create retry by the end of this pause.
+	time.Sleep(2 * runRetryMax)
+	coreServer.Shutdown()
+	coreServer.WaitForShutdown()
+	secondServer := restartJetStreamServer(t, port, storeDir, func(o *natsserver.Options) {
+		o.Users = users(existingOnlyWorkerPermissions)
+	})
+	t.Cleanup(joinRun)
+
+	adminNC, err = nats.Connect(secondServer.ClientURL(), nats.UserInfo(adminUser, pass))
+	if err != nil {
+		t.Fatalf("connect replacement admin: %v", err)
+	}
+	defer adminNC.Close()
+	js, err = jetstream.New(adminNC)
+	if err != nil {
+		t.Fatalf("replacement admin jetstream.New: %v", err)
+	}
+	afterCons, err := js.Consumer(t.Context(), cfg.Stream, cfg.Durable)
+	if err != nil {
+		t.Fatalf("durable did not survive broker restart: %v", err)
+	}
+	after, err := afterCons.Info(t.Context())
+	if err != nil {
+		t.Fatalf("consumer info after restart: %v", err)
+	}
+	if !after.Created.Equal(before.Created) {
+		t.Fatalf("durable creation time changed across restart: before=%v after=%v", before.Created, after.Created)
+	}
+	if _, err := js.Publish(t.Context(), "events.repo", []byte("after-restart")); err != nil {
+		t.Fatalf("publish after restart: %v", err)
+	}
+	select {
+	case got := <-deliveries:
+		if string(got.Data()) != "after-restart" {
+			t.Fatalf("delivery = %q, want after-restart", got.Data())
+		}
+		if err := got.Ack(); err != nil {
+			t.Fatalf("ack after restart: %v", err)
+		}
+	case runErr := <-done:
+		// Leave the result for joinRun, which owns the goroutine join on every
+		// exit path (including this deliberately diagnostic failure branch).
+		done <- runErr
+		t.Fatalf("Run returned after routine broker restart: %v", runErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("preserved consume loop did not resume delivery after broker restart")
+	}
+}
+
 // TestRunRecreatesWhenReconnectFindsDurableDeleted pins the terminal state
 // that the mixed-version rollout exposed: a ConsumeContext can remain open
 // after reconnecting to a broker where its durable no longer exists. Its pull
@@ -1028,14 +1219,32 @@ func runJetStreamServer(t *testing.T, opts ...func(*natsserver.Options)) *natsse
 // restartJetStreamServer rebinds the same port and store as a stopped server.
 // The fixed port is essential to exercise client reconnect, but it opens a
 // small race with other listeners; retry that bind for a bounded interval.
-func restartJetStreamServer(t *testing.T, port int, storeDir string) *natsserver.Server {
+func restartJetStreamServer(t *testing.T, port int, storeDir string, opts ...func(*natsserver.Options)) *natsserver.Server {
+	t.Helper()
+	base := []func(*natsserver.Options){func(o *natsserver.Options) {
+		o.StoreDir = storeDir
+	}}
+	return restartServer(t, port, append(base, opts...)...)
+}
+
+// restartCoreServer rebinds the same port without JetStream, modelling the
+// interval during broker maintenance where core NATS is accepting connections
+// before the JetStream API and consumers are available.
+func restartCoreServer(t *testing.T, port int, opts ...func(*natsserver.Options)) *natsserver.Server {
+	t.Helper()
+	base := []func(*natsserver.Options){func(o *natsserver.Options) {
+		o.JetStream = false
+	}}
+	return restartServer(t, port, append(base, opts...)...)
+}
+
+func restartServer(t *testing.T, port int, opts ...func(*natsserver.Options)) *natsserver.Server {
 	t.Helper()
 	var lastErr error
 	for range 3 {
-		o := jetStreamServerOptions(t, func(o *natsserver.Options) {
+		o := jetStreamServerOptions(t, append([]func(*natsserver.Options){func(o *natsserver.Options) {
 			o.Port = port
-			o.StoreDir = storeDir
-		})
+		}}, opts...)...)
 		s, err := natstest.TryRun(t, o, 2*time.Second)
 		if err == nil {
 			return s
