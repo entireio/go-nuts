@@ -403,6 +403,19 @@ func isShutdownConsumeErr(ctx context.Context, err error) bool {
 		(ctx.Err() != nil && errors.Is(err, jetstream.ErrConnectionClosed))
 }
 
+// isRestartableConsumeErr reports errors that mean a live pull loop can no
+// longer reach the durable it was created for. nats.go already stops the
+// ConsumeContext for ErrConsumerDeleted, but it deliberately keeps the
+// context open after ErrNoResponders so it can recover from a transient
+// server-side gap. That is normally useful; it is terminal when the pull
+// subject disappeared because the durable was deleted. Run restarts both
+// cases. A transient no-responders window is safe to restart too: Start's
+// existing retry envelope waits for JetStream to become available again.
+func isRestartableConsumeErr(err error) bool {
+	return errors.Is(err, nats.ErrNoResponders) ||
+		errors.Is(err, jetstream.ErrConsumerDeleted)
+}
+
 // Runner is a live consume loop. Stop halts it and is idempotent.
 type Runner struct {
 	cc jetstream.ConsumeContext
@@ -450,6 +463,20 @@ func (r *Runner) Stop() {
 // both the core nats.go sentinels ([nuts.IsShutdownFetchErr]) and jetstream's
 // own connection-closed error — which is a clean exit rather than a fault.
 func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.Msg)) (*Runner, error) {
+	return start(ctx, nc, cfg, onMsg, nil)
+}
+
+// start is Start with an internal consume-error signal used by Run. Keeping
+// it out of Runner and Start's public API preserves the one-shot contract:
+// Start callers still own supervision, while Run can restart a pull loop that
+// reports a terminal error without ever closing its ConsumeContext.
+func start(
+	ctx context.Context,
+	nc *nats.Conn,
+	cfg Config,
+	onMsg func(jetstream.Msg),
+	onRestartableConsumeErr func(error),
+) (*Runner, error) {
 	if err := cfg.validate(nc, onMsg); err != nil {
 		return nil, err
 	}
@@ -483,6 +510,9 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 			return
 		}
 		cfg.logger().WarnContext(ctx, cfg.Name+": consume error", slog.Any("error", cerr))
+		if onRestartableConsumeErr != nil && isRestartableConsumeErr(cerr) {
+			onRestartableConsumeErr(cerr)
+		}
 	})}
 	switch {
 	case cfg.KeepInProgress:
@@ -569,8 +599,11 @@ var (
 // underneath the caller (consumer deleted on the server, subscription
 // invalidated) stays closed — Run retries both with exponential backoff
 // (runRetryInitial doubling to runRetryMax, reset after a loop that outlives
-// the max). In particular a stream that is not provisioned yet at boot — the
-// declarative-provisioning race — is a retry, not a crash.
+// the max). It also restarts terminal pull errors such as ErrNoResponders:
+// nats.go can leave that ConsumeContext open after its durable has disappeared,
+// otherwise leaving a process alive but permanently deaf. In particular a
+// stream that is not provisioned yet at boot — the declarative-provisioning
+// race — is a retry, not a crash.
 //
 // Run blocks until ctx is cancelled, then joins the live loop (including an
 // in-flight handler, see [Runner.Stop]) before returning, so it composes with
@@ -598,7 +631,16 @@ func Run(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.Ms
 		// Start arms is released when the attempt dies, instead of one
 		// accumulating per recreate for the life of the process.
 		attemptCtx, cancelAttempt := context.WithCancel(ctx)
-		r, err := Start(attemptCtx, nc, cfg, onMsg)
+		consumeErrors := make(chan error, 1)
+		r, err := start(attemptCtx, nc, cfg, onMsg, func(err error) {
+			// Error callbacks run on nats.go's consume goroutine. Never make
+			// that goroutine wait for Run; one signal is enough to end this
+			// attempt, and duplicate no-responder reports may be coalesced.
+			select {
+			case consumeErrors <- err:
+			default:
+			}
+		})
 		if err != nil {
 			cancelAttempt()
 			if ctx.Err() != nil {
@@ -635,6 +677,20 @@ func Run(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.Ms
 				}
 				cfg.logger().WarnContext(ctx, cfg.Name+": consume loop closed; recreating",
 					slog.Duration("retry_in", delay))
+			case consumeErr := <-consumeErrors:
+				// Some terminal pull errors do not close nats.go's
+				// ConsumeContext. Stop and join it explicitly before creating a
+				// replacement, exactly as the Closed path above does.
+				r.Stop()
+				cancelAttempt()
+				if ctx.Err() != nil {
+					return nil //nolint:nilerr // the consume error raced shutdown; ctx still owns the clean exit
+				}
+				if time.Since(started) >= runRetryMax {
+					delay = runRetryInitial
+				}
+				cfg.logger().WarnContext(ctx, cfg.Name+": consume loop unreachable; recreating",
+					slog.Any("error", consumeErr), slog.Duration("retry_in", delay))
 			}
 		}
 		select {

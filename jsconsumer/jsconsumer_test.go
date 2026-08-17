@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -313,6 +314,26 @@ func TestIsShutdownConsumeErr(t *testing.T) {
 		if got := isShutdownConsumeErr(tc.ctx, tc.err); got != tc.want {
 			t.Errorf("%s: isShutdownConsumeErr = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestIsRestartableConsumeErr(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"no responders", fmt.Errorf("pull: %w", nats.ErrNoResponders), true},
+		{"consumer deleted", fmt.Errorf("pull: %w", jetstream.ErrConsumerDeleted), true},
+		{"missing heartbeat", jetstream.ErrNoHeartbeat, false},
+		{"leadership changed", jetstream.ErrConsumerLeadershipChanged, false},
+		{"unrelated", errors.New("boom"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isRestartableConsumeErr(tc.err); got != tc.want {
+				t.Fatalf("isRestartableConsumeErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -710,6 +731,151 @@ func TestRunRecreatesAfterConsumerDeleted(t *testing.T) {
 		case <-deadline:
 			t.Fatal("message did not arrive after the consumer was deleted and recreated")
 		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v on cancel, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+}
+
+// TestRunRecreatesWhenReconnectFindsDurableDeleted pins the terminal state
+// that the mixed-version rollout exposed: a ConsumeContext can remain open
+// after reconnecting to a broker where its durable no longer exists. Its pull
+// loop reports ErrNoResponders, but Closed never fires, so Run must treat that
+// asynchronous error as a restart signal and recreate the durable.
+func TestRunRecreatesWhenReconnectFindsDurableDeleted(t *testing.T) {
+	compressRunRetries(t)
+	storeDir := t.TempDir()
+	var servers []*natsserver.Server
+	startServer := func(port int) *natsserver.Server {
+		t.Helper()
+		s, err := natsserver.NewServer(&natsserver.Options{
+			Host: "127.0.0.1", Port: port, NoLog: true, NoSigs: true,
+			JetStream: true, StoreDir: storeDir,
+		})
+		if err != nil {
+			t.Fatalf("new embedded nats server: %v", err)
+		}
+		go s.Start()
+		if !s.ReadyForConnections(10 * time.Second) {
+			s.Shutdown()
+			t.Fatal("embedded nats server not ready in time")
+		}
+		servers = append(servers, s)
+		return s
+	}
+	t.Cleanup(func() {
+		for _, s := range servers {
+			s.Shutdown()
+		}
+	})
+
+	firstServer := startServer(-1)
+	tcpAddr, ok := firstServer.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("embedded server address has type %T, want *net.TCPAddr", firstServer.Addr())
+	}
+	port := tcpAddr.Port
+	url := firstServer.ClientURL()
+	adminNC, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect admin: %v", err)
+	}
+	js, err := jetstream.New(adminNC)
+	if err != nil {
+		t.Fatalf("admin jetstream.New: %v", err)
+	}
+	if _, err := js.CreateStream(t.Context(), jetstream.StreamConfig{
+		Name: "events_v1", Subjects: []string{"events.>"},
+	}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+
+	runnerNC, err := nats.Connect(url,
+		nats.MaxReconnects(-1),
+		nats.CustomReconnectDelay(func(int) time.Duration { return 500 * time.Millisecond }),
+	)
+	if err != nil {
+		t.Fatalf("connect runner: %v", err)
+	}
+	t.Cleanup(runnerNC.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	got := make(chan string, 1)
+	cfg := Config{
+		Stream: "events_v1", Durable: "reconnect_durable",
+		FilterSubject: "events.repo", Name: "testconsumer", SpanName: "test.consume",
+	}
+	go func() {
+		done <- Run(ctx, runnerNC, cfg, func(m jetstream.Msg) {
+			if err := m.Ack(); err != nil {
+				t.Errorf("ack: %v", err)
+			}
+			got <- string(m.Data())
+		})
+	}()
+
+	waitForConsumer := func(js jetstream.JetStream) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			cons, lookupErr := js.Consumer(t.Context(), cfg.Stream, cfg.Durable)
+			if lookupErr == nil {
+				if info, infoErr := cons.Info(t.Context()); infoErr == nil && info.NumWaiting == 1 {
+					return
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("durable never appeared with a waiting runner")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitForConsumer(js)
+
+	// Keep the runner disconnected long enough to delete the durable before
+	// its consume loop can restore a pull request on the restarted broker.
+	adminNC.Close()
+	firstServer.Shutdown()
+	deadline := time.Now().Add(5 * time.Second)
+	for runnerNC.Status() != nats.RECONNECTING {
+		if time.Now().After(deadline) {
+			t.Fatal("runner connection never entered reconnecting state")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	secondServer := startServer(port)
+	adminNC, err = nats.Connect(secondServer.ClientURL())
+	if err != nil {
+		t.Fatalf("connect replacement admin: %v", err)
+	}
+	defer adminNC.Close()
+	js, err = jetstream.New(adminNC)
+	if err != nil {
+		t.Fatalf("replacement admin jetstream.New: %v", err)
+	}
+	if err := js.DeleteConsumer(t.Context(), cfg.Stream, cfg.Durable); err != nil {
+		t.Fatalf("delete durable before runner reconnect: %v", err)
+	}
+
+	waitForConsumer(js)
+	if _, err := js.Publish(t.Context(), "events.repo", []byte("after-reconnect")); err != nil {
+		t.Fatalf("publish after reconnect: %v", err)
+	}
+	select {
+	case payload := <-got:
+		if payload != "after-reconnect" {
+			t.Fatalf("payload = %q, want after-reconnect", payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("message did not arrive after reconnecting without the durable")
 	}
 
 	cancel()
