@@ -1879,7 +1879,7 @@ func TestStartFailsWhenTheStreamRetentionCannotBeRead(t *testing.T) {
 				Subscribe: &natsserver.SubjectPermission{Allow: []string{">"}},
 			}},
 		}
-	})
+	}).ClientURL()
 
 	admin, err := nats.Connect(url, nats.UserInfo(adminUser, pass))
 	if err != nil {

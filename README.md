@@ -116,14 +116,24 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
   scriptable message for asserting a consumer's ack/nak/term disposition
   without a broker.
 - **`jsconsumer`** — the durable JetStream pull-consumer scaffold:
-  `Start` (create-or-update durable → consume → stop on context cancel),
-  `Run` (`Start` under supervision: recreate on a closed loop with exponential
-  backoff, tolerate a not-yet-provisioned stream at boot), and
+  `Start` (one-shot create-or-update durable → consume → stop on context
+  cancel), `Run` (the production default for long-lived services: supervise
+  startup and recreate a closed or persistently unreachable loop with
+  exponential backoff, including waiting for a not-yet-provisioned stream at
+  boot), and
   `Process` (consumer span re-parented across the NATS hop → decode →
   Term-on-undecodable → dispatch to the handler, which owns the message's
   disposition). AckExplicit, bounded AckWait and MaxDeliver, optional
   InactiveThreshold / MaxAckPending, shutdown-aware consume-error logging,
   optional `KeepInProgress` heartbeat. Also `Retry` — see below.
+
+  `Start` deliberately returns immediately and does not own restart policy. A
+  notify-only pull error can leave its `Runner` open but unable to deliver, so
+  a service that currently stores that Runner and calls `Stop` at shutdown is
+  not supervised. Migrate that lifecycle to a goroutine running `Run`; `Run`
+  blocks until its context is cancelled, joins the current attempt, and returns
+  permanent configuration errors to the service's shutdown group. Keep `Start`
+  only where the caller intentionally owns a one-shot loop.
 - **`jsconsumer.Schedule`** — a consumer's retry timing as plain values, and
   `Validate` / `Err`: the single implementation of the arithmetic that says
   whether it hangs together. Pure — no NATS connection, no I/O, no clock — so

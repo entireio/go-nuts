@@ -11,6 +11,8 @@ import (
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+
+	"github.com/entireio/go-nuts/internal/natstest"
 )
 
 // The suite's own tunables. Ladder rungs are milliseconds rather than the
@@ -61,24 +63,7 @@ func startServer(t *testing.T, opts ...func(*natsserver.Options)) *natsserver.Se
 	for _, fn := range opts {
 		fn(o)
 	}
-	s, err := natsserver.NewServer(o)
-	if err != nil {
-		t.Fatalf("new embedded nats server: %v", err)
-	}
-	go s.Start()
-	// Register the shutdown BEFORE waiting on readiness, and keep it in that
-	// order. A server that never reports ready is still running: still bound to
-	// its port and still holding its JetStream store. Fataling first leaves it
-	// there for the rest of the process — and because t.TempDir registered its own
-	// cleanup earlier, cleanups run LIFO and the store directory is removed
-	// underneath a live server rather than after it stopped. The consequence lands
-	// as a flake in a LATER parallel test, which is the kind of failure that gets
-	// blamed on anything but its cause.
-	t.Cleanup(s.Shutdown)
-	if !s.ReadyForConnections(10 * time.Second) {
-		t.Fatal("embedded nats server not ready in time")
-	}
-	return s
+	return natstest.Run(t, *o)
 }
 
 // connect dials s and closes the connection when the test ends. Async errors are

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
+
+	"github.com/entireio/go-nuts/internal/natstest"
 )
 
 // runEmbeddedServer starts an in-process NATS server on a random loopback port
@@ -28,19 +30,7 @@ func runEmbeddedServerWith(t *testing.T, opts *natsserver.Options) *natsserver.S
 	opts.Port = -1 // pick a free port
 	opts.NoLog = true
 	opts.NoSigs = true
-	s, err := natsserver.NewServer(opts)
-	if err != nil {
-		t.Fatalf("new embedded nats server: %v", err)
-	}
-	go s.Start()
-	// Shutdown registered BEFORE the readiness wait, so a server that never
-	// becomes ready is still torn down — see startServer in
-	// internal/brokersemantics for why the order matters.
-	t.Cleanup(s.Shutdown)
-	if !s.ReadyForConnections(10 * time.Second) {
-		t.Fatal("embedded nats server not ready in time")
-	}
-	return s
+	return natstest.Run(t, *opts)
 }
 
 // capturingHandler is a thread-safe slog.Handler that records log messages so
