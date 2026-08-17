@@ -17,6 +17,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/entireio/go-nuts/internal/natstest"
 )
 
 // testStream is the embedded-server stream the publish tests bind to pub.>.
@@ -26,7 +28,7 @@ const testStream = "pub_v1"
 // and returns a connection to it.
 func newStreamConn(t *testing.T) *nats.Conn {
 	t.Helper()
-	s, err := natsserver.NewServer(&natsserver.Options{
+	s := natstest.Run(t, natsserver.Options{
 		Host:      "127.0.0.1",
 		Port:      -1, // pick a free port
 		NoLog:     true,
@@ -34,17 +36,6 @@ func newStreamConn(t *testing.T) *nats.Conn {
 		JetStream: true,
 		StoreDir:  t.TempDir(),
 	})
-	if err != nil {
-		t.Fatalf("new embedded nats server: %v", err)
-	}
-	go s.Start()
-	// Shutdown registered BEFORE the readiness wait, so a server that never
-	// becomes ready is still torn down — see startServer in
-	// internal/brokersemantics for why the order matters.
-	t.Cleanup(s.Shutdown)
-	if !s.ReadyForConnections(10 * time.Second) {
-		t.Fatal("embedded nats server not ready in time")
-	}
 
 	nc, err := nats.Connect(s.ClientURL())
 	if err != nil {
