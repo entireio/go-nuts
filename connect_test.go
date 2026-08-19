@@ -207,6 +207,35 @@ func TestConnectLogsLameDuckMode(t *testing.T) {
 	captured.waitFor(t, "nuts: NATS server entering lame duck mode")
 }
 
+// TestConnectDisconnectAfterLameDuckLogsWarn: the disconnect the server forces
+// once it has announced lame duck is planned maintenance, so it must be logged
+// at WARN, not ERROR — otherwise every rollout that drains a node trips
+// error-level alerting on a self-healing event.
+func TestConnectDisconnectAfterLameDuckLogsWarn(t *testing.T) {
+	s := runEmbeddedServerWith(t, &natsserver.Options{
+		LameDuckDuration:    250 * time.Millisecond,
+		LameDuckGracePeriod: -10 * time.Millisecond,
+	})
+	logger, captured := newCapturingLogger()
+	nc, err := Connect(t.Context(), s.ClientURL(), WithoutTLS(), WithLogger(logger))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+
+	// Draining the node announces lame duck, then evicts this client — the
+	// eviction fires DisconnectErrHandler with a non-nil error.
+	go s.LameDuckShutdown()
+	captured.waitForAt(t, slog.LevelWarn, "nuts: NATS disconnected")
+
+	// The same event must not also have been logged at ERROR: a disconnect is
+	// reported exactly once, and after a lame-duck notice that one report is the
+	// WARN above.
+	if captured.hasAt(slog.LevelError, "nuts: NATS disconnected") {
+		t.Fatalf("disconnect after lame duck was logged at ERROR; saw %v", captured.snapshot())
+	}
+}
+
 // TestTLSConfigCARotation guards that the trusted CA is re-read from disk on
 // every handshake (via VerifyConnection) rather than pinned once at startup, so
 // a CA rotation is honored without a process restart.

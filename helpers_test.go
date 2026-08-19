@@ -43,18 +43,25 @@ func runEmbeddedServerWith(t *testing.T, opts *natsserver.Options) *natsserver.S
 	return s
 }
 
-// capturingHandler is a thread-safe slog.Handler that records log messages so
-// tests can assert what was logged, including from background goroutines.
+// logEntry is one captured log record: its level and message.
+type logEntry struct {
+	level slog.Level
+	msg   string
+}
+
+// capturingHandler is a thread-safe slog.Handler that records log records so
+// tests can assert what was logged, and at what level, including from
+// background goroutines.
 type capturingHandler struct {
-	mu   sync.Mutex
-	msgs []string
+	mu      sync.Mutex
+	entries []logEntry
 }
 
 func (h *capturingHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
 	h.mu.Lock()
-	h.msgs = append(h.msgs, r.Message)
+	h.entries = append(h.entries, logEntry{level: r.Level, msg: r.Message})
 	h.mu.Unlock()
 	return nil
 }
@@ -65,23 +72,42 @@ func (h *capturingHandler) WithGroup(string) slog.Handler      { return h }
 func (h *capturingHandler) has(msg string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return slices.Contains(h.msgs, msg)
+	return slices.ContainsFunc(h.entries, func(e logEntry) bool { return e.msg == msg })
 }
 
-func (h *capturingHandler) snapshot() []string {
+// hasAt reports whether msg was logged at exactly the given level.
+func (h *capturingHandler) hasAt(level slog.Level, msg string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return slices.Clone(h.msgs)
+	return slices.Contains(h.entries, logEntry{level: level, msg: msg})
 }
 
-// waitFor blocks until a message equal to msg has been logged, or fails the
-// test after a short deadline. Used to synchronize on logs emitted from a
-// background loop goroutine.
+func (h *capturingHandler) snapshot() []logEntry {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.entries)
+}
+
+// waitFor blocks until a message equal to msg has been logged at any level, or
+// fails the test after a short deadline. Used to synchronize on logs emitted
+// from a background loop goroutine.
 func (h *capturingHandler) waitFor(t *testing.T, msg string) {
+	t.Helper()
+	h.waitUntil(t, msg, func() bool { return h.has(msg) })
+}
+
+// waitForAt is waitFor, additionally requiring the message to be logged at
+// exactly the given level.
+func (h *capturingHandler) waitForAt(t *testing.T, level slog.Level, msg string) {
+	t.Helper()
+	h.waitUntil(t, msg, func() bool { return h.hasAt(level, msg) })
+}
+
+func (h *capturingHandler) waitUntil(t *testing.T, msg string, ok func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if h.has(msg) {
+		if ok() {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
