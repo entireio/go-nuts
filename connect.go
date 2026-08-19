@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -111,7 +112,9 @@ func WithNATSOptions(opts ...nats.Option) Option {
 // NATS outages rather than permanently CLOSE after the client default of 60
 // attempts), a bounded drain timeout, and lifecycle handlers that log at the
 // right level — notably routing the nil-error DisconnectErr that nats.go fires
-// on an explicit Close to INFO, so a clean shutdown does not look like a fault.
+// on an explicit Close to INFO, so a clean shutdown does not look like a fault,
+// and the disconnect that follows a lame-duck notice to WARN, so a routine
+// server rollout does not read as an error.
 // Async errors (slow-consumer drops, permissions violations) and lame-duck
 // notices are logged through the configured logger instead of nats.go's
 // stderr default; override either handler via [WithNATSOptions].
@@ -162,21 +165,35 @@ func Connect(ctx context.Context, url string, opts ...Option) (*nats.Conn, error
 	logCtx := context.WithoutCancel(ctx)
 	connAttr := slog.String("conn", cfg.name)
 
+	// Set by the lame-duck handler; the next disconnect is then the planned
+	// eviction the server warned us about, so it logs at WARN, not ERROR. Lame
+	// duck is a one-way trip to shutdown, so that disconnect always arrives (or
+	// the client tears down first, which also disarms the flag below) — the flag
+	// is consumed within one connection lifecycle rather than lingering.
+	var lameDuckPending atomic.Bool
+
 	natsOpts := []nats.Option{
 		nats.DrainTimeout(cfg.drainTimeout),
 		nats.RetryOnFailedConnect(cfg.retryOnFailedConnect),
 		nats.MaxReconnects(cfg.maxReconnects),
 		nats.ReconnectWait(cfg.reconnectWait),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-			// nats.go fires this with err==nil when the caller calls Close()
-			// explicitly (see nats.Options.DisconnectedErrCB). Logging that at
-			// ERROR makes clean shutdowns look like failures, so route the
-			// explicit-close case to INFO.
+			// nats.go fires this with err==nil on a deliberate disconnect (an
+			// explicit Close or a ForceReconnect; see DisconnectedErrCB). That is
+			// not a fault, so log INFO, and disarm the flag so it cannot outlive
+			// this disconnect to mis-downgrade a later genuine one.
 			if err == nil {
+				lameDuckPending.Store(false)
 				cfg.logger.InfoContext(logCtx, "nuts: NATS disconnected", connAttr)
 				return
 			}
-			cfg.logger.ErrorContext(logCtx, "nuts: NATS disconnected", connAttr, slog.Any("error", err))
+			// WARN if this was the eviction a lame-duck notice warned us about;
+			// otherwise it is an unexpected drop and stays ERROR.
+			level := slog.LevelError
+			if lameDuckPending.Swap(false) {
+				level = slog.LevelWarn
+			}
+			cfg.logger.Log(logCtx, level, "nuts: NATS disconnected", connAttr, slog.Any("error", err))
 		}),
 		nats.ClosedHandler(func(_ *nats.Conn) {
 			cfg.logger.InfoContext(logCtx, "nuts: NATS connection closed", connAttr)
@@ -202,8 +219,10 @@ func Connect(ctx context.Context, url string, opts ...Option) (*nats.Conn, error
 		}),
 		// The server announces lame duck mode before it starts evicting
 		// clients; reconnection is automatic, but the log line attributes the
-		// coming disconnect to server maintenance rather than a fault.
+		// coming disconnect to server maintenance rather than a fault, and arms
+		// lameDuckPending so the disconnect itself is logged at WARN too.
 		nats.LameDuckModeHandler(func(_ *nats.Conn) {
+			lameDuckPending.Store(true)
 			cfg.logger.WarnContext(logCtx, "nuts: NATS server entering lame duck mode", connAttr)
 		}),
 	}
