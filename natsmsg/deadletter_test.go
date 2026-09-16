@@ -41,7 +41,16 @@ type fakeDLQPublisher struct {
 // TO, and a mismatch is refused with err 10060. Without this the "control
 // headers are stripped" test would pass just as happily on the broken code,
 // because a fake that ignores expectations cannot fail the way the broker does.
-func (f *fakeDLQPublisher) PublishMsg(_ context.Context, m *nats.Msg, _ ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+//
+// It binds ctx for exactly that reason. A real client fails before the wire on a
+// dead context; a fake that ignores ctx cannot fail the way COR-1487 did, so a
+// cancellation test written against it would pass just as happily on the broken
+// code. Every other test in this file publishes on a live context, so the check is
+// inert for them.
+func (f *fakeDLQPublisher) PublishMsg(ctx context.Context, m *nats.Msg, _ ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -69,6 +78,34 @@ func (f *fakeDLQPublisher) PublishMsg(_ context.Context, m *nats.Msg, _ ...jetst
 }
 
 var _ natsmsg.DLQPublisher = (*fakeDLQPublisher)(nil)
+
+// ctxRecordingDLQ reports what the publish context actually carried: the bound
+// DeadLetter applied, and a value planted by the caller. Neither is visible
+// through the plain fake, and both are half of what COR-1487 restored — so the
+// recording lives here rather than on the type every other test in this file
+// shares.
+//
+// DeadLetter publishes exactly once, so these are scalars rather than a log.
+type ctxRecordingDLQ struct {
+	fakeDLQPublisher
+
+	deadline time.Time // zero if the publish context carried none
+	probe    any       // ctx.Value(dlqProbeKey{}), as the publish saw it
+}
+
+// dlqProbeKey keys the value a test plants on the caller's context to read back
+// from inside the publish.
+type dlqProbeKey struct{}
+
+func (f *ctxRecordingDLQ) PublishMsg(ctx context.Context, m *nats.Msg, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+	// Record before delegating: the embedded fake refuses a dead context, and what
+	// it SAW is exactly what the failing case has to show.
+	f.deadline, _ = ctx.Deadline()
+	f.probe = ctx.Value(dlqProbeKey{})
+	return f.fakeDLQPublisher.PublishMsg(ctx, m, opts...)
+}
+
+var _ natsmsg.DLQPublisher = (*ctxRecordingDLQ)(nil)
 
 func TestSubjectToken(t *testing.T) {
 	cases := map[string]string{
@@ -145,6 +182,74 @@ func TestDeadLetter(t *testing.T) {
 			t.Fatal("expected error when the DLQ publish fails")
 		}
 	})
+}
+
+// TestDeadLetterCapturesWithAnAlreadyCancelledParent is the COR-1487 regression:
+// the give-up capture must not be defeated by the very cancellation that provoked
+// it.
+//
+// DeadLetter bounded its publish with context.WithTimeout(ctx, dlqPublishTimeout),
+// which caps the deadline AND inherits the parent's cancellation. The jobs most
+// likely to need dead-lettering are exactly the ones whose ctx is already dead — a
+// SIGTERM landing mid-handler, a cancelled upstream call — so the publish context
+// was born dead: PublishMsg failed with context.Canceled before touching the
+// network and the 15s bound never applied. Confirmed in staging and prod logs.
+//
+// Three things have to hold at once, and the last two are why the fix is
+// WithoutCancel rather than context.Background(): the capture happens, it is still
+// bounded, and the caller's values still reach the publish.
+func TestDeadLetterCapturesWithAnAlreadyCancelledParent(t *testing.T) {
+	// Mirrors the unexported dlqPublishTimeout; this is an external test package
+	// and cannot name it.
+	const dlqPublishTimeoutWant = 15 * time.Second
+
+	orig := nats.Header{}
+	orig.Set("traceparent", traceparent)
+	msg := &natsmsgtest.FakeMsg{
+		SubjectVal: "repo.ops.v1.us.acme.teardown",
+		DataVal:    []byte(`{"target":{"ulid":"X"}}`),
+		HeadersVal: orig,
+		Meta:       &jetstream.MsgMetadata{NumDelivered: 4, Stream: "repo_ops_v1", Sequence: jetstream.SequencePair{Stream: 999}, Timestamp: storedAt},
+	}
+
+	// Exactly the state a shutdown leaves behind during the join window: the
+	// handler's context is dead while the connection is still fully usable.
+	parent := context.WithValue(t.Context(), dlqProbeKey{}, traceparent)
+	ctx, cancel := context.WithCancel(parent)
+	cancel()
+
+	pub := &ctxRecordingDLQ{}
+	start := time.Now()
+	err := natsmsg.DeadLetter(ctx, pub, "repo.ops.dlq.v1.teardown.bad_body", msg, "bad_body")
+	end := time.Now()
+	if err != nil {
+		t.Fatalf("DeadLetter on an already-cancelled parent: %v (the capture must outlive it)", err)
+	}
+	if len(pub.msgs) != 1 {
+		t.Fatalf("captured %d messages, want 1 — the DLQ copy is the whole point of the give-up", len(pub.msgs))
+	}
+
+	// The bound has to survive the detach. WithoutCancel drops the parent's
+	// deadline along with its cancellation, so this explicit one is all that stands
+	// between a NATS blip and a hung handler.
+	deadline := pub.deadline
+	if deadline.IsZero() {
+		t.Fatalf("publish context carried no deadline, want ~%s: detaching must not unbound the publish", dlqPublishTimeoutWant)
+	}
+	// The deadline is set at the moment of the call, so it must land in
+	// [start, end] + the bound — an exact bracket, with no tolerance to flake
+	// under -race.
+	if lo, hi := start.Add(dlqPublishTimeoutWant), end.Add(dlqPublishTimeoutWant); deadline.Before(lo) || deadline.After(hi) {
+		t.Errorf("publish deadline %v outside [%v, %v], want the parent's cancellation dropped but dlqPublishTimeout kept",
+			deadline, lo, hi)
+	}
+
+	// Values are the half of ctx WithoutCancel keeps, and the reason the fix is not
+	// context.Background(): drop them and the handler's span stops carrying into
+	// the capture.
+	if probe := pub.probe; probe != traceparent {
+		t.Errorf("ctx value seen inside PublishMsg = %v, want %q: the caller's values must still reach the publish", probe, traceparent)
+	}
 }
 
 // TestDeadLetterStripsJetStreamControlHeaders is the regression test for a

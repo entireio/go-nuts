@@ -113,6 +113,11 @@ func (p Publisher) Publish(ctx context.Context, msg *nats.Msg, msgID string, att
 	if timeout == 0 {
 		timeout = DefaultPublishTimeout
 	}
+	// The bare ctx here is deliberate, and unlike DeadLetter (COR-1487) this one
+	// SHOULD inherit the caller's cancellation: an ordinary producer whose caller
+	// gave up wants to abandon the publish and fall back to its own outbox, nak or
+	// 5xx path. Detaching is right only for the give-up capture, which has no
+	// fallback left.
 	pubCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 

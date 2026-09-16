@@ -1034,6 +1034,10 @@ func (r *Retry) terminate(ctx context.Context, msg jetstream.Msg, s Settlement, 
 	//
 	// Values are preserved, so the span and trace context the handler was given
 	// still carry into the capture.
+	//
+	// The WHOLE settle sequence runs detached, not just the capture:
+	// natsmsg.DeadLetter detaches its own publish too (COR-1487), but this is what
+	// covers the DoubleAck below, which nothing else does.
 	settleCtx := context.WithoutCancel(ctx)
 
 	if err := r.capture(settleCtx, msg, s.Cause, reason); err != nil {

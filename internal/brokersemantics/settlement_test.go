@@ -14,6 +14,10 @@ import (
 	"github.com/entireio/go-nuts/natsmsg"
 )
 
+// poisonPayload is the body of the message these tests give up on — the one that
+// has to end up in the DLQ rather than being dropped.
+const poisonPayload = "poison"
+
 // TestTermSettlesAndAdvancesAckFloor is the ENT-1492 belief, measured.
 //
 // The belief under test — recorded in ENT-1492, in COR-944, and still carried in
@@ -153,8 +157,8 @@ func TestDeadLetterCaptureThenAckSettlesAndPreservesProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read captured message: %v", err)
 	}
-	if string(captured.Data) != "poison" {
-		t.Errorf("captured payload = %q, want %q", captured.Data, "poison")
+	if string(captured.Data) != poisonPayload {
+		t.Errorf("captured payload = %q, want %q", captured.Data, poisonPayload)
 	}
 	for header, want := range map[string]string{
 		natsmsg.DLQReasonHeader:    "bad completion payload",
@@ -168,6 +172,69 @@ func TestDeadLetterCaptureThenAckSettlesAndPreservesProvenance(t *testing.T) {
 	}
 	if captured.Subject != "dlq.events."+reason {
 		t.Errorf("captured on subject %q, want %q", captured.Subject, "dlq.events."+reason)
+	}
+}
+
+// TestDeadLetterCapturesOnAnAlreadyCancelledCallerContext measures COR-1487
+// against the real client: a caller whose context is already dead must still get a
+// durable DLQ record.
+//
+// The unit test beside DeadLetter proves the code BUILDS a live, deadline-bounded
+// publish context. It cannot prove the publish then lands, because the fake's
+// context check is this library's own model of the client — and the bug was
+// precisely a wrong belief about context semantics, the failure mode a fake
+// reproduces rather than catches. Only the real jetstream.PublishMsg can show that
+// the caller's cancellation no longer reaches the wire.
+//
+// The state under test is the one shutdown leaves behind: nuts.ShutdownGroup
+// cancels the loops' context, joins them, and only THEN drains the connections, so
+// for the whole join window the handler's ctx is done while the connection is
+// still fully usable. That is when a poison message is most likely to be given up
+// on, and it is exactly when the capture used to fail by construction — with
+// context.Canceled, before touching the network, leaving no record at all.
+func TestDeadLetterCapturesOnAnAlreadyCancelledCallerContext(t *testing.T) {
+	t.Parallel()
+	_, js := env(t)
+	newStream(t, js, jetstream.StreamConfig{Name: "events_dlq", Subjects: []string{"dlq.events.>"}})
+	cons := newConsumer(t, js, "events", jetstream.ConsumerConfig{
+		Durable:       "cancelled_capturer",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       time.Minute,
+		FilterSubject: "events.repo",
+	})
+	publish(t, js, "events.repo", poisonPayload)
+
+	msgs := fetchAll(t, cons, 1)
+	if len(msgs) != 1 {
+		t.Fatalf("fetched %d messages, want 1", len(msgs))
+	}
+
+	// Cancelled caller, live connection — the join window, reproduced.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if err := natsmsg.DeadLetter(ctx, js, "dlq.events.bad_body", msgs[0], "bad_body"); err != nil {
+		t.Fatalf("DeadLetter on an already-cancelled context: %v (the capture must outlive it)", err)
+	}
+
+	// Published is not stored: only reading the record back out of the DLQ stream
+	// shows the poison actually survived the give-up.
+	dlq, err := js.Stream(t.Context(), "events_dlq")
+	if err != nil {
+		t.Fatalf("dlq stream: %v", err)
+	}
+	captured, err := dlq.GetMsg(t.Context(), 1)
+	if err != nil {
+		t.Fatalf("read captured message: %v (a cancelled caller left no DLQ record)", err)
+	}
+	if string(captured.Data) != poisonPayload {
+		t.Errorf("captured payload = %q, want %q", captured.Data, poisonPayload)
+	}
+	if captured.Subject != "dlq.events.bad_body" {
+		t.Errorf("captured on subject %q, want %q", captured.Subject, "dlq.events.bad_body")
+	}
+	if got := captured.Header.Get(natsmsg.DLQReasonHeader); got != "bad_body" {
+		t.Errorf("captured %s = %q, want %q", natsmsg.DLQReasonHeader, got, "bad_body")
 	}
 }
 
@@ -357,7 +424,7 @@ func TestExhaustedDeliveryPinsFloorWithNoAckPending(t *testing.T) {
 
 	// Never dispose of the poison; Ack everything behind it.
 	r := consume(t, cons, func(m jetstream.Msg) {
-		if string(m.Data()) != "poison" {
+		if string(m.Data()) != poisonPayload {
 			if err := m.Ack(); err != nil {
 				t.Errorf("ack: %v", err)
 			}
