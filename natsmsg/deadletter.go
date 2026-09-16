@@ -16,6 +16,18 @@ import (
 // bound a NATS blip would hang the handler (and, since a one-in-flight consumer
 // keeps a slot occupied, stall the consumer) instead of failing the capture
 // loudly.
+//
+// It is the ONLY bound on that publish, because [DeadLetter] detaches from the
+// caller's cancellation (COR-1487) — and during a shutdown it is usually not the
+// clock that fires. ShutdownGroup cancels the loops, joins them, and only then
+// drains the connections, so whenever the join window is shorter than this bound a
+// capture racing shutdown is cut short by the drain and fails with a connection
+// error rather than reaching this timeout. That is the case under the defaults
+// (nuts.DefaultJoinTimeout is 10s to this 15s), though nuts.WithJoinTimeout can
+// change it either way. Detaching narrows that window rather than closing it.
+// Neither value is being changed here — a shorter bound would also shorten every
+// capture that is not racing a shutdown — but the interaction is recorded so it is
+// not rediscovered.
 const dlqPublishTimeout = 15 * time.Second
 
 // DLQ provenance headers added to the captured copy so a replay tool (or a
@@ -289,8 +301,21 @@ func SubjectToken(s string) string {
 //
 // Returns an error if the republish fails; on error the caller MUST NOT remove
 // the original — Nak or leave it so the poison is never dropped without a
-// captured copy. Publishing is bounded by dlqPublishTimeout regardless of ctx's
-// deadline.
+// captured copy.
+//
+// The publish is detached from ctx's CANCELLATION and bounded by
+// [dlqPublishTimeout]; ctx's values still propagate, so the handler's span carries
+// into the capture. Cancellation is the word that matters, and saying only
+// "deadline" is how the gap survived review: this is the give-up capture, so the
+// jobs most likely to reach it are exactly the ones whose ctx is already dead
+// (SIGTERM, a cancelled upstream call), and a publish context inheriting that is
+// born dead — it fails before touching the network and the bound never applies
+// (COR-1487).
+//
+// The cost, stated rather than implied: against an unreachable broker this now
+// blocks for [dlqPublishTimeout] instead of failing at once, so a capture racing
+// shutdown can outlast the join window rather than returning immediately. See
+// [dlqPublishTimeout] for that interaction.
 func DeadLetter(ctx context.Context, pub DLQPublisher, dlqSubject string, msg jetstream.Msg, reason string) error {
 	src := msg.Headers()
 	hdr := nats.Header{}
@@ -351,7 +376,12 @@ func DeadLetter(ctx context.Context, pub DLQPublisher, dlqSubject string, msg je
 
 	out := &nats.Msg{Subject: dlqSubject, Data: msg.Data(), Header: hdr}
 
-	pubCtx, cancel := context.WithTimeout(ctx, dlqPublishTimeout)
+	// WithoutCancel, not the bare ctx: WithTimeout inherits the parent's
+	// cancellation as well as capping the deadline, so the wrap is what stops a
+	// cancelled caller from producing a publish context born dead (COR-1487). See
+	// the doc comment above for why this function in particular must outlive the
+	// job that gave up on the message.
+	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dlqPublishTimeout)
 	defer cancel()
 	if _, err := pub.PublishMsg(pubCtx, out); err != nil {
 		return fmt.Errorf("dead-letter publish to %q: %w", dlqSubject, err)
