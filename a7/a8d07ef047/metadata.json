@@ -1,0 +1,37 @@
+{
+  "cli_version": "0.10.7-nightly.202609150627.4cb7edaf1",
+  "checkpoint_id": "a7a8d07ef047",
+  "strategy": "manual-commit",
+  "branch": "georg/cor-1487-deadletter-withoutcancel",
+  "checkpoints_count": 11,
+  "files_touched": [
+    "internal/brokersemantics/settlement_test.go",
+    "jsconsumer/retry.go",
+    "natsmsg/deadletter.go",
+    "natsmsg/deadletter_test.go",
+    "natsmsg/publish.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/a7/a8d07ef047/0/metadata.json",
+      "transcript": "/a7/a8d07ef047/0/full.jsonl",
+      "compact_transcript": "/a7/a8d07ef047/0/transcript.jsonl",
+      "content_hash": "/a7/a8d07ef047/0/content_hash.txt",
+      "prompt": "/a7/a8d07ef047/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 124,
+    "cache_creation_tokens": 272884,
+    "cache_read_tokens": 8552179,
+    "output_tokens": 83089,
+    "api_call_count": 62,
+    "subagent_tokens": {
+      "input_tokens": 106,
+      "cache_creation_tokens": 311233,
+      "cache_read_tokens": 3565368,
+      "output_tokens": 55058,
+      "api_call_count": 53
+    }
+  }
+}
