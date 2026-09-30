@@ -1,0 +1,5 @@
+I would like to migrate `go-nuts` to the new `go.entire.io` domain, pull every repo in this folder and plan the switch
+
+---
+
+let's do it

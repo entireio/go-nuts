@@ -1,0 +1,41 @@
+{
+  "cli_version": "0.11.3",
+  "checkpoint_id": "d84d55054a2a",
+  "strategy": "manual-commit",
+  "branch": "andrea/go-nuts-vanity-import",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "README.md",
+    "backoff/backoff_test.go",
+    "doc.go",
+    "go.mod",
+    "internal/brokersemantics/consumerconfig_test.go",
+    "internal/brokersemantics/library_test.go",
+    "internal/brokersemantics/publishdirectives_test.go",
+    "internal/brokersemantics/redelivery_test.go",
+    "internal/brokersemantics/settlement_test.go",
+    "jsconsumer/jsconsumer.go",
+    "jsconsumer/jsconsumer_test.go",
+    "jsconsumer/retry.go",
+    "jsconsumer/retry_test.go",
+    "jsconsumer/schedule.go",
+    "natsmsg/deadletter_test.go",
+    "natsmsg/publish.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/d8/4d55054a2a/0/metadata.json",
+      "transcript": "/d8/4d55054a2a/0/full.jsonl",
+      "compact_transcript": "/d8/4d55054a2a/0/transcript.jsonl",
+      "content_hash": "/d8/4d55054a2a/0/content_hash.txt",
+      "prompt": "/d8/4d55054a2a/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 58034,
+    "cache_read_tokens": 1012039,
+    "output_tokens": 6700,
+    "api_call_count": 14
+  }
+}
