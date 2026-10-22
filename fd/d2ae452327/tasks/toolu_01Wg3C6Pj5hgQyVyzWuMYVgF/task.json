@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01Wg3C6Pj5hgQyVyzWuMYVgF",
+  "agent_id": "af74b17adf3932884",
+  "subagent_type": "general-purpose",
+  "task_description": "Adversarial review of drain change",
+  "token_usage": {
+    "input_tokens": 580,
+    "cache_creation_tokens": 176614,
+    "cache_read_tokens": 2405620,
+    "output_tokens": 32400,
+    "api_call_count": 20
+  },
+  "started_at": "2026-10-22T14:28:43.558562+02:00",
+  "completed_at": "2026-10-22T14:36:14.595052+02:00"
+}

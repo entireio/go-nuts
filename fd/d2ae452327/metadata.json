@@ -1,0 +1,45 @@
+{
+  "cli_version": "0.11.6",
+  "checkpoint_id": "fdd2ae452327",
+  "strategy": "manual-commit",
+  "branch": "nodo/cor-2224-drain-in-flight-handlers-on-sigterm",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "README.md",
+    "backoff/backoff.go",
+    "backoff/backoff_test.go",
+    "doc.go",
+    "internal/brokersemantics/consumerconfig_test.go",
+    "internal/brokersemantics/library_test.go",
+    "internal/brokersemantics/redelivery_test.go",
+    "jsconsumer/jsconsumer.go",
+    "jsconsumer/jsconsumer_test.go",
+    "jsconsumer/retry.go",
+    "jsconsumer/retry_test.go",
+    "jsconsumer/schedule_test.go",
+    "shutdown.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/fd/d2ae452327/0/metadata.json",
+      "transcript": "/fd/d2ae452327/0/full.jsonl",
+      "compact_transcript": "/fd/d2ae452327/0/transcript.jsonl",
+      "content_hash": "/fd/d2ae452327/0/content_hash.txt",
+      "prompt": "/fd/d2ae452327/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 1256,
+    "cache_creation_tokens": 242662,
+    "cache_read_tokens": 7889904,
+    "output_tokens": 78446,
+    "api_call_count": 42,
+    "subagent_tokens": {
+      "input_tokens": 66,
+      "cache_creation_tokens": 79552,
+      "cache_read_tokens": 129420,
+      "output_tokens": 756,
+      "api_call_count": 3
+    }
+  }
+}
