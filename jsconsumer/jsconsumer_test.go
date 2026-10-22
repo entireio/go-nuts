@@ -1041,6 +1041,45 @@ func TestStopConcurrentWithCancelDrainsLiveHandler(t *testing.T) {
 	}
 }
 
+// TestNaturalCloseReleasesHandlerContext: a one-shot Start whose loop closes
+// on its own (the durable deleted on the server) must release the detached
+// handler context without anyone calling Stop — the parent's cancellation can
+// no longer reach it, so this is the only thing that would.
+func TestNaturalCloseReleasesHandlerContext(t *testing.T) {
+	url := runJetStreamServer(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	ctx := t.Context()
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{Name: "events_v1", Subjects: []string{"events.>"}}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	run, err := Start(ctx, nc, Config{Stream: "events_v1", Durable: "doomed_durable", FilterSubject: "events.repo",
+		Name: "testconsumer", SpanName: "test.consume"}, func(context.Context, jetstream.Msg) {})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := js.DeleteConsumer(ctx, "events_v1", "doomed_durable"); err != nil {
+		t.Fatalf("delete consumer: %v", err)
+	}
+	select {
+	case <-run.closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("consume loop did not close after the durable was deleted")
+	}
+	select {
+	case <-run.handlerCtx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler context still live after the loop closed on its own; it leaks until an explicit Stop")
+	}
+}
+
 // TestExplicitStopArmsDrainWindow: an explicit Stop with a still-live parent
 // context is the same drain — stop pulling, wait up to the window, then cancel
 // — so a caller that stops a Runner by hand is bounded by the same budget.

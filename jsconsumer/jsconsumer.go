@@ -672,9 +672,14 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(context.Co
 		defer close(watcherDone)
 		select {
 		case <-ctx.Done():
-			r.Stop()
 		case <-r.closed:
+			// The loop closed on its own (consumer deleted on the server,
+			// subscription invalidated). Nothing is in flight, but the
+			// detached handler context is still live, and the parent's
+			// cancellation can no longer reach it — Stop releases it, and
+			// returns at once here because the loop is already down.
 		}
+		r.Stop()
 	}()
 	return r, nil
 }
