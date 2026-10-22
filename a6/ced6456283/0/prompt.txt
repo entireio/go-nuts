@@ -1,0 +1,14 @@
+```
+
+
+<pasted_content id="0db2">
+Cancel the detached handler context when the loop closes naturally — jsconsumer.go:637 (jsconsumer/jsconsumer.go:637). If the broker deletes a one-shot Start consumer, the watcher exits through r.closed without calling cancelHandlers. Later parent cancellation cannot reach the detached context, so background work using it can remain alive indefinitely unless the caller explicitly calls Stop. Cancel it on the natural-close path too. Supervised Run already handles this correctly.
+
+Reproduced 5/5 against the embedded broker; a temporary cleanup fix passes 5/5. Existing tests pass with go test -race -count=1 ./...; go vet passes. No other actionable findings. Repository unchanged.
+
+Merge status is separate: no conflicts, but approval is missing and the checks gate remains pending.
+</pasted_content id="0db2">
+
+```
+
+Valid?
