@@ -1,6 +1,7 @@
 package brokersemantics
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -69,7 +70,7 @@ func TestNonPositiveMaxDeliverMeansUnlimited(t *testing.T) {
 			t.Fatalf("EffectiveMaxDeliver() = %d, want %d passed through unchanged", got, backoff.UnlimitedMaxDeliver)
 		}
 		got := make(chan struct{}, 1)
-		run, err := jsconsumer.Start(t.Context(), nc, cfg, func(m jetstream.Msg) {
+		run, err := jsconsumer.Start(t.Context(), nc, cfg, func(_ context.Context, m jetstream.Msg) {
 			// No delivery is ever final under an unlimited cap, so a policy built
 			// from this Config would Nak forever rather than Term.
 			if backoff.IsFinalDelivery(m, cfg.EffectiveMaxDeliver()) {
@@ -116,7 +117,7 @@ func TestJSConsumerDefaultsLandOnTheServer(t *testing.T) {
 		SpanName:      "test.consume",
 		// AckWait and MaxDeliver deliberately unset.
 	}
-	run, err := jsconsumer.Start(t.Context(), nc, cfg, func(jetstream.Msg) {})
+	run, err := jsconsumer.Start(t.Context(), nc, cfg, func(context.Context, jetstream.Msg) {})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -335,7 +336,7 @@ func TestStreamConsumerLimitsAreInheritedBySilentConsumers(t *testing.T) {
 			FilterSubject: "limited.repo",
 			Name:          "silent",
 			SpanName:      "test.consume",
-		}, func(jetstream.Msg) {})
+		}, func(context.Context, jetstream.Msg) {})
 		if err != nil {
 			t.Fatalf("Start: %v", err)
 		}

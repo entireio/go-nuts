@@ -26,7 +26,7 @@ func TestNakOrTermNaksBeforeExhaustion(t *testing.T) {
 	p := Policy{NakDelay: testDelay, MaxDeliver: 5, TermOnExhaustion: true}
 	msg := delivered(4)
 
-	got, err := p.NakOrTerm(msg)
+	got, err := p.NakOrTerm(context.Background(), msg)
 	if err != nil {
 		t.Fatalf("NakOrTerm: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestNakOrTermTermsOnFinalDelivery(t *testing.T) {
 	p := Policy{NakDelay: testDelay, MaxDeliver: 5, TermOnExhaustion: true}
 	msg := delivered(5)
 
-	got, err := p.NakOrTerm(msg)
+	got, err := p.NakOrTerm(context.Background(), msg)
 	if err != nil {
 		t.Fatalf("NakOrTerm: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestNakOrTermKeepsNakWithoutOptIn(t *testing.T) {
 	p := Policy{NakDelay: testDelay, MaxDeliver: 5}
 	msg := delivered(5)
 
-	got, err := p.NakOrTerm(msg)
+	got, err := p.NakOrTerm(context.Background(), msg)
 	if err != nil {
 		t.Fatalf("NakOrTerm: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestNakOrTermMissingMetadataNaks(t *testing.T) {
 	p := Policy{NakDelay: testDelay, MaxDeliver: 1, TermOnExhaustion: true}
 	msg := &natsmsgtest.FakeMsg{MetaErr: errors.New("no metadata")}
 
-	got, err := p.NakOrTerm(msg)
+	got, err := p.NakOrTerm(context.Background(), msg)
 	if err != nil {
 		t.Fatalf("NakOrTerm: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestNakOrTermZeroMaxDeliverNaks(t *testing.T) {
 	p := Policy{NakDelay: testDelay, TermOnExhaustion: true} // MaxDeliver unset
 	msg := delivered(1)
 
-	got, err := p.NakOrTerm(msg)
+	got, err := p.NakOrTerm(context.Background(), msg)
 	if err != nil {
 		t.Fatalf("NakOrTerm: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestNakOrTermUsesGrownDelay(t *testing.T) {
 	p := Policy{NakDelay: time.Second, Factor: 2, MaxDelay: 300 * time.Second, MaxDeliver: 8}
 	msg := delivered(3)
 
-	got, err := p.NakOrTerm(msg)
+	got, err := p.NakOrTerm(context.Background(), msg)
 	if err != nil {
 		t.Fatalf("NakOrTerm: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestNakOrTermGrownDelayMissingMetadata(t *testing.T) {
 	p := Policy{NakDelay: time.Second, Factor: 2, MaxDelay: 300 * time.Second}
 	msg := &natsmsgtest.FakeMsg{MetaErr: errors.New("no metadata")}
 
-	if _, err := p.NakOrTerm(msg); err != nil {
+	if _, err := p.NakOrTerm(context.Background(), msg); err != nil {
 		t.Fatalf("NakOrTerm: %v", err)
 	}
 	if len(msg.NakDelays) != 1 || msg.NakDelays[0] != time.Second {
@@ -321,7 +321,7 @@ func TestNakOrTermDispositionMatrix(t *testing.T) {
 				msg.Meta = &jetstream.MsgMetadata{NumDelivered: tc.delivered}
 			}
 
-			out, err := tc.policy.NakOrTerm(msg)
+			out, err := tc.policy.NakOrTerm(context.Background(), msg)
 			if err != nil {
 				t.Fatalf("NakOrTerm: %v", err)
 			}
@@ -353,7 +353,7 @@ func TestNakOrTermDispositionErrors(t *testing.T) {
 		p := Policy{NakDelay: time.Second, MaxDeliver: 1, TermOnExhaustion: true}
 		boom := errors.New("term boom")
 
-		out, err := p.NakOrTerm(&natsmsgtest.FakeMsg{Meta: &jetstream.MsgMetadata{NumDelivered: 1}, TermErr: boom})
+		out, err := p.NakOrTerm(context.Background(), &natsmsgtest.FakeMsg{Meta: &jetstream.MsgMetadata{NumDelivered: 1}, TermErr: boom})
 		if out != OutcomeTerm {
 			t.Errorf("outcome = %q, want term", out)
 		}
@@ -366,7 +366,7 @@ func TestNakOrTermDispositionErrors(t *testing.T) {
 		p := Policy{NakDelay: time.Second, MaxDeliver: 5}
 		boom := errors.New("nak boom")
 
-		out, err := p.NakOrTerm(&natsmsgtest.FakeMsg{Meta: &jetstream.MsgMetadata{NumDelivered: 2}, NakErr: boom})
+		out, err := p.NakOrTerm(context.Background(), &natsmsgtest.FakeMsg{Meta: &jetstream.MsgMetadata{NumDelivered: 2}, NakErr: boom})
 		if out != OutcomeNak {
 			t.Errorf("outcome = %q, want nak", out)
 		}
@@ -434,7 +434,7 @@ func TestEnvelopeIngest(t *testing.T) {
 	if !IsFinalDelivery(delivered(8), p.MaxDeliver) {
 		t.Error("ingest delivery 8/8 not read as final")
 	}
-	out, err := p.NakOrTerm(delivered(8))
+	out, err := p.NakOrTerm(context.Background(), delivered(8))
 	if err != nil || out != OutcomeTerm {
 		t.Errorf("ingest final delivery: outcome=%q err=%v, want term", out, err)
 	}
@@ -480,7 +480,7 @@ func TestDeadLetterBeforeDisposition(t *testing.T) {
 		if len(pub.published) != 1 {
 			t.Fatalf("captured %d msgs, want 1 before disposition", len(pub.published))
 		}
-		out, err := p.NakOrTerm(msg)
+		out, err := p.NakOrTerm(context.Background(), msg)
 		if err != nil || out != OutcomeTerm || !msg.Termed {
 			t.Fatalf("dispose: out=%q err=%v termed=%v, want clean term", out, err, msg.Termed)
 		}
@@ -507,4 +507,89 @@ func TestDeadLetterBeforeDisposition(t *testing.T) {
 			t.Error("message termed despite a failed DLQ capture")
 		}
 	})
+}
+
+// TestNakOrTermNaksOnCancelledContext pins COR-2224: a transient failure whose
+// context was cancelled is a shutdown, not poison, so the final delivery is
+// Naked instead of Termed even with TermOnExhaustion set. On the broker's
+// final delivery that Nak is dropped and the message is left un-acked
+// (visible, reapable), rather than silently discarded. A context cancelled
+// THROUGH a derived timeout reads the same way: the cancellation, not the
+// deadline, is what ended the attempt.
+func TestNakOrTermNaksOnCancelledContext(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	derived, cancelDerived := context.WithTimeout(cancelled, time.Hour)
+	defer cancelDerived()
+
+	for _, tc := range []struct {
+		name      string
+		ctx       context.Context
+		delivered uint64
+	}{
+		{"cancelled on the final delivery", cancelled, 5},
+		{"cancelled through a derived timeout on the final delivery", derived, 5},
+		{"cancelled before the final delivery", cancelled, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := Policy{NakDelay: testDelay, MaxDeliver: 5, TermOnExhaustion: true}
+			msg := delivered(tc.delivered)
+
+			got, err := p.NakOrTerm(tc.ctx, msg)
+			if err != nil {
+				t.Fatalf("NakOrTerm: %v", err)
+			}
+			if got != OutcomeNak {
+				t.Errorf("outcome = %q, want nak", got)
+			}
+			if msg.Termed {
+				t.Error("termed on a cancelled context")
+			}
+			if len(msg.NakDelays) != 1 || msg.NakDelays[0] != testDelay {
+				t.Errorf("NakDelays = %v, want one nak with the policy delay", msg.NakDelays)
+			}
+		})
+	}
+}
+
+// TestNakOrTermTermsUnlessInterrupted: the context check is for a CANCELLED
+// context only. A live one keeps the COR-762 Term on the final delivery, and
+// so does one that merely ran out of time — a per-attempt deadline is a failed
+// attempt (slow poison), not a shutdown.
+func TestNakOrTermTermsUnlessInterrupted(t *testing.T) {
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	for name, ctx := range map[string]context.Context{"live": context.Background(), "deadline exceeded": expired} {
+		t.Run(name, func(t *testing.T) {
+			p := Policy{NakDelay: testDelay, MaxDeliver: 5, TermOnExhaustion: true}
+			msg := delivered(5)
+			if got, err := p.NakOrTerm(ctx, msg); err != nil || got != OutcomeTerm || !msg.Termed {
+				t.Fatalf("NakOrTerm(final) = %q, %v, termed=%v; want term", got, err, msg.Termed)
+			}
+		})
+	}
+}
+
+// TestIsInterrupted pins the rule the dispositions share: cancellation is an
+// interruption, a deadline is not, and a live context is neither.
+func TestIsInterrupted(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	throughTimeout, cancelThrough := context.WithTimeout(cancelled, time.Hour)
+	defer cancelThrough()
+	for name, tc := range map[string]struct {
+		ctx  context.Context
+		want bool
+	}{
+		"live":                      {context.Background(), false},
+		"cancelled":                 {cancelled, true},
+		"deadline exceeded":         {expired, false},
+		"cancelled through timeout": {throughTimeout, true},
+	} {
+		if got := IsInterrupted(tc.ctx); got != tc.want {
+			t.Errorf("IsInterrupted(%s) = %v, want %v", name, got, tc.want)
+		}
+	}
 }

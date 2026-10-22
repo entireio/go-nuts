@@ -1,6 +1,7 @@
 package brokersemantics
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -386,7 +387,7 @@ func TestBackoffPolicyDelayIsNotWhatTheBrokerServes(t *testing.T) {
 			r := consume(t, cons, func(m jetstream.Msg) {
 				// Exactly what a consumer using the policy does on a transient
 				// failure, final delivery included.
-				if _, err := policy.NakOrTerm(m); err != nil {
+				if _, err := policy.NakOrTerm(context.Background(), m); err != nil {
 					t.Errorf("NakOrTerm: %v", err)
 				}
 			})

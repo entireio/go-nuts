@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -210,7 +211,7 @@ func TestRunnerStopIdempotent(_ *testing.T) {
 func TestStartNilConn(t *testing.T) {
 	cfg := testCfg
 	cfg.Durable = "test_durable"
-	if _, err := Start(context.Background(), nil, cfg, func(jetstream.Msg) {}); err == nil {
+	if _, err := Start(context.Background(), nil, cfg, func(context.Context, jetstream.Msg) {}); err == nil {
 		t.Fatal("Start(nil conn) succeeded, want error")
 	}
 }
@@ -219,7 +220,7 @@ func TestStartNilConn(t *testing.T) {
 // CreateOrUpdateConsumer silently create an ephemeral, server-named consumer,
 // losing resume-across-restarts — reject it before touching the broker.
 func TestStartRejectsEmptyDurable(t *testing.T) {
-	if _, err := Start(context.Background(), nil, testCfg, func(jetstream.Msg) {}); err == nil || !strings.Contains(err.Error(), "Durable") {
+	if _, err := Start(context.Background(), nil, testCfg, func(context.Context, jetstream.Msg) {}); err == nil || !strings.Contains(err.Error(), "Durable") {
 		t.Fatalf("Start(empty Durable) err = %v, want Durable-required error", err)
 	}
 }
@@ -229,27 +230,27 @@ func TestStartRejectsPermanentLocalConfigErrors(t *testing.T) {
 	tests := []struct {
 		name  string
 		cfg   Config
-		onMsg func(jetstream.Msg)
+		onMsg func(context.Context, jetstream.Msg)
 		want  string
 	}{
-		{"empty stream", func() Config { c := valid; c.Stream = ""; return c }(), func(jetstream.Msg) {}, "Stream"},
+		{"empty stream", func() Config { c := valid; c.Stream = ""; return c }(), func(context.Context, jetstream.Msg) {}, "Stream"},
 		{"nil handler", valid, nil, "onMsg"},
 		{"both filter forms", func() Config {
 			c := valid
 			c.FilterSubject = "events.one"
 			c.FilterSubjects = []string{"events.two"}
 			return c
-		}(), func(jetstream.Msg) {}, "FilterSubject"},
+		}(), func(context.Context, jetstream.Msg) {}, "FilterSubject"},
 		{"empty multi filter", func() Config {
 			c := valid
 			c.FilterSubjects = []string{"events.one", ""}
 			return c
-		}(), func(jetstream.Msg) {}, "FilterSubjects"},
-		{"negative ack wait", func() Config { c := valid; c.AckWait = -time.Second; return c }(), func(jetstream.Msg) {}, "AckWait"},
-		{"invalid max deliver", func() Config { c := valid; c.MaxDeliver = -2; return c }(), func(jetstream.Msg) {}, "MaxDeliver"},
-		{"negative max messages", func() Config { c := valid; c.MaxMessages = -1; return c }(), func(jetstream.Msg) {}, "MaxMessages"},
-		{"invalid max ack pending", func() Config { c := valid; c.MaxAckPending = -2; return c }(), func(jetstream.Msg) {}, "MaxAckPending"},
-		{"negative inactive threshold", func() Config { c := valid; c.InactiveThreshold = -time.Second; return c }(), func(jetstream.Msg) {}, "InactiveThreshold"},
+		}(), func(context.Context, jetstream.Msg) {}, "FilterSubjects"},
+		{"negative ack wait", func() Config { c := valid; c.AckWait = -time.Second; return c }(), func(context.Context, jetstream.Msg) {}, "AckWait"},
+		{"invalid max deliver", func() Config { c := valid; c.MaxDeliver = -2; return c }(), func(context.Context, jetstream.Msg) {}, "MaxDeliver"},
+		{"negative max messages", func() Config { c := valid; c.MaxMessages = -1; return c }(), func(context.Context, jetstream.Msg) {}, "MaxMessages"},
+		{"invalid max ack pending", func() Config { c := valid; c.MaxAckPending = -2; return c }(), func(context.Context, jetstream.Msg) {}, "MaxAckPending"},
+		{"negative inactive threshold", func() Config { c := valid; c.InactiveThreshold = -time.Second; return c }(), func(context.Context, jetstream.Msg) {}, "InactiveThreshold"},
 	}
 
 	for _, tt := range tests {
@@ -325,7 +326,7 @@ func TestStartRejectsKeepInProgressWithPrefetch(t *testing.T) {
 	cfg.Durable = "test_durable"
 	cfg.KeepInProgress = true
 	cfg.MaxMessages = 10
-	if _, err := Start(context.Background(), nil, cfg, func(jetstream.Msg) {}); err == nil || !strings.Contains(err.Error(), "MaxMessages") {
+	if _, err := Start(context.Background(), nil, cfg, func(context.Context, jetstream.Msg) {}); err == nil || !strings.Contains(err.Error(), "MaxMessages") {
 		t.Fatalf("Start(KeepInProgress, MaxMessages=10) err = %v, want MaxMessages conflict error", err)
 	}
 }
@@ -333,7 +334,14 @@ func TestStartRejectsKeepInProgressWithPrefetch(t *testing.T) {
 // startTestConsumer boots an embedded JetStream server, a stream, and a
 // running consumer delivering to onMsg, returning the runner, the JetStream
 // context for publishing, and the consume context's cancel.
-func startTestConsumer(t *testing.T, onMsg func(jetstream.Msg)) (*Runner, jetstream.JetStream, context.CancelFunc) {
+func startTestConsumer(t *testing.T, onMsg func(context.Context, jetstream.Msg)) (*Runner, jetstream.JetStream, context.CancelFunc) {
+	t.Helper()
+	return startTestConsumerCfg(t, nil, onMsg)
+}
+
+// startTestConsumerCfg is startTestConsumer with a hook to shape the Config
+// (drain window, logger) before Start.
+func startTestConsumerCfg(t *testing.T, mutate func(*Config), onMsg func(context.Context, jetstream.Msg)) (*Runner, jetstream.JetStream, context.CancelFunc) {
 	t.Helper()
 	url := runJetStreamServer(t)
 	nc, err := nats.Connect(url)
@@ -353,13 +361,17 @@ func startTestConsumer(t *testing.T, onMsg func(jetstream.Msg)) (*Runner, jetstr
 	}); err != nil {
 		t.Fatalf("create stream: %v", err)
 	}
-	run, err := Start(ctx, nc, Config{
+	cfg := Config{
 		Stream:        "events_v1",
 		Durable:       "test_durable",
 		FilterSubject: "events.repo",
 		Name:          "testconsumer",
 		SpanName:      "test.consume",
-	}, onMsg)
+	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	run, err := Start(ctx, nc, cfg, onMsg)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -373,7 +385,7 @@ func startTestConsumer(t *testing.T, onMsg func(jetstream.Msg)) (*Runner, jetstr
 func TestStopWaitsForInFlightHandler(t *testing.T) {
 	started := make(chan struct{})
 	var handlerDone atomic.Bool
-	run, js, _ := startTestConsumer(t, func(m jetstream.Msg) {
+	run, js, _ := startTestConsumer(t, func(_ context.Context, m jetstream.Msg) {
 		close(started)
 		time.Sleep(300 * time.Millisecond)
 		handlerDone.Store(true)
@@ -401,7 +413,7 @@ func TestStopWaitsForInFlightHandler(t *testing.T) {
 // while ctx cancellation triggers the Start-armed stop. All calls must
 // return, without panic or race.
 func TestStopConcurrentWithCancel(t *testing.T) {
-	run, _, cancel := startTestConsumer(t, func(jetstream.Msg) {})
+	run, _, cancel := startTestConsumer(t, func(context.Context, jetstream.Msg) {})
 
 	var wg sync.WaitGroup
 	for range 8 {
@@ -425,7 +437,7 @@ func TestStopConcurrentWithCancel(t *testing.T) {
 // caller may stop a Runner while retaining the parent context, and doing so
 // must not leave Start's cancellation watcher parked until that parent ends.
 func TestExplicitStopReleasesWatcher(t *testing.T) {
-	run, _, _ := startTestConsumer(t, func(jetstream.Msg) {})
+	run, _, _ := startTestConsumer(t, func(context.Context, jetstream.Msg) {})
 	run.Stop()
 
 	select {
@@ -467,7 +479,7 @@ func TestStartAppliesConsumerTunables(t *testing.T) {
 		SpanName:          "test.consume",
 		InactiveThreshold: 72 * time.Hour,
 		MaxAckPending:     42,
-	}, func(jetstream.Msg) {})
+	}, func(context.Context, jetstream.Msg) {})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -518,7 +530,7 @@ func runTestEnv(t *testing.T) (*nats.Conn, jetstream.JetStream) {
 // TestRunRejectsInvalidConfig: configuration errors can never succeed on
 // retry, so Run must return them immediately instead of supervising forever.
 func TestRunRejectsInvalidConfig(t *testing.T) {
-	if err := Run(context.Background(), nil, testCfg, func(jetstream.Msg) {}); err == nil || !strings.Contains(err.Error(), "Durable") {
+	if err := Run(context.Background(), nil, testCfg, func(context.Context, jetstream.Msg) {}); err == nil || !strings.Contains(err.Error(), "Durable") {
 		t.Fatalf("Run(empty Durable) err = %v, want immediate Durable-required error", err)
 	}
 }
@@ -542,7 +554,7 @@ func TestRunReturnsPermanentServerConfigError(t *testing.T) {
 		Name:           "testconsumer",
 	}
 	done := make(chan error, 1)
-	go func() { done <- Run(t.Context(), nc, cfg, func(jetstream.Msg) {}) }()
+	go func() { done <- Run(t.Context(), nc, cfg, func(context.Context, jetstream.Msg) {}) }()
 
 	select {
 	case err := <-done:
@@ -572,7 +584,7 @@ func TestRunDeliversAndReturnsOnCancel(t *testing.T) {
 	cfg := Config{Stream: "events_v1", Durable: "run_durable", FilterSubject: "events.repo",
 		Name: "testconsumer", SpanName: "test.consume"}
 	go func() {
-		done <- Run(ctx, nc, cfg, func(m jetstream.Msg) {
+		done <- Run(ctx, nc, cfg, func(_ context.Context, m jetstream.Msg) {
 			if err := m.Ack(); err != nil {
 				t.Errorf("ack: %v", err)
 			}
@@ -617,7 +629,7 @@ func TestRunToleratesMissingStreamAtBoot(t *testing.T) {
 	cfg := Config{Stream: "late_v1", Durable: "late_durable", FilterSubject: "late.repo",
 		Name: "testconsumer", SpanName: "test.consume"}
 	go func() {
-		done <- Run(ctx, nc, cfg, func(m jetstream.Msg) {
+		done <- Run(ctx, nc, cfg, func(_ context.Context, m jetstream.Msg) {
 			if err := m.Ack(); err != nil {
 				t.Errorf("ack: %v", err)
 			}
@@ -675,7 +687,7 @@ func TestRunRecreatesAfterConsumerDeleted(t *testing.T) {
 	cfg := Config{Stream: "events_v1", Durable: "recreate_durable", FilterSubject: "events.repo",
 		Name: "testconsumer", SpanName: "test.consume"}
 	go func() {
-		done <- Run(ctx, nc, cfg, func(m jetstream.Msg) {
+		done <- Run(ctx, nc, cfg, func(_ context.Context, m jetstream.Msg) {
 			if err := m.Ack(); err != nil {
 				t.Errorf("ack: %v", err)
 			}
@@ -785,7 +797,7 @@ func TestStartDeliversToOnMsg(t *testing.T) {
 		FilterSubject: "events.repo",
 		Name:          "testconsumer",
 		SpanName:      "test.consume",
-	}, func(m jetstream.Msg) {
+	}, func(_ context.Context, m jetstream.Msg) {
 		if err := m.Ack(); err != nil {
 			t.Errorf("ack: %v", err)
 		}
@@ -806,5 +818,306 @@ func TestStartDeliversToOnMsg(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("message did not reach onMsg")
+	}
+}
+
+// publishAndAwaitStart publishes one message and waits for the handler to
+// signal it has begun, so a shutdown can be driven against a live handler.
+func publishAndAwaitStart(t *testing.T, js jetstream.JetStream, started <-chan struct{}) {
+	t.Helper()
+	if _, err := js.Publish(context.Background(), "events.repo", []byte("slow")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never started")
+	}
+}
+
+// TestHandlerContextSurvivesParentCancel pins the drain contract (COR-2224):
+// cancelling the context Start was given stops the pull loop but does NOT
+// cancel the handler's context. An in-flight handler finishes on its own
+// terms inside the drain window, instead of failing with context.Canceled in
+// the same instant SIGTERM lands.
+func TestHandlerContextSurvivesParentCancel(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan error, 1)
+	run, js, cancel := startTestConsumerCfg(t, func(c *Config) { c.DrainWindow = 5 * time.Second },
+		func(ctx context.Context, m jetstream.Msg) {
+			close(started)
+			<-release
+			err := ctx.Err()
+			if ackErr := m.Ack(); ackErr != nil {
+				t.Errorf("ack: %v", ackErr)
+			}
+			finished <- err
+		})
+	publishAndAwaitStart(t, js, started)
+
+	cancel()
+	// The parent is gone and the loop has been told to stop; the handler must
+	// still hold a live context.
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("handler ctx.Err() = %v after parent cancel, want nil inside the drain window", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish")
+	}
+	run.Stop()
+}
+
+// TestDrainWindowCancelsHandlerContext: a handler that does not finish inside
+// Config.DrainWindow has its context cancelled when the window elapses, so
+// shutdown stays bounded, and the scaffold says so in the log.
+func TestDrainWindowCancelsHandlerContext(t *testing.T) {
+	logs := &logCapture{}
+	started := make(chan struct{})
+	handlerCtxDone := make(chan struct{})
+	run, js, cancel := startTestConsumerCfg(t, func(c *Config) {
+		c.DrainWindow = 150 * time.Millisecond
+		c.Logger = slog.New(logs)
+	}, func(ctx context.Context, _ jetstream.Msg) {
+		close(started)
+		<-ctx.Done()
+		close(handlerCtxDone)
+	})
+	publishAndAwaitStart(t, js, started)
+
+	cancelledAt := time.Now()
+	cancel()
+	select {
+	case <-handlerCtxDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler context never cancelled after the drain window")
+	}
+	if elapsed := time.Since(cancelledAt); elapsed < 150*time.Millisecond {
+		t.Errorf("handler context cancelled after %v, want the full 150ms drain window", elapsed)
+	}
+	if !backoff.IsInterrupted(run.handlerCtx) {
+		t.Error("window expiry did not read as an interruption to the dispositions")
+	}
+	run.Stop()
+	if logs.count("testconsumer: drain window elapsed; cancelling in-flight handler") == 0 {
+		t.Errorf("drain-window expiry not logged; got %v", logs.snapshot())
+	}
+}
+
+// TestNoDrainWindowLogWhenHandlerFinishes: a clean drain (handler returns
+// inside the window) must not log the expiry warning — it is the signal
+// operators size the window by, so it has to mean what it says.
+func TestNoDrainWindowLogWhenHandlerFinishes(t *testing.T) {
+	logs := &logCapture{}
+	started := make(chan struct{})
+	run, js, cancel := startTestConsumerCfg(t, func(c *Config) {
+		c.DrainWindow = 2 * time.Second
+		c.Logger = slog.New(logs)
+	}, func(_ context.Context, m jetstream.Msg) {
+		close(started)
+		time.Sleep(50 * time.Millisecond)
+		if err := m.Ack(); err != nil {
+			t.Errorf("ack: %v", err)
+		}
+	})
+	publishAndAwaitStart(t, js, started)
+	cancel()
+	run.Stop()
+	if logs.count("testconsumer: drain window elapsed; cancelling in-flight handler") != 0 {
+		t.Error("drain-window expiry logged although the handler finished inside the window")
+	}
+}
+
+type ctxKey struct{}
+
+// TestHandlerContextCarriesParentValues: the handler context is detached from
+// the parent's CANCELLATION only. Its values — trace baggage, loggers, request
+// scope — still flow through.
+func TestHandlerContextCarriesParentValues(t *testing.T) {
+	url := runJetStreamServer(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), ctxKey{}, "carried"))
+	defer cancel()
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{Name: "events_v1", Subjects: []string{"events.>"}}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	got := make(chan any, 1)
+	run, err := Start(ctx, nc, Config{Stream: "events_v1", Durable: "test_durable", FilterSubject: "events.repo",
+		Name: "testconsumer", SpanName: "test.consume"}, func(hctx context.Context, m jetstream.Msg) {
+		if err := m.Ack(); err != nil {
+			t.Errorf("ack: %v", err)
+		}
+		got <- hctx.Value(ctxKey{})
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer run.Stop()
+	if _, err := js.Publish(ctx, "events.repo", []byte("x")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case v := <-got:
+		if v != "carried" {
+			t.Errorf("handler ctx value = %v, want carried", v)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("message did not reach onMsg")
+	}
+}
+
+// TestHandlerContextCancelledOnceLoopCloses: after Stop returns the handler
+// context is cancelled even when the window never elapsed, so anything a
+// handler forked on it (a heartbeat, a background flush) is released before
+// the caller drains the connection — the drain → cancel → nuts.Drain ordering.
+func TestHandlerContextCancelledOnceLoopCloses(t *testing.T) {
+	started := make(chan struct{})
+	var captured atomic.Pointer[context.Context]
+	run, js, cancel := startTestConsumerCfg(t, func(c *Config) { c.DrainWindow = 5 * time.Second },
+		func(ctx context.Context, m jetstream.Msg) {
+			captured.Store(&ctx)
+			if err := m.Ack(); err != nil {
+				t.Errorf("ack: %v", err)
+			}
+			close(started)
+		})
+	publishAndAwaitStart(t, js, started)
+	cancel()
+	run.Stop()
+	if hctx := captured.Load(); hctx == nil || (*hctx).Err() == nil {
+		t.Error("handler context still live after Stop returned; want it cancelled so forked goroutines release")
+	}
+}
+
+// TestStopConcurrentWithCancelDrainsLiveHandler: the concurrent-Stop race
+// with a handler actually in flight — every Stop caller, and the watcher's,
+// returns only once the handler has, and the handler is cancelled exactly once
+// the window elapses rather than by whichever caller got there first.
+func TestStopConcurrentWithCancelDrainsLiveHandler(t *testing.T) {
+	started := make(chan struct{})
+	var handlerReturned atomic.Bool
+	run, js, cancel := startTestConsumerCfg(t, func(c *Config) { c.DrainWindow = 150 * time.Millisecond },
+		func(ctx context.Context, _ jetstream.Msg) {
+			close(started)
+			<-ctx.Done()
+			handlerReturned.Store(true)
+		})
+	publishAndAwaitStart(t, js, started)
+
+	cancelledAt := time.Now()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			run.Stop()
+			if !handlerReturned.Load() {
+				t.Error("Stop returned while the handler was still in flight")
+			}
+		}()
+	}
+	cancel()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("concurrent Stop calls did not all return")
+	}
+	if elapsed := time.Since(cancelledAt); elapsed < 150*time.Millisecond {
+		t.Errorf("handler cancelled after %v, want the full window regardless of how many callers stopped", elapsed)
+	}
+}
+
+// TestExplicitStopArmsDrainWindow: an explicit Stop with a still-live parent
+// context is the same drain — stop pulling, wait up to the window, then cancel
+// — so a caller that stops a Runner by hand is bounded by the same budget.
+func TestExplicitStopArmsDrainWindow(t *testing.T) {
+	started := make(chan struct{})
+	handlerCtxDone := make(chan struct{})
+	run, js, _ := startTestConsumerCfg(t, func(c *Config) { c.DrainWindow = 150 * time.Millisecond },
+		func(ctx context.Context, _ jetstream.Msg) {
+			close(started)
+			<-ctx.Done()
+			close(handlerCtxDone)
+		})
+	publishAndAwaitStart(t, js, started)
+
+	stopped := make(chan struct{})
+	go func() { run.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return after the drain window")
+	}
+	select {
+	case <-handlerCtxDone:
+	default:
+		t.Error("Stop returned before the handler observed its cancellation")
+	}
+}
+
+// TestRunJoinsInFlightHandlerWithinDrainWindow: Run's ctx-driven exit is the
+// drain too — it returns only after the in-flight handler finished or was
+// cancelled by the window, never while one is still running.
+func TestRunJoinsInFlightHandlerWithinDrainWindow(t *testing.T) {
+	nc, js := runTestEnv(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{Name: "events_v1", Subjects: []string{"events.>"}}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	started := make(chan struct{})
+	var handlerReturned atomic.Bool
+	done := make(chan error, 1)
+	cfg := Config{Stream: "events_v1", Durable: "run_durable", FilterSubject: "events.repo",
+		Name: "testconsumer", SpanName: "test.consume", DrainWindow: 150 * time.Millisecond}
+	go func() {
+		done <- Run(ctx, nc, cfg, func(hctx context.Context, _ jetstream.Msg) {
+			close(started)
+			<-hctx.Done()
+			handlerReturned.Store(true)
+		})
+	}()
+	publishAndAwaitStart(t, js, started)
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v on cancel, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the drain window")
+	}
+	if !handlerReturned.Load() {
+		t.Error("Run returned while the handler was still in flight")
+	}
+}
+
+// TestConfigEffectiveDrainWindow: zero means DefaultDrainWindow; a set value
+// is used as-is; a negative one is a configuration error.
+func TestConfigEffectiveDrainWindow(t *testing.T) {
+	if got := (Config{}).EffectiveDrainWindow(); got != DefaultDrainWindow {
+		t.Errorf("EffectiveDrainWindow() zero = %v, want %v", got, DefaultDrainWindow)
+	}
+	if got := (Config{DrainWindow: 3 * time.Second}).EffectiveDrainWindow(); got != 3*time.Second {
+		t.Errorf("EffectiveDrainWindow() = %v, want 3s", got)
+	}
+	cfg := Config{Stream: "events_v1", Durable: "d", Name: "testconsumer", DrainWindow: -time.Second}
+	if _, err := Start(context.Background(), nil, cfg, func(context.Context, jetstream.Msg) {}); err == nil || !strings.Contains(err.Error(), "DrainWindow") {
+		t.Fatalf("Start(negative DrainWindow) err = %v, want DrainWindow error", err)
 	}
 }

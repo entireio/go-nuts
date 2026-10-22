@@ -648,12 +648,12 @@ func TestMaxTimeToDeadLetterBoundsTheLadder(t *testing.T) {
 	}
 	// The ENT-1535 ladder: reaches the dead-letter branch hours past the bound.
 	runaway := []time.Duration{5 * time.Minute, 10 * time.Minute, 30 * time.Minute, time.Hour, 4 * time.Hour}
-	_, err := Start(t.Context(), nil, newCfg(runaway), func(jetstream.Msg) {})
+	_, err := Start(t.Context(), nil, newCfg(runaway), func(context.Context, jetstream.Msg) {})
 	if err == nil || !strings.Contains(err.Error(), "MaxTimeToDeadLetter") {
 		t.Fatalf("Start(runaway ladder) err = %v, want a MaxTimeToDeadLetter rejection", err)
 	}
 	// A bounded one gets past the schedule check (and fails later, on the nil conn).
-	if _, err := Start(t.Context(), nil, newCfg(testLadder()), func(jetstream.Msg) {}); err == nil ||
+	if _, err := Start(t.Context(), nil, newCfg(testLadder()), func(context.Context, jetstream.Msg) {}); err == nil ||
 		strings.Contains(err.Error(), "MaxTimeToDeadLetter") {
 		t.Fatalf("Start(bounded ladder) err = %v, want the schedule accepted", err)
 	}
@@ -1250,14 +1250,14 @@ func TestConfigRejectsConflictingFloorMonitors(t *testing.T) {
 		Retry:        r,
 		FloorMonitor: mustFloorMonitor(FloorMonitorConfig{}), // a different one
 	}
-	_, err := Start(t.Context(), nil, cfg, func(jetstream.Msg) {})
+	_, err := Start(t.Context(), nil, cfg, func(context.Context, jetstream.Msg) {})
 	if err == nil || !strings.Contains(err.Error(), "different") {
 		t.Fatalf("Start(two monitors) err = %v, want a conflict error", err)
 	}
 
 	// The same monitor on both is the normal wiring, not a conflict.
 	cfg.FloorMonitor = r.Monitor()
-	if _, err := Start(t.Context(), nil, cfg, func(jetstream.Msg) {}); err == nil ||
+	if _, err := Start(t.Context(), nil, cfg, func(context.Context, jetstream.Msg) {}); err == nil ||
 		strings.Contains(err.Error(), "different") {
 		t.Fatalf("Start(same monitor on both) err = %v, want it accepted (failing later on the nil conn)", err)
 	}
@@ -1284,7 +1284,7 @@ func TestConfigPairsTheServerLadderWithRetry(t *testing.T) {
 		BackOff:    testLadder(),
 		Retry:      r,
 	}
-	if err := cfg.validate(nil, func(jetstream.Msg) {}); err != nil && !strings.Contains(err.Error(), "nil nats conn") {
+	if err := cfg.validate(nil, func(context.Context, jetstream.Msg) {}); err != nil && !strings.Contains(err.Error(), "nil nats conn") {
 		t.Fatalf("validate(server ladder + Retry) = %v, want the pairing accepted", err)
 	}
 	// And the detector survives for configs the library cannot build.
@@ -1308,13 +1308,13 @@ func TestConfigValidatesAnOmittedLadder(t *testing.T) {
 		Stream: "repo_refs_v1", Durable: "d", Name: "c",
 		AckWait: time.Hour, MaxDeliver: 6, Retry: r, // no BackOff at all
 	}
-	err := cfg.validate(nil, func(jetstream.Msg) {})
+	err := cfg.validate(nil, func(context.Context, jetstream.Msg) {})
 	if err == nil || !strings.Contains(err.Error(), "MaxTimeToDeadLetter") {
 		t.Fatalf("validate(no BackOff, 1h AckWait) = %v, want the four-hour effective ladder rejected", err)
 	}
 	// Sized sensibly, the same shape is legitimate and must pass.
 	cfg.AckWait = 5 * time.Minute
-	if err := cfg.validate(nil, func(jetstream.Msg) {}); err != nil && !strings.Contains(err.Error(), "nil nats conn") {
+	if err := cfg.validate(nil, func(context.Context, jetstream.Msg) {}); err != nil && !strings.Contains(err.Error(), "nil nats conn") {
 		t.Fatalf("validate(no BackOff, 5m AckWait) = %v, want it accepted", err)
 	}
 }
@@ -1333,14 +1333,14 @@ func TestConfigRejectsRetryMaxDeliverMismatch(t *testing.T) {
 		BackOff:    testLadder(),
 		Retry:      r,
 	}
-	_, err := Start(t.Context(), nil, cfg, func(jetstream.Msg) {})
+	_, err := Start(t.Context(), nil, cfg, func(context.Context, jetstream.Msg) {})
 	if err == nil || !strings.Contains(err.Error(), "MaxDeliver") {
 		t.Fatalf("Start(mismatched MaxDeliver) err = %v, want a MaxDeliver mismatch error", err)
 	}
 
 	// The consumer's own default counts as its cap, not the raw zero field.
 	cfg.MaxDeliver = 0
-	if _, err := Start(t.Context(), nil, cfg, func(jetstream.Msg) {}); err == nil ||
+	if _, err := Start(t.Context(), nil, cfg, func(context.Context, jetstream.Msg) {}); err == nil ||
 		!strings.Contains(err.Error(), "consumer's is 8") {
 		t.Fatalf("Start(default MaxDeliver) err = %v, want it compared against EffectiveMaxDeliver", err)
 	}
@@ -1378,7 +1378,7 @@ func TestConfigRejectsUnworkableBackOff(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := Start(t.Context(), nil, tt.cfg, func(jetstream.Msg) {})
+			_, err := Start(t.Context(), nil, tt.cfg, func(context.Context, jetstream.Msg) {})
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("Start() err = %v, want error containing %q", err, tt.want)
 			}
@@ -1467,7 +1467,7 @@ func TestStartWritesTheConfiguredLadder(t *testing.T) {
 			Stream: "repo_refs_v1", Durable: "search_indexer_refs",
 			Name: "search-indexer-refs", AckWait: 5 * time.Minute,
 			MaxDeliver: 6, BackOff: backOff, Retry: r,
-		}, func(jetstream.Msg) {})
+		}, func(context.Context, jetstream.Msg) {})
 		if err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -1514,7 +1514,7 @@ func TestStartObservesTheAckFloor(t *testing.T) {
 		Name:       "search-indexer-refs",
 		MaxDeliver: 6,
 		Retry:      r,
-	}, func(m jetstream.Msg) {
+	}, func(_ context.Context, m jetstream.Msg) {
 		if err := m.Ack(); err != nil {
 			t.Errorf("ack: %v", err)
 		}
@@ -1592,7 +1592,7 @@ func TestRunJoinsThePollBeforeRecreating(t *testing.T) {
 		done <- Run(ctx, nc, Config{
 			Stream: "repo_refs_v1", Durable: "recreate_durable",
 			Name: "recreate", MaxDeliver: 6, Retry: r,
-		}, func(m jetstream.Msg) {
+		}, func(_ context.Context, m jetstream.Msg) {
 			if err := m.Ack(); err != nil {
 				t.Errorf("ack: %v", err)
 			}
@@ -1664,7 +1664,7 @@ func TestStartWithoutBreakerRunsNoPoll(t *testing.T) {
 		Name:       "no-breaker",
 		MaxDeliver: 6,
 		Retry:      r,
-	}, func(jetstream.Msg) {})
+	}, func(context.Context, jetstream.Msg) {})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -1706,7 +1706,7 @@ func TestSettleActuallyServesTheServerLadder(t *testing.T) {
 	run, err := Start(t.Context(), nc, Config{
 		Stream: "repo_refs_v1", Durable: "ladder", Name: "ladder",
 		AckWait: rung, MaxDeliver: 4, BackOff: ladder, Retry: r,
-	}, func(m jetstream.Msg) {
+	}, func(_ context.Context, m jetstream.Msg) {
 		mu.Lock()
 		at = append(at, time.Now())
 		n := len(at)
@@ -1759,7 +1759,7 @@ func TestSettleActuallyServesTheServerLadder(t *testing.T) {
 // is the module's own spelling of "unlimited" — it must not become a hard
 // startup failure because this package learned to check schedules.
 func TestValidateLeavesUntouchedConsumersAlone(t *testing.T) {
-	onMsg := func(jetstream.Msg) {}
+	onMsg := func(context.Context, jetstream.Msg) {}
 	base := Config{Stream: "s_v1", Durable: "d", Name: "legacy"}
 
 	for _, maxDeliver := range []int{-1, 0, 3} {
@@ -1796,7 +1796,7 @@ func TestMaxDeliverMismatchReportsItself(t *testing.T) {
 		Stream: "repo_refs_v1", Durable: "d", Name: "c",
 		AckWait: 5 * time.Minute, MaxDeliver: 7, BackOff: testLadder(), Retry: r,
 	}
-	err := cfg.validate(nil, func(jetstream.Msg) {})
+	err := cfg.validate(nil, func(context.Context, jetstream.Msg) {})
 	if err == nil || !strings.Contains(err.Error(), "they must match") {
 		t.Fatalf("validate(mismatch) = %v, want the specific cross-check message", err)
 	}
@@ -1823,11 +1823,11 @@ func TestStartChecksTheLadderAgainstStreamRetention(t *testing.T) {
 		AckWait: 5 * time.Minute, MaxDeliver: 6, BackOff: testLadder(), Retry: r,
 	}
 	// The schedule is coherent on its own — 20m to dead-letter, no bound set.
-	if err := cfg.validate(nc, func(jetstream.Msg) {}); err != nil {
+	if err := cfg.validate(nc, func(context.Context, jetstream.Msg) {}); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 	// Against a 10-minute stream it is not.
-	_, err := Start(t.Context(), nc, cfg, func(jetstream.Msg) {})
+	_, err := Start(t.Context(), nc, cfg, func(context.Context, jetstream.Msg) {})
 	if err == nil || !strings.Contains(err.Error(), "StreamMaxAge") {
 		t.Fatalf("Start = %v, want the ladder rejected against 10m retention", err)
 	}
@@ -1839,7 +1839,7 @@ func TestStartChecksTheLadderAgainstStreamRetention(t *testing.T) {
 		t.Fatalf("create stream: %v", err)
 	}
 	cfg.Stream = "long_v1"
-	run, err := Start(t.Context(), nc, cfg, func(jetstream.Msg) {})
+	run, err := Start(t.Context(), nc, cfg, func(context.Context, jetstream.Msg) {})
 	if err != nil {
 		t.Fatalf("Start(roomy retention): %v", err)
 	}
@@ -1913,7 +1913,7 @@ func TestStartFailsWhenTheStreamRetentionCannotBeRead(t *testing.T) {
 	// The schedule is coherent on its own: 20m to dead-letter, no bound declared.
 	// Only the stream's 10m retention makes it wrong, and that is what this
 	// credential cannot see.
-	if err := cfg.validate(restricted, func(jetstream.Msg) {}); err != nil {
+	if err := cfg.validate(restricted, func(context.Context, jetstream.Msg) {}); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 
@@ -1923,7 +1923,7 @@ func TestStartFailsWhenTheStreamRetentionCannotBeRead(t *testing.T) {
 	// by the probe, leaving CreateOrUpdateConsumer to fail on an expired context
 	// instead. Start would then return an error under the OLD behaviour too, and the
 	// test would pass while proving nothing.
-	_, startErr := Start(t.Context(), restricted, cfg, func(jetstream.Msg) {})
+	_, startErr := Start(t.Context(), restricted, cfg, func(context.Context, jetstream.Msg) {})
 	if startErr == nil {
 		t.Fatal("Start succeeded without being able to read the stream's retention; " +
 			"an unchecked ladder is how the message expires before capture")
@@ -1952,7 +1952,7 @@ func TestStartRidesOutAStreamThatDoesNotExistYet(t *testing.T) {
 		Stream: "not_provisioned_yet", Durable: "d", Name: "c",
 		AckWait: 5 * time.Minute, MaxDeliver: 6, BackOff: testLadder(), Retry: r,
 	}
-	_, err := Start(t.Context(), nc, cfg, func(jetstream.Msg) {})
+	_, err := Start(t.Context(), nc, cfg, func(context.Context, jetstream.Msg) {})
 	if err == nil {
 		t.Fatal("Start succeeded against a stream that does not exist")
 	}
@@ -2001,5 +2001,128 @@ func TestFinalAckFailureIsUncertainNotStranded(t *testing.T) {
 	}
 	if s2.Outcome != OutcomeStranded || s2.Captured {
 		t.Errorf("Settlement = %+v, want stranded with nothing captured", s2)
+	}
+}
+
+// TestSettleDefersOnCancelledContextWithDeliveriesLeft pins the Retry half of
+// COR-2224: a failure reported on a cancelled context is a shutdown, not
+// poison. On the exhaustion delivery — where CaptureReserve still leaves the
+// broker deliveries to serve — the message is left on the ladder for another
+// pod rather than dead-lettered, and the Settlement says why.
+func TestSettleDefersOnCancelledContextWithDeliveriesLeft(t *testing.T) {
+	r, pub := newTestRetry(t, func(c *RetryConfig) { c.Monitor, c.Breaker = nil, BreakerObserve })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	msg := deliveredMsg(2774437, exhaustedDelivery)
+
+	s, err := r.Settle(ctx, msg, "session name failed: context canceled")
+	if err != nil {
+		t.Fatalf("Settle: %v", err)
+	}
+	if s.Outcome != OutcomeRetried || s.Cause != CauseShutdown {
+		t.Fatalf("Settlement = %+v, want retried/shutdown", s)
+	}
+	if msg.Acked || msg.Termed || msg.Naks != 0 || len(msg.NakDelays) != 0 {
+		t.Errorf("message acked=%v termed=%v naks=%d/%d; want it left untouched for the ladder",
+			msg.Acked, msg.Termed, msg.Naks, len(msg.NakDelays))
+	}
+	if n := len(pub.captured()); n != 0 {
+		t.Errorf("captured %d messages on a cancelled context, want 0", n)
+	}
+}
+
+// TestSettleBreakerSkippedOnInterruptedDelivery: an interrupted delivery is
+// not evidence about the message, so the breaker is not evaluated on it — no
+// trip, no quarantine budget spent, no failure clock started. The very next
+// settlement on a live context then trips exactly as it would have, which is
+// what a spent budget would have prevented for a whole stall window.
+func TestSettleBreakerSkippedOnInterruptedDelivery(t *testing.T) {
+	r, pub := newTestRetry(t, nil)
+	armFloor(r, 2774436, 20*time.Minute)
+	armFailing(r, 2774437, 20*time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	msg := deliveredMsg(2774437, breakerDelivery)
+
+	s, err := r.Settle(ctx, msg, "re-queuing: update")
+	if err != nil {
+		t.Fatalf("Settle: %v", err)
+	}
+	if s.Outcome != OutcomeRetried || s.Cause != "" || s.BreakerTripped {
+		t.Fatalf("Settlement = %+v, want a plain ladder retry with no trip", s)
+	}
+	if msg.Acked || len(pub.captured()) != 0 {
+		t.Fatal("breaker dead-lettered on an interrupted delivery")
+	}
+	if r.haveQuarantined {
+		t.Fatal("quarantine budget spent on an interrupted delivery")
+	}
+
+	live := deliveredMsg(2774437, breakerDelivery)
+	s, err = r.Settle(context.Background(), live, "re-queuing: update")
+	if err != nil {
+		t.Fatalf("Settle(live): %v", err)
+	}
+	if s.Outcome != OutcomeDeadLettered || s.Cause != CauseFloorAge {
+		t.Fatalf("Settlement after the interrupted one = %+v, want dead_lettered/floor_age", s)
+	}
+}
+
+// TestSettleDeadlineIsNotAnInterruption: a context that ran out of time is a
+// failed attempt — slow poison — and settles exactly as a live one would.
+func TestSettleDeadlineIsNotAnInterruption(t *testing.T) {
+	r, pub := newTestRetry(t, func(c *RetryConfig) { c.Monitor, c.Breaker = nil, BreakerObserve })
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	msg := deliveredMsg(2774437, exhaustedDelivery)
+
+	s, err := r.Settle(ctx, msg, "bedrock call timed out")
+	if err != nil {
+		t.Fatalf("Settle: %v", err)
+	}
+	if s.Outcome != OutcomeDeadLettered || s.Cause != CauseExhausted || len(pub.captured()) != 1 {
+		t.Fatalf("Settlement = %+v (captured %d), want dead_lettered/max_deliver", s, len(pub.captured()))
+	}
+}
+
+// TestDeadLetterIgnoresInterruption pins the asymmetry with Settle: a
+// caller-declared permanent failure is a verdict the handler reached, not an
+// inference from a failed attempt, so an interrupted context does not defer
+// it — the capture runs detached (COR-1487) and the message is acked.
+func TestDeadLetterIgnoresInterruption(t *testing.T) {
+	r, pub := newTestRetry(t, func(c *RetryConfig) { c.Monitor, c.Breaker = nil, BreakerObserve })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	msg := deliveredMsg(2774437, 1)
+
+	s, err := r.DeadLetter(ctx, msg, "unknown schema version")
+	if err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+	if s.Outcome != OutcomeDeadLettered || s.Cause != CausePermanent || !msg.Acked || len(pub.captured()) != 1 {
+		t.Fatalf("Settlement = %+v acked=%v captured=%d, want dead_lettered/permanent", s, msg.Acked, len(pub.captured()))
+	}
+}
+
+// TestSettleDeadLettersOnCancelledContextAtBrokerCap: at the broker's own cap
+// nothing redelivers, so deferring would strand the message. The non-lossy
+// capture still runs (it is detached from the cancellation, COR-1487) and the
+// message is dead-lettered as exhausted — a replayable DLQ copy beats a
+// pinned floor.
+func TestSettleDeadLettersOnCancelledContextAtBrokerCap(t *testing.T) {
+	r, pub := newTestRetry(t, func(c *RetryConfig) { c.Monitor, c.Breaker = nil, BreakerObserve })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	msg := deliveredMsg(2774437, r.MaxDeliver())
+
+	s, err := r.Settle(ctx, msg, "session name failed: context canceled")
+	if err != nil {
+		t.Fatalf("Settle: %v", err)
+	}
+	if s.Outcome != OutcomeDeadLettered || s.Cause != CauseExhausted {
+		t.Fatalf("Settlement = %+v, want dead_lettered/max_deliver", s)
+	}
+	if !msg.Acked || len(pub.captured()) != 1 {
+		t.Errorf("acked=%v captured=%d, want the capture-then-ack to run on the final delivery", msg.Acked, len(pub.captured()))
 	}
 }
