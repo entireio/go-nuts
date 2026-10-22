@@ -124,7 +124,10 @@ const (
 	OutcomeUncertain Outcome = "uncertain"
 )
 
-// Cause explains an [OutcomeDeadLettered] settlement; it is empty on a retry.
+// Cause explains an [OutcomeDeadLettered] settlement. On an [OutcomeRetried]
+// it is empty, except where the retry was reached from a terminal branch that
+// could not or should not complete — a failed capture keeps that branch's
+// Cause, and a shutdown reports [CauseShutdown].
 type Cause string
 
 const (
@@ -137,6 +140,15 @@ const (
 	// CausePermanent is a caller-declared unprocessable message, dead-lettered
 	// by [Retry.DeadLetter] without consuming the ladder.
 	CausePermanent Cause = "permanent"
+	// CauseShutdown marks a retry that would otherwise have been the
+	// exhaustion branch: the handler's context was cancelled
+	// ([backoff.IsInterrupted]) when it settled, so the failure is read as an
+	// interrupted delivery, not poison, and the message is left on the ladder
+	// for a surviving replica (COR-2224). Reported with [OutcomeRetried], and
+	// only while the broker still has deliveries to serve — at its own cap the
+	// terminal branch runs regardless, since deferring there would strand the
+	// message.
+	CauseShutdown Cause = "shutdown"
 )
 
 // Settlement reports what [Retry.Settle] chose and the state it chose it
@@ -964,15 +976,32 @@ func (r *Retry) spendQuarantineBudgetLocked(floor uint64, window time.Duration, 
 func (r *Retry) Settle(ctx context.Context, msg jetstream.Msg, reason string) (Settlement, error) {
 	delivered := backoff.NumDelivered(msg)
 	now := r.clock()
+	// An interrupted delivery (the handler's context was cancelled, COR-2224)
+	// is not evidence about the message, so while the broker still has
+	// deliveries to serve it feeds none of the message-local judgement: no
+	// failure clock, no breaker evaluation, no quarantine budget spent — the
+	// next delivery, on a live replica, evaluates all of that against a real
+	// attempt. At the broker's own cap the ordinary path runs, because
+	// deferring there would strand the message; see terminate.
+	interrupted := backoff.IsInterrupted(ctx) && !r.brokerCapReached(delivered)
 	// With no stall signal there is no breaker, so none of its bookkeeping
 	// runs: no failure clocks, no map, no quarantine budget. A consumer on
 	// the bounded-ladder configuration pays nothing for a mechanism it has
 	// not opted into.
-	var failingFor time.Duration
-	if r.monitor != nil {
+	var (
+		failingFor time.Duration
+		quarantine bool
+		floor      uint64
+		age        time.Duration
+	)
+	switch {
+	case r.monitor == nil:
+	case interrupted:
+		floor, age, _ = r.monitor.FloorStall()
+	default:
 		failingFor = r.noteFailure(streamSeq(msg), now)
+		quarantine, floor, age = r.shouldQuarantine(msg, delivered, failingFor, now)
 	}
-	quarantine, floor, age := r.shouldQuarantine(msg, delivered, failingFor, now)
 
 	s := Settlement{
 		Delivered:      delivered,
@@ -1002,7 +1031,31 @@ func (r *Retry) Settle(ctx context.Context, msg jetstream.Msg, reason string) (S
 	default:
 		return r.awaitRedelivery(ctx, msg, s), nil
 	}
+	// Exhaustion reached on an interrupted delivery is a shutdown landing on
+	// this delivery, not the ladder running out on a real attempt. While the
+	// broker still has deliveries to serve, leave it on the ladder — the
+	// CaptureReserve deliveries exist for exactly this kind of retry. At the
+	// broker's own cap (interrupted is false there) nothing redelivers, so
+	// the non-lossy capture below runs anyway (it is detached from the
+	// cancellation, see terminate): a replayable DLQ copy beats a message
+	// stranded on purpose.
+	if interrupted {
+		logger, name := r.log()
+		logger.InfoContext(ctx, name+": settlement deferred; delivery interrupted on the ladder's last rung, leaving it for redelivery",
+			slog.String("reason", reason),
+			slog.Int("delivered", delivered))
+		s.Cause = CauseShutdown
+		return r.awaitRedelivery(ctx, msg, s), nil
+	}
 	return r.terminate(ctx, msg, s, reason)
+}
+
+// brokerCapReached reports whether the broker will serve no further delivery
+// of this message: NumDelivered has reached the consumer's MaxDeliver. Missing
+// metadata (0) reads as deliveries remaining, the same safe default as
+// ladderSpent and backoff.IsFinalDelivery.
+func (r *Retry) brokerCapReached(delivered int) bool {
+	return delivered > 0 && delivered >= r.cfg.MaxDeliver
 }
 
 // terminate runs the capture-then-settle sequence shared by [Settle]'s two
@@ -1010,7 +1063,7 @@ func (r *Retry) Settle(ctx context.Context, msg jetstream.Msg, reason string) (S
 // fall short. s must already carry its Cause.
 func (r *Retry) terminate(ctx context.Context, msg jetstream.Msg, s Settlement, reason string) (Settlement, error) {
 	logger, name := r.log()
-	spent := s.Delivered > 0 && s.Delivered >= r.cfg.MaxDeliver
+	spent := r.brokerCapReached(s.Delivered)
 
 	// Capture and settle on a context that shutdown cannot cancel. The module's
 	// shutdown ordering cancels the loops' context, joins them, and only THEN

@@ -7,6 +7,31 @@
 // drains the connections — the ordering that keeps a Drain from racing an
 // in-flight Fetch (COR-923).
 //
+// # Shutdown ordering
+//
+// A process built on this module shuts down in one fixed order, and each
+// piece owns one step of it:
+//
+//  1. the signal context is cancelled (SIGTERM, or a tracked loop failing);
+//  2. every jsconsumer loop stops pulling new deliveries;
+//  3. in-flight handlers keep running on a context that survives the cancel,
+//     for up to jsconsumer.Config.DrainWindow (default 10s);
+//  4. handlers still running when the window elapses have their context
+//     cancelled, and the expiry is logged;
+//  5. the loops return once their handlers have, and [ShutdownGroup] joins
+//     them (bounded by [DefaultJoinTimeout], which must exceed the window);
+//  6. only then are the connections drained with [Drain], so no Ack, Nak or
+//     dead-letter capture is written to a draining connection.
+//
+// Steps 2–4 are COR-2224: before it, step 1 cancelled every handler at once,
+// so "waiting for the in-flight handler" waited for a context.Canceled failure
+// and a final delivery landing on a rollout was Termed or dead-lettered as
+// poison. The dispositions agree with the drain: backoff.Policy.NakOrTerm and
+// jsconsumer.Retry.Settle treat a CANCELLED context (backoff.IsInterrupted —
+// a deadline is a failed attempt, not an interruption) as a shutdown rather
+// than a verdict on the message, and leave it for another replica wherever
+// the broker still has deliveries to serve.
+//
 // This root package is the connection-lifecycle core extracted from
 // entire-core (entiredb), entire-api, and mirror-pipeline, which had each
 // grown their own copy of this plumbing (COR-925). It depends only on nats.go.

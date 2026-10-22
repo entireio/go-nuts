@@ -13,6 +13,14 @@
 // message's terminal disposition (Ack/Nak/Term); Process never touches a
 // message that decoded.
 //
+// The scaffold also owns the handler's context, and with it the shape of a
+// graceful shutdown (COR-2224): cancelling the consumer's context stops the
+// pull loop but leaves an in-flight handler running on a context that
+// survives the cancellation for a bounded drain window (Config.DrainWindow),
+// so a rollout or scale-down lets the work finish instead of failing it with
+// context.Canceled and — on a final delivery — discarding it as poison. See
+// [Start] for the sequence and [Runner.Stop] for its steps.
+//
 // The one exception to "disposition stays with the handler" is [Retry], the
 // scaffold's optional single retry mechanism: the redelivery ladder and the
 // dead-letter capture it terminates into (ENT-1535). A handler that
@@ -45,6 +53,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -65,6 +74,16 @@ const (
 	// DefaultMaxDeliver caps redelivery before JetStream stops redelivering a
 	// message when Config.MaxDeliver is zero.
 	DefaultMaxDeliver = 8
+	// DefaultDrainWindow is how long an in-flight handler may keep running
+	// after the consumer's context is cancelled, when Config.DrainWindow is
+	// zero. Sized to fit under Kubernetes' default 30s termination grace with
+	// the connection drain and telemetry flush that follow it, and under
+	// [nuts.DefaultJoinTimeout] so a [nuts.ShutdownGroup] on defaults joins
+	// the window itself; what a handler does AFTER its context is cancelled
+	// (a detached dead-letter capture, say) is outside both budgets.
+	// Deployments with a longer grace raise it explicitly — and raise the join
+	// timeout with it.
+	DefaultDrainWindow = 10 * time.Second
 )
 
 // Config describes the durable consumer to create and how to trace/log it. The
@@ -197,6 +216,39 @@ type Config struct {
 	// KeepInProgress forces it to 1; setting both to conflicting values is a
 	// Start error.
 	MaxMessages int
+
+	// DrainWindow bounds how long an in-flight handler keeps running after
+	// the context given to [Start] or [Run] is cancelled, before the handler's
+	// own context is cancelled too. Zero means [DefaultDrainWindow]; negative
+	// is a Start error. See [Start] for the shutdown sequence it governs.
+	//
+	// Size it to the handler's longest honest run, under the process's
+	// termination budget: the pod's grace period less the connection drain
+	// and telemetry flush that follow it. A window the handler never fills
+	// costs nothing — shutdown proceeds the moment the handler returns; one it
+	// regularly overruns is logged at Warn on expiry, which is the signal to
+	// re-size by. A [nuts.ShutdownGroup] joining this consumer needs a join
+	// timeout longer than the window (nuts.WithJoinTimeout), or a handler that
+	// uses the whole window is reported as a join timeout.
+	//
+	// A window longer than AckWait buys nothing without KeepInProgress: once
+	// AckWait expires the broker redelivers the in-flight message to another
+	// replica whatever this one is still doing with it, so the useful window
+	// is bounded by the delivery's own lease.
+	//
+	// Each Runner drains its own handler for its own window. A process with
+	// several consumers must Stop them concurrently (a [nuts.ShutdownGroup]
+	// does), not one after another, or its shutdown is the SUM of the windows.
+	DrainWindow time.Duration
+}
+
+// EffectiveDrainWindow is the drain window actually applied: Config.DrainWindow,
+// or DefaultDrainWindow when zero.
+func (c Config) EffectiveDrainWindow() time.Duration {
+	if c.DrainWindow == 0 {
+		return DefaultDrainWindow
+	}
+	return c.DrainWindow
 }
 
 // EffectiveAckWait is the AckWait actually applied to the JetStream consumer:
@@ -228,7 +280,7 @@ func (c Config) EffectiveMaxDeliver() int {
 // validate rejects the configuration errors no retry can fix; shared by
 // [Start] (one-shot) and [Run] (supervised, which must fail fast on these
 // rather than retry them forever).
-func (c Config) validate(nc *nats.Conn, onMsg func(jetstream.Msg)) error {
+func (c Config) validate(nc *nats.Conn, onMsg func(context.Context, jetstream.Msg)) error {
 	if c.KeepInProgress && c.MaxMessages > 1 {
 		return fmt.Errorf("jsconsumer(%s): KeepInProgress requires MaxMessages <= 1: the heartbeat extends only the in-flight delivery, so %d buffered messages would exhaust AckWait behind a long handler", c.Name, c.MaxMessages)
 	}
@@ -266,6 +318,9 @@ func (c Config) validate(nc *nats.Conn, onMsg func(jetstream.Msg)) error {
 	}
 	if c.InactiveThreshold < 0 {
 		return fmt.Errorf("jsconsumer(%s): InactiveThreshold must not be negative", c.Name)
+	}
+	if c.DrainWindow < 0 {
+		return fmt.Errorf("jsconsumer(%s): DrainWindow must not be negative (0 means DefaultDrainWindow)", c.Name)
 	}
 	if c.FloorMonitor != nil && c.Retry != nil && c.Retry.Monitor() != nil && c.FloorMonitor != c.Retry.Monitor() {
 		return fmt.Errorf("jsconsumer(%s): %w", c.Name, errMonitorConflict)
@@ -403,9 +458,20 @@ func isShutdownConsumeErr(ctx context.Context, err error) bool {
 		(ctx.Err() != nil && errors.Is(err, jetstream.ErrConnectionClosed))
 }
 
-// Runner is a live consume loop. Stop halts it and is idempotent.
+// Runner is a live consume loop. Stop drains it and is idempotent.
 type Runner struct {
 	cc jetstream.ConsumeContext
+	// handlerCtx is the context every onMsg call receives: the parent's
+	// values without its cancellation, cancelled by Stop once the loop has
+	// wound down or the drain window has elapsed, whichever comes first.
+	handlerCtx     context.Context
+	cancelHandlers context.CancelFunc
+	drainWindow    time.Duration
+	logger         *slog.Logger
+	name           string
+	// inFlight is set for the duration of an onMsg call, so the drain-window
+	// expiry is logged only when there was a handler to cancel.
+	inFlight atomic.Bool
 	// closed is cc.Closed(), captured while the subscription is live (the
 	// same channel is returned on every call, so capturing once avoids any
 	// post-Stop race) — it closes when the consume loop has fully wound
@@ -422,34 +488,110 @@ type Runner struct {
 	stop     sync.Once
 }
 
-// Stop halts the consume loop and blocks until it has fully wound down —
-// including an in-flight handler — so a caller may tear down what handlers
-// use (stores, publishers, the NATS connection) the moment it returns: the
-// cancel → join → drain shutdown ordering (COR-923). Safe on a nil or
-// never-Started Runner, idempotent, and safe for concurrent use — an
-// explicit Stop can race the context-cancel stop armed by Start. Must not be
-// called from inside the handler; it would deadlock waiting on itself.
+// Stop drains the consume loop and blocks until it has fully wound down, so a
+// caller may tear down what handlers use (stores, publishers, the NATS
+// connection) the moment it returns: the stop-pulling → drain → cancel → join
+// → drain-connection ordering (COR-923, COR-2224). In order:
+//
+//  1. no further deliveries are dispatched (buffered ones are dropped
+//     client-side and redeliver on AckWait to a surviving replica);
+//  2. an in-flight handler keeps running on its still-live context for up to
+//     Config.DrainWindow;
+//  3. if it is still running when the window elapses, its context is
+//     cancelled and the expiry logged at Warn;
+//  4. Stop then waits for the handler to return — a handler that ignores its
+//     context is waited on indefinitely, as before — and cancels the handler
+//     context regardless, releasing anything forked on it.
+//
+// Safe on a nil or never-Started Runner, idempotent, and safe for concurrent
+// use — an explicit Stop can race the context-cancel stop armed by Start, and
+// every caller returns once the loop is down. Must not be called from inside
+// the handler; it would deadlock waiting on itself.
 func (r *Runner) Stop() {
 	if r == nil || r.cc == nil {
 		return
 	}
-	r.stop.Do(r.cc.Stop)
+	r.stop.Do(func() {
+		r.cc.Stop()
+		if windowElapsed(r.closed, r.drainWindow) {
+			// Only a handler can hold the loop open past the window on a
+			// healthy connection; the other way (a connection drained
+			// underneath us, against the documented ordering) has nothing to
+			// cancel and is not this log line's story. Logged on the handler
+			// context while it is still live, so the line carries whatever
+			// the parent put on it.
+			if r.inFlight.Load() {
+				r.logger.WarnContext(r.handlerCtx, r.name+": drain window elapsed; cancelling in-flight handler",
+					slog.Duration("drain_window", r.drainWindow))
+			}
+			r.cancelHandlers()
+		}
+		<-r.closed
+		r.cancelHandlers()
+	})
 	<-r.closed
 	if r.pollDone != nil {
 		<-r.pollDone
 	}
 }
 
+// windowElapsed waits for done or the window and reports whether the window
+// won. When both are ready together it prefers done: a handler that returned
+// inside the window must not be cancelled or reported for it.
+func windowElapsed(done <-chan struct{}, window time.Duration) bool {
+	timer := time.NewTimer(window)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return false
+	case <-timer.C:
+		select {
+		case <-done:
+			return false
+		default:
+			return true
+		}
+	}
+}
+
 // Start creates/updates the durable consumer on nc and begins delivering
-// messages to onMsg, returning a Runner that Stops when ctx is cancelled. The
-// stream must already exist (provisioned declaratively); callers whose cells
-// opt in per-stream gate Start behind that opt-in so a cell without the stream
-// doesn't error at CreateOrUpdateConsumer.
+// messages to onMsg, returning a Runner that drains and Stops when ctx is
+// cancelled. The stream must already exist (provisioned declaratively);
+// callers whose cells opt in per-stream gate Start behind that opt-in so a
+// cell without the stream doesn't error at CreateOrUpdateConsumer.
+//
+// # The handler context
+//
+// onMsg receives a context derived from ctx by [context.WithoutCancel] — the
+// same values (trace baggage, loggers), none of the cancellation. Cancelling
+// ctx stops the pull loop; it does not fail the handler. The handler's context
+// is cancelled only when the loop has wound down or Config.DrainWindow has
+// elapsed with the handler still running, in that order of preference (see
+// [Runner.Stop]). Before this (COR-2224) every consumer closed over the
+// process signal context, so a SIGTERM failed every in-flight handler with
+// context.Canceled in the same instant, and "waiting for the in-flight
+// handler" meant waiting for that fast failure; on a final delivery the
+// failure then read as poison and the message was Termed or dead-lettered.
+//
+// Two obligations follow for the handler. It must USE the context it is
+// given — a callback of the shape func(_ context.Context, m) { handle(ctx, m) }
+// with the captured process context compiles and keeps the old
+// cancel-everything behaviour exactly; migrate by replacing that captured
+// context with the one passed in. And it must HONOUR it, since it is what
+// bounds shutdown once the window is spent. Pass it (or a context derived
+// from it) to the disposition too: [backoff.IsInterrupted] is how NakOrTerm
+// and [Retry.Settle] tell a drain from a failed attempt.
+//
+// The whole shutdown sequence for a process built on this package is
+// therefore: cancel the consumers' context → each loop stops pulling → in-flight
+// handlers finish inside their drain window → handler contexts are cancelled →
+// Stop/Run return → [nuts.Drain] the connections. [nuts.ShutdownGroup] runs
+// exactly that, provided its join timeout exceeds the longest drain window.
 //
 // Consume errors are logged at Warn, except a drain/close during shutdown —
 // both the core nats.go sentinels ([nuts.IsShutdownFetchErr]) and jetstream's
 // own connection-closed error — which is a clean exit rather than a fault.
-func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.Msg)) (*Runner, error) {
+func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(context.Context, jetstream.Msg)) (*Runner, error) {
 	if err := cfg.validate(nc, onMsg); err != nil {
 		return nil, err
 	}
@@ -490,12 +632,27 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 	case cfg.MaxMessages > 0:
 		consumeOpts = append(consumeOpts, jetstream.PullMaxMessages(cfg.MaxMessages))
 	}
-	cc, err := cons.Consume(onMsg, consumeOpts...)
+	// Detached from ctx's cancellation, not from its values; cancelled by
+	// Stop (window expiry or wind-down), never by the parent directly.
+	handlerCtx, cancelHandlers := context.WithCancel(context.WithoutCancel(ctx))
+	r := &Runner{
+		handlerCtx:     handlerCtx,
+		cancelHandlers: cancelHandlers,
+		drainWindow:    cfg.EffectiveDrainWindow(),
+		logger:         cfg.logger(),
+		name:           cfg.Name,
+	}
+	cc, err := cons.Consume(func(m jetstream.Msg) {
+		r.inFlight.Store(true)
+		defer r.inFlight.Store(false)
+		onMsg(handlerCtx, m)
+	}, consumeOpts...)
 	if err != nil {
+		cancelHandlers()
 		return nil, fmt.Errorf("jsconsumer(%s): consume %s: %w", cfg.Name, cfg.Stream, err)
 	}
 	watcherDone := make(chan struct{})
-	r := &Runner{cc: cc, closed: cc.Closed(), watcherDone: watcherDone}
+	r.cc, r.closed, r.watcherDone = cc, cc.Closed(), watcherDone
 	if cfg.Retry != nil {
 		cfg.Retry.attach(cfg.Name, cfg.logger())
 	}
@@ -505,16 +662,24 @@ func Start(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.
 		r.pollDone = pollDone
 		go func() {
 			defer close(pollDone)
-			mon.pollFloor(ctx, r.closed)
+			// On the handler context, not ctx: the floor reading has to stay
+			// fresh for a Settle inside the drain window, and the poll already
+			// stops on r.closed, so nothing outlives the loop.
+			mon.pollFloor(handlerCtx, r.closed)
 		}()
 	}
 	go func() {
 		defer close(watcherDone)
 		select {
 		case <-ctx.Done():
-			r.Stop()
 		case <-r.closed:
+			// The loop closed on its own (consumer deleted on the server,
+			// subscription invalidated). Nothing is in flight, but the
+			// detached handler context is still live, and the parent's
+			// cancellation can no longer reach it — Stop releases it, and
+			// returns at once here because the loop is already down.
 		}
+		r.Stop()
 	}()
 	return r, nil
 }
@@ -572,10 +737,11 @@ var (
 // the max). In particular a stream that is not provisioned yet at boot — the
 // declarative-provisioning race — is a retry, not a crash.
 //
-// Run blocks until ctx is cancelled, then joins the live loop (including an
-// in-flight handler, see [Runner.Stop]) before returning, so it composes with
-// the cancel → join → drain shutdown ordering as the body of a supervised
-// goroutine:
+// Run blocks until ctx is cancelled, then drains the live loop — an in-flight
+// handler finishes inside Config.DrainWindow before its context is cancelled,
+// see [Runner.Stop] — and returns only once it has, so it composes with the
+// cancel → drain → join → drain-connection shutdown ordering as the body of a
+// supervised goroutine:
 //
 //	g.Go(func(ctx context.Context) {
 //		if err := jsconsumer.Run(ctx, nc, cfg, onMsg); err != nil {
@@ -588,7 +754,7 @@ var (
 // are returned immediately. A missing declarative stream, temporary transport
 // failure, or unknown server-side 5xx response remains supervised. A nil return
 // means a clean, ctx-driven exit.
-func Run(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(jetstream.Msg)) error {
+func Run(ctx context.Context, nc *nats.Conn, cfg Config, onMsg func(context.Context, jetstream.Msg)) error {
 	if err := cfg.validate(nc, onMsg); err != nil {
 		return err
 	}

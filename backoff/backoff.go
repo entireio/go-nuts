@@ -35,15 +35,35 @@
 // retry backstop) leave TermOnExhaustion off and keep the plain Nak.
 //
 // Dead-letter capture stays with the caller, which should capture BEFORE
-// disposing — gate it on [IsFinalDelivery]:
+// disposing — gate it on [IsFinalDelivery] AND on the delivery not having been
+// interrupted, so the gate agrees with the disposition that follows it:
 //
-//	if backoff.IsFinalDelivery(msg, p.MaxDeliver) {
+//	if !backoff.IsInterrupted(ctx) && backoff.IsFinalDelivery(msg, p.MaxDeliver) {
 //		captureToDLQ(ctx, msg)
 //	}
-//	outcome, err := p.NakOrTerm(msg)
+//	outcome, err := p.NakOrTerm(ctx, msg)
+//
+// # An interrupted delivery is a shutdown, not poison
+//
+// A handler whose context was CANCELLED did not fail on the message; it was
+// interrupted — SIGTERM, a rollout, a KEDA scale-down (COR-2224). NakOrTerm
+// therefore never Terms on an interrupted delivery, final or not: the message
+// is Naked and left for another replica. On the broker's FINAL delivery that
+// Nak is dropped (MaxDeliver is spent) and the message stays un-acked — the
+// orphan state TermOnExhaustion otherwise avoids, chosen here on purpose
+// because an un-acked message is visible (pinned ack floor, pending gauge)
+// and reapable by a MAX_DELIVERIES sweeper, where a Term is a silent loss.
+// The drain window jsconsumer gives handlers is what keeps this branch rare;
+// this check only decides what happens when the window is not enough.
+//
+// "Interrupted" is [IsInterrupted]: cancellation, never a deadline. A
+// per-attempt timeout a handler puts on its own context is a failed attempt —
+// slow poison is exactly what TermOnExhaustion exists for — and still Terms.
 package backoff
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -106,9 +126,17 @@ type Policy struct {
 
 // NakOrTerm applies the policy to a transiently-failed [jetstream.Msg]
 // delivery: NakWithDelay (see [Policy.DelayFor]) for redelivery, or — on the
-// final delivery with TermOnExhaustion set — Term. Without TermOnExhaustion the
-// final delivery still Naks; the broker drops the Nak at MaxDeliver and the
-// stream's retention decides the message's fate.
+// final delivery with TermOnExhaustion set and ctx still live — Term. Without
+// TermOnExhaustion the final delivery still Naks; the broker drops the Nak at
+// MaxDeliver and the stream's retention decides the message's fate.
+//
+// ctx is the handler's context, and a CANCELLED one ([IsInterrupted]) changes
+// the final-delivery branch: the failure is read as a shutdown rather than
+// poison, and the message is Naked instead of Termed so it is not discarded
+// for having been interrupted (COR-2224). A context that merely timed out
+// still Terms. See the package doc for what the Nak leaves on the stream. ctx
+// is consulted for nothing else — the Nak and Term requests are not bounded
+// by it.
 //
 // The returned Outcome reports which disposition was ATTEMPTED, for the caller's
 // metrics and logs. It is not evidence that the broker accepted it, and neither is
@@ -129,8 +157,8 @@ type Policy struct {
 // write the request — and is worth a log line but nothing more: a failed Nak
 // redelivers via AckWait expiry anyway, and a failed Term on a work-queue stream
 // means the message lingers exactly as it would have without the policy.
-func (p Policy) NakOrTerm(msg jetstream.Msg) (Outcome, error) {
-	if p.TermOnExhaustion && IsFinalDelivery(msg, p.MaxDeliver) {
+func (p Policy) NakOrTerm(ctx context.Context, msg jetstream.Msg) (Outcome, error) {
+	if !IsInterrupted(ctx) && p.TermOnExhaustion && IsFinalDelivery(msg, p.MaxDeliver) {
 		if err := msg.Term(); err != nil {
 			return OutcomeTerm, fmt.Errorf("term on final delivery: %w", err)
 		}
@@ -140,6 +168,27 @@ func (p Policy) NakOrTerm(msg jetstream.Msg) (Outcome, error) {
 		return OutcomeNak, fmt.Errorf("nak with delay: %w", err)
 	}
 	return OutcomeNak, nil
+}
+
+// IsInterrupted reports whether a delivery's handler was cut short by a
+// cancellation rather than finishing or timing out: ctx is done with
+// [context.Canceled]. That is the shape of a shutdown — the process signal
+// context, a [nuts.ShutdownGroup], or jsconsumer's drain window elapsing — and
+// the policy reads it as "this delivery was interrupted", not "this message
+// failed". [context.DeadlineExceeded] is deliberately NOT interrupted: a
+// deadline is something the handler (or an RPC under it) put on its own
+// attempt, and an attempt that ran out of time is a failed attempt.
+//
+// The distinction only holds if the handler passes the context it was GIVEN,
+// or one derived from it, to the disposition: a context the handler cancelled
+// itself would read as a shutdown too. Use it to gate anything that should
+// not happen to an interrupted delivery — a dead-letter capture, an
+// error-level "poison" log — so those decisions agree with [Policy.NakOrTerm]
+// and jsconsumer.Retry.Settle, which apply the same rule.
+//
+// [nuts.ShutdownGroup]: https://pkg.go.dev/github.com/entireio/go-nuts#ShutdownGroup
+func IsInterrupted(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.Canceled)
 }
 
 // DelayFor reports the redelivery delay the policy applies after delivery
@@ -194,7 +243,10 @@ func NumDelivered(msg jetstream.Msg) int {
 
 // IsFinalDelivery reports whether this is the last delivery before JetStream
 // stops redelivering (NumDelivered has reached MaxDeliver), so a transient
-// failure here is terminal rather than another Nak-and-retry. A non-positive
+// failure here is terminal rather than another Nak-and-retry. It reads the
+// delivery count only: a caller gating a dead-letter capture on it should also
+// check [IsInterrupted], since [Policy.NakOrTerm] will not Term on an
+// interrupted delivery and the capture would then precede a Nak, not a Term. A non-positive
 // maxDeliver means unlimited redeliveries (the jetstream.ConsumerConfig
 // semantics), so no delivery is final — without the guard the zero value
 // would read every delivery as final and Term on the first failure.

@@ -1,6 +1,7 @@
 package brokersemantics
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -30,6 +31,7 @@ func TestTermOnExhaustionFiresOnTheBrokersFinalDelivery(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
 		termOnExhaustion bool
+		cancelled        bool // the FINAL delivery's handler ctx is cancelled (a shutdown landing on it)
 		wantOutcome      backoff.Outcome
 		wantFloor        uint64
 		wantMsgsInStream uint64
@@ -44,6 +46,21 @@ func TestTermOnExhaustionFiresOnTheBrokersFinalDelivery(t *testing.T) {
 		{
 			name:             "without it the final Nak is dropped and the message orphans",
 			termOnExhaustion: false,
+			wantOutcome:      backoff.OutcomeNak,
+			wantFloor:        0,
+			wantMsgsInStream: 1,
+		},
+		{
+			// COR-2224: a cancelled context on the final delivery is a shutdown,
+			// not poison, so the policy Naks even with TermOnExhaustion. The broker
+			// drops that Nak (MaxDeliver spent) and the message is left un-acked —
+			// the orphan state above, chosen over a silent Term because it is
+			// visible (pinned floor, pending gauge) and a sweeper can reap it.
+			// Only the final delivery runs on the cancelled context here, so the
+			// outcome is attributable to that delivery's interruption alone.
+			name:             "a cancelled context on the final delivery Naks, and the message is left un-acked",
+			termOnExhaustion: true,
+			cancelled:        true,
 			wantOutcome:      backoff.OutcomeNak,
 			wantFloor:        0,
 			wantMsgsInStream: 1,
@@ -80,12 +97,17 @@ func TestTermOnExhaustionFiresOnTheBrokersFinalDelivery(t *testing.T) {
 				finalSeen  atomic.Int64
 				deliveries atomic.Int64
 			)
-			run, err := jsconsumer.Start(t.Context(), nc, cfg, func(m jetstream.Msg) {
+			interrupted, interrupt := context.WithCancel(context.Background())
+			interrupt()
+			run, err := jsconsumer.Start(t.Context(), nc, cfg, func(hctx context.Context, m jetstream.Msg) {
 				deliveries.Add(1)
 				if backoff.IsFinalDelivery(m, policy.MaxDeliver) {
 					finalSeen.Store(int64(backoff.NumDelivered(m)))
+					if tc.cancelled {
+						hctx = interrupted
+					}
 				}
-				outcome, err := policy.NakOrTerm(m)
+				outcome, err := policy.NakOrTerm(hctx, m)
 				if err != nil {
 					t.Errorf("NakOrTerm: %v", err)
 				}
@@ -259,7 +281,7 @@ func TestConsumerSurvivesRecreationWithSameDurable(t *testing.T) {
 	// durable would race for the same deliveries and prove nothing about resume.
 	deliver := func() (<-chan string, *jsconsumer.Runner) {
 		got := make(chan string, 16)
-		run, err := jsconsumer.Start(t.Context(), nc, cfg, func(m jetstream.Msg) {
+		run, err := jsconsumer.Start(t.Context(), nc, cfg, func(_ context.Context, m jetstream.Msg) {
 			if err := m.Ack(); err != nil {
 				t.Errorf("ack: %v", err)
 			}

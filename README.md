@@ -37,6 +37,37 @@ go get github.com/entireio/go-nuts
   tracked loop cancels the group and is returned by `Shutdown`, so a dead
   consumer cannot leave its process looking healthy.
 
+### Shutdown ordering
+
+Every piece of the module owns one step of a fixed sequence, so a SIGTERM
+(rollout, KEDA scale-down, node drain) finishes work instead of failing it:
+
+1. the signal context is cancelled;
+2. each `jsconsumer` loop stops pulling new deliveries;
+3. in-flight handlers keep running on a context that **survives the cancel**
+   for up to `Config.DrainWindow` (default `DefaultDrainWindow`, 10s);
+4. a handler still running when the window elapses has its context cancelled,
+   and the expiry is logged at Warn — the signal to re-size the window by;
+5. the loops return once their handlers have; `ShutdownGroup` joins them
+   (`DefaultJoinTimeout`, 15s, which must stay above the longest window);
+6. only then are the connections drained with `Drain`.
+
+The dispositions agree with the drain: `backoff.Policy.NakOrTerm` and
+`jsconsumer.Retry.Settle` read a done context as an interruption, not a verdict
+on the message. `NakOrTerm` Naks instead of Terms on a cancelled context (on the
+broker's final delivery that leaves the message un-acked and visible rather than
+silently discarded); `Settle` leaves the message on the ladder while the broker
+still has deliveries to serve, and dead-letters only at the broker's own cap,
+where deferring would strand it. Size `DrainWindow` to the handler's longest
+honest run, under the pod's termination grace less the connection drain and
+telemetry flush that follow it. "Done" means **cancelled**, never timed out:
+`backoff.IsInterrupted` is the shared predicate, so a per-attempt deadline a
+handler sets on its own context still reads as a failed attempt. Migrating a
+caller means using the context the callback receives instead of the process
+context it used to close over — the signature forces a touch at every call
+site, but `func(_ context.Context, m) { handle(ctx, m) }` compiles and keeps the
+old behaviour, so check the body, not just the shape.
+
 ## Usage
 
 The example below drives a hand-rolled fetch loop on nats.go's legacy pull
@@ -116,12 +147,16 @@ and `jsconsumer` add the OpenTelemetry API; all three use `nats.go/jetstream`):
   scriptable message for asserting a consumer's ack/nak/term disposition
   without a broker.
 - **`jsconsumer`** — the durable JetStream pull-consumer scaffold:
-  `Start` (create-or-update durable → consume → stop on context cancel),
+  `Start` (create-or-update durable → consume → drain on context cancel),
   `Run` (`Start` under supervision: recreate on a closed loop with exponential
   backoff, tolerate a not-yet-provisioned stream at boot), and
   `Process` (consumer span re-parented across the NATS hop → decode →
   Term-on-undecodable → dispatch to the handler, which owns the message's
-  disposition). AckExplicit, bounded AckWait and MaxDeliver, optional
+  disposition). The handler callback is `func(ctx, msg)`: that context carries
+  the parent's values but survives its cancellation for `Config.DrainWindow`,
+  so handlers must use it — not the process context they closed over before —
+  and must honour it, since it is what bounds shutdown once the window is
+  spent. AckExplicit, bounded AckWait and MaxDeliver, optional
   InactiveThreshold / MaxAckPending, shutdown-aware consume-error logging,
   optional `KeepInProgress` heartbeat. Also `Retry` — see below.
 - **`jsconsumer.Schedule`** — a consumer's retry timing as plain values, and

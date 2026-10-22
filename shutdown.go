@@ -14,13 +14,32 @@ import (
 
 // DefaultJoinTimeout bounds how long [ShutdownGroup.Shutdown] waits for
 // background loops to return before draining the connections anyway.
-const DefaultJoinTimeout = 10 * time.Second
+//
+// It is sized to sit above jsconsumer.DefaultDrainWindow (10s): a consumer loop
+// drains its in-flight handler for that window before cancelling it, and only
+// then returns, so a join timeout equal to the window would report a handler
+// that used all of it as a timeout and drain the connection under its final
+// Ack. The 5s margin covers a handler that returns promptly once cancelled;
+// settlement work a handler runs AFTER cancellation on a detached context (a
+// dead-letter capture and its ack, bounded by their own timeouts) can still
+// outlast the join, as it could before. A group whose loops run a longer
+// Config.DrainWindow must raise this with [WithJoinTimeout] by the same
+// margin.
+const DefaultJoinTimeout = 15 * time.Second
 
 // ShutdownGroup coordinates graceful shutdown of a set of background
 // pull-consumer loops and the NATS connections they use. It encodes the
 // ordering that prevents rollout noise (COR-923): on Shutdown it cancels the
 // loops' context, waits for them to return, and only THEN drains the
 // connections — so a Drain never races an in-flight Fetch.
+//
+// With jsconsumer loops the cancel is a drain, not an abort (COR-2224): each
+// loop stops pulling, lets its in-flight handler finish inside its
+// Config.DrainWindow, cancels the handler's context only when that elapses,
+// and returns once the handler has. The full sequence is therefore
+// cancel → stop pulling → drain window → cancel handlers → join → drain
+// connections, and the join timeout has to cover the longest window — see
+// [DefaultJoinTimeout].
 //
 // Typical use in a service main:
 //

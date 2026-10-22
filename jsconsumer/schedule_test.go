@@ -1,6 +1,7 @@
 package jsconsumer
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -167,7 +168,7 @@ func TestConfigUsesTheSharedSchedule(t *testing.T) {
 		Stream: "s_v1", Durable: "d", Name: "c",
 		AckWait: 30 * time.Minute, MaxDeliver: 6, BackOff: ladder, Retry: r,
 	}
-	startErr := cfg.validate(nil, func(jetstream.Msg) {})
+	startErr := cfg.validate(nil, func(context.Context, jetstream.Msg) {})
 	if startErr == nil {
 		t.Fatal("Start accepted a ladder past the Retry's bound")
 	}
