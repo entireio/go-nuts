@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_018mEUdBUuhaJhSHaWBrt8xz",
+  "agent_id": "ac0e3a7d11265a882",
+  "subagent_type": "Explore",
+  "task_description": "Map native-mirror replication chain",
+  "token_usage": {
+    "input_tokens": 152,
+    "cache_creation_tokens": 224749,
+    "cache_read_tokens": 12370322,
+    "output_tokens": 28390,
+    "api_call_count": 76
+  },
+  "started_at": "2026-10-27T11:55:40.094816+01:00",
+  "completed_at": "2026-10-27T12:57:59.782201+01:00"
+}

@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01DoNwVfkVsatS5p76wLi2oz",
+  "agent_id": "a76e99c9aae69c2af",
+  "subagent_type": "Explore",
+  "task_description": "Map core write path and entity homes",
+  "token_usage": {
+    "input_tokens": 130,
+    "cache_creation_tokens": 251828,
+    "cache_read_tokens": 12066516,
+    "output_tokens": 33569,
+    "api_call_count": 65
+  },
+  "started_at": "2026-10-27T11:55:40.096647+01:00",
+  "completed_at": "2026-10-27T12:57:59.794765+01:00"
+}
