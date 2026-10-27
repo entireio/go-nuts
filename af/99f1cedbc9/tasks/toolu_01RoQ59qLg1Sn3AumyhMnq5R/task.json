@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01RoQ59qLg1Sn3AumyhMnq5R",
+  "agent_id": "af332093529339f78",
+  "subagent_type": "Explore",
+  "task_description": "Map entire-api strata plumbing",
+  "token_usage": {
+    "input_tokens": 110,
+    "cache_creation_tokens": 344147,
+    "cache_read_tokens": 12245780,
+    "output_tokens": 19806,
+    "api_call_count": 55
+  },
+  "started_at": "2026-10-27T11:50:21.130488+01:00",
+  "completed_at": "2026-10-27T11:54:34.263768+01:00"
+}

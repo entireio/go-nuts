@@ -1,0 +1,44 @@
+<pasted_content id="11cf">
+ We want to roll out `strata` in production. The idea is with strata we will be able to replicate data across region using the same mirror-pipeline we use for git data, simplifying the architecture and allowing local read
+  and write of metadata. The candidates are multiple in the future:
+  - project metadata (access, etc)
+  - trails
+  and others.
+
+  There are two
+</pasted_content id="11cf">
+
+ paths I see.
+
+- Start with project metadata, rough idea there is for each project create a "hidden" repository that gets replicated everywhere there is a mirrored repo for that project and start switching readers to that.
+- A maybe better path, aim to turn regional CCDB into regional aurora dbs populated using strata. The idea there is to look at the regional CCRDBs data, model it as git repos, bit by bit, and gradually switch to strata.
+
+The goal of this session is to figure out a path forward. That's a lot, any clarificatiion question?
+
+---
+
+the latter
+
+---
+
+single writer per entity
+
+---
+
+not sure, ideally decisions, but will need to look into it
+
+---
+
+I woul love the specific usage of storing metadata to go, it can be further down the line if needed
+
+---
+
+The latter, in the future user will be able to express a preference too
+
+---
+
+no particular order, I would probably start with the simplest
+
+---
+
+paced by the team
